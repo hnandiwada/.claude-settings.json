@@ -1,0 +1,45 @@
+{
+  "model": "opus",
+  "enabledPlugins": {
+    "pyright-lsp@claude-plugins-official": true
+  },
+  "effortLevel": "medium",
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MSG=$(jq -r '.message // \"\"'); case \"$MSG\" in *\"waiting for your input\"*) exit 0 ;; esac; TAB=$(tmux display-message -p -t \"${TMUX_PANE:-}\" '#W' 2>/dev/null || echo 'no tmux'); osascript -e \"display notification \\\"$TAB — $MSG\\\" with title \\\"Claude Code\\\" subtitle \\\"awaiting input\\\" sound name \\\"Glass\\\"\" >/dev/null 2>&1 || true; PTY=$(tmux display-message -p -t \"${TMUX_PANE:-}\" '#{pane_tty}' 2>/dev/null); [ -n \"$PTY\" ] && printf '\\a' > \"$PTY\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TAB=$(tmux display-message -p -t \"${TMUX_PANE:-}\" '#W' 2>/dev/null || echo 'no tmux'); osascript -e \"display notification \\\"$TAB\\\" with title \\\"Claude Code\\\" subtitle \\\"finished\\\" sound name \\\"Glass\\\"\" >/dev/null 2>&1 || true; PTY=$(tmux display-message -p -t \"${TMUX_PANE:-}\" '#{pane_tty}' 2>/dev/null); [ -n \"$PTY\" ] && printf '\\a' > \"$PTY\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  },
+    "permissions": {
+    "allow": [
+      "Bash(rg:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh search:*)",
+      "Bash(tmux display-message *)",
+      "WebSearch"
+    ]
+  }
+
+}
