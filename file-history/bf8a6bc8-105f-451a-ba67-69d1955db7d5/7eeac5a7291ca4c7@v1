@@ -1,0 +1,78 @@
+---
+name: distill
+description: "Weekly cleanup of the .claude/ markdown: compacts api-summary files to current API behavior, promotes patterns human reviewers taught on PRs into gotchas, rules or CLAUDE.md, and fixes skill instructions reviewers corrected. Use for the scheduled routine or when knowledge files have become append-only history (`/distill [--lookback <days>]`). Markdown only; one draft PR."
+---
+
+# Distill
+
+Rewrite `.claude/` markdown that has drifted into history back into current fact. Three jobs: compact api-summary files, promote patterns human reviewers taught on PRs into shared rule files, and fix skill instructions whose output reviewers corrected. Git history keeps whatever you drop.
+
+Run as `/distill [--lookback <days>]`, default 14. It runs weekly on the bot account (fresh session, prompt `/distill`); an ad-hoc run behaves the same. The window is longer than a week so runs overlap, and [idempotence](#idempotence) makes that harmless.
+
+## Preconditions
+
+1. **One distill at a time.** If an open PR has the title prefix `distill:`, report that and stop. No branch, no edits.
+2. **Branch before any edit:** `git fetch origin main`, then branch `distill-{YYYY-MM-DD}` from `origin/main`.
+3. **Markdown only** (see [Guardrails](#guardrails)). A finding that needs a code change becomes a card via the `create-linear-issue` skill, not an edit.
+
+## Working set
+
+The window decides which files to touch, never which parts of a file to keep. Distill a selected file **whole**; a half-distilled file is worse than an untouched one.
+
+| Target | Selected from the window | Workflow |
+|---|---|---|
+| api-summary compaction | Integrations with commits touching `integrations/**/{name}/` or `.claude/references/{name}/` (`git log --since`), plus the largest remaining `api-summary.md` files by line count | [workflows/api-summaries.md](workflows/api-summaries.md) |
+| PR-review distillation | PRs in this repo updated within the window that have review comments from humans | [workflows/pr-reviews.md](workflows/pr-reviews.md) |
+
+Compaction goes broad, since its diffs are deletions and review fast. Promotion stays narrow: every future session reads each promoted line, so ship a condensed handful of strong rules, never a spread of near-duplicates. List compaction files you didn't finish under "Parked" in the PR body. The next run reselects from scratch, so no state file is needed.
+
+## Editing doctrine — keep vs drop
+
+This extends `.claude/rules/api-summary.md`, which every edit to an api-summary follows; compaction brings files written before it into line.
+
+**Compaction is deletion.** The diff is mostly removals: merge and cut, adding a connecting line only where a merge needs one. Retelling dropped content in new prose is not distilling.
+
+**Drop:**
+
+- Process history: reviewer verdicts, "attempted X first, dropped in iter-2", which agent or phase wrote an entry.
+- Standing `Date:` lines and observation dates that don't change what to do now.
+- Superseded facts: sandbox snapshots that later entries contradict, "verify later" flags since verified (fold in the answer and delete the flag), old behavior described next to its replacement.
+- Samples beyond one max-populated record per endpoint.
+- Anything that repeats `integration-patterns.md` or a rules file. Name the rule instead of copying it.
+
+**Keep, in one to three lines each:**
+
+- Decision rationale that stops a settled question being reopened: the mapping, why, and the evidence. Example: "`committed=0` vs `qoh-atp` split is arbitrary; the API exposes no breakdown."
+- Rationale entries for `IntegrationNotImplemented`, `.get()` defaults, and validator opt-outs. Missing rationale is a reviewer `[BLOCK]`, so deleting one brings the block back on the next edit.
+- Open unknowns, flagged questions, and vendor tickets, with their dates (an open ticket's age matters).
+- Write-safety context: `allow_writes()` rationale, cleanup strategy, vendor contact, customer org.
+- Sandbox-vs-prod differences that still hold.
+- Customer/account context. It is banned from code comments, so `api-summary.md` is its only home.
+- A date only where it changes what to do: an open vendor ticket, a point-in-time write probe, a sandbox seeding snapshot.
+
+**When unsure, keep it.** Deleting the paragraph that prevents a repeated mistake is the failure that matters. Don't count on the PR reviewer to catch it.
+
+## Versioned files
+
+- Any edit to `references/integration-patterns.md`, including a promoted rule, bumps its version banner (MAJOR/MINOR per the `references/CHANGELOG.md` rubric) and appends an entry to that changelog naming the change.
+- **Never compact a `CHANGELOG.md`**; it is history by design. When a promoted fix edits a skill that has one, append an entry there, versioned per the same rubric.
+- Skills are only a promotion destination, never a compaction target. Edits to them are targeted fixes backed by evidence, not rewrites.
+
+## Idempotence
+
+A second run over the same window must produce an empty diff. Before promoting any pattern, grep the target file for existing coverage and refine that rule in place instead of adding a near-duplicate. If the run yields no changes, report that and stop: no push, no PR. Never make up work.
+
+## Deliverable — one draft PR
+
+- **Branch** `distill-{YYYY-MM-DD}`, **title** `distill: {YYYY-MM-DD} ({N}d lookback)`.
+- **Draft**, so a human reads this bulk rewrite of team knowledge before automated review. Apply the `distill` label if the repo has one.
+- **Body**, within the PR ceiling in `.claude/rules/communications.md`: file count and net line delta; one line per compacted file naming the categories dropped (not an inventory); each promoted pattern with permalinks to its source review comments; then the "Parked" list and `[skip-tests]` (markdown-only diff). This evidence lives only in the PR, never in the target files.
+- **Subscribe to PR activity** and handle review comments from this session. The PR is the only status channel: no Slack or Linear updates.
+- **Keep the branch rebased on `origin/main`** while the PR is open. On a rebase, fold the facts that changed on main into the distilled file by hand. A mechanical conflict resolution either brings back removed history or drops the new fact.
+
+## Guardrails
+
+- Edit only markdown under `.claude/` and the project `CLAUDE.md`. No code, tests, config, or gitignored paths (`plans/`, `tmp/`, scraped docs).
+- Never drop open unknowns, write-safety context, customer/account context, or the `IntegrationNotImplemented` / `.get()` default / validator opt-out rationale entries.
+- Each target file sets its own promotion bar: `knowledge/integration-gotchas.md` "How to write a gotcha" (the next-ten-integrations test); rules files stay terse and worth loading every session; `CLAUDE.md` takes only what changes behavior for most sessions.
+- One PR per run. Compaction is net-negative, promotion a condensed handful, and an empty run opens no PR.

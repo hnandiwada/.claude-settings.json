@@ -1,0 +1,128 @@
+---
+name: investigate
+description: "Investigate Trackstar integration issues: missing or wrong data, webhook failures, sync delays, stale schedules, crawl errors, credential problems, and customer-reported bugs. Use for any connection debugging, customer data report, stale schedule, Datadog error, or support-thread triage, even when the issue type is unclear."
+allowed-tools: Read, Grep, Glob, Bash, Skill
+---
+
+# Investigate
+
+Pick the workflow that matches the input and follow it.
+
+## Triage
+
+| Input | Workflow |
+|-------|----------|
+| Stale schedule, or schedule data for a function_name | [workflows/stale-schedules.md](workflows/stale-schedules.md) |
+| Datadog logs, error patterns, connection errors | [workflows/datadog-investigation.md](workflows/datadog-investigation.md) |
+| Slack thread, customer report, support ticket | [workflows/customer-issue.md](workflows/customer-issue.md) |
+
+If the type is unclear, start with the customer-issue workflow.
+
+## Mental model
+
+Every data issue comes down to one of these questions:
+
+1. **Is the data in the source system?** If not, it's the customer's issue, not ours.
+2. **Did we try to sync it?** Scheduler status, crawl timing.
+3. **Did we hit an error?** Datadog, scheduler and connection errors.
+4. **Did we store it?** The resource table.
+5. **Did we transform it correctly?** Compare raw with stored.
+6. **Did we notify about it?** SVIX webhooks.
+
+You won't always need all six, or in this order. Let the symptom pick the start:
+
+- **Data is missing:** resource table first. If it's not there, check the scheduler (behind or erroring?). If the scheduler is fine, check the raw source. If it's in the source but not stored, search Datadog for sync errors.
+- **Field value is wrong:** compare the stored value with the raw source value. If raw is also wrong, it's the customer's data. If only stored is wrong, it's a bug in `format_*`.
+- **Webhook not received:** SVIX first (sent? delivery status?). If not sent, check whether the data actually changed. If sent but failed, read the SVIX error.
+- **Data is stale:** scheduler first (running? behind?), then Datadog for recent errors. If the crawl is current but the data is stale, check the resource is still in the current source response.
+
+Other common causes:
+
+| Symptom | Likely cause |
+|---------|--------------|
+| In source, not in Dynamo, crawl is current | Transformation bug, a filter excluding it, or a field-mapping issue |
+| In source, not in Dynamo, crawl is stale | Scheduler issue: find why the crawl is behind |
+| In source, not in Dynamo, Datadog shows errors | Sync failed: check the specific error |
+| Crawl stuck or stalled | Expired auth, rate limit, or vendor API issue |
+| Repeated auth errors in Datadog | The vendor may have rotated the credentials |
+
+## Data sources
+
+DynamoDB and `get_credentials.py` need AWS credentials. Local sessions use your own. The bot account has them, and so does a claude.ai/code session whose environment setup runs `.claude/setup-aws.sh` and `.claude/setup-aws-creds.sh`. If a call fails with `NoCredentials`, the session has none: use Datadog and say which checks you couldn't run.
+
+| Source | What it shows | Where |
+|--------|---------------|-------|
+| **Resource table** | What we stored for a resource | DynamoDB `{resource-type}-{stage}` (orders, returns, inventory, products, inbound-shipments, warehouses, shipping-methods) |
+| **Scheduler table** | Crawl/sync status per connection: latest_data, stale, crawl timestamps, page_token, heartbeat | DynamoDB `scheduler-{stage}`, key: `(connection_id, function_name)` |
+| **Connections table** | Connection config, org_id, integration type | DynamoDB `connections-{stage}`, key: `id` |
+| **Connection errors table** | Vendor API endpoints this connection can't access: messages, affected endpoints, preventing_sync | DynamoDB `connection-errors-{stage}`, key: `(connection_id, failed_url)` |
+| **Raw vendor API** | Ground truth from the source system | `get_credentials.py` (API keys, tokens, base_url), then a read-only request to the vendor API |
+| **Datadog** | Errors, exceptions, failed API calls | Datadog MCP: `search_datadog_logs` (params `query`, `from`, `to`, `start_at`); `search_datadog_monitors` for monitor status (params `query`, `start_at`). Syntax: `query-datadog` skill |
+| **SVIX** | Webhook delivery status | [reference/svix-webhooks.md](reference/svix-webhooks.md) |
+
+Example DynamoDB queries are in [reference/dynamo-tables.md](reference/dynamo-tables.md).
+
+## Scripts
+
+In `.claude/skills/investigate/scripts/`. Run them from the repo root with `uv run python3`.
+
+| Script | Purpose | Key args |
+|--------|---------|----------|
+| `get_credentials.py` | Decrypt vendor credentials | `--connection-id`, `-s stage` |
+| `decode_access_token.py` | Decode a trackstar_access_token to get the connection_id | `--access-token`, `--org-id` |
+| `query_webhooks.py` | Query SVIX webhook messages and delivery status | `--org-id`, `--resource-id`, `--message-id` |
+
+## Reference files
+
+- Webhooks: [reference/svix-webhooks.md](reference/svix-webhooks.md)
+- Reproducing a crawl failure locally: [reference/crawl-reproduction.md](reference/crawl-reproduction.md)
+- DynamoDB table names, fields and example queries: [reference/dynamo-tables.md](reference/dynamo-tables.md)
+
+## Searching the code
+
+When the evidence points to a transformation, filter, or mapping bug:
+
+1. Get `integration_type` (wms, cart, carrier; freight is legacy, don't extend it) and `integration_name` from the connection.
+2. The code is in `integrations/{integration_type}/{integration_name}/`.
+3. Check recent changes: `git log --since="14 days ago" -- integrations/{integration_type}/{integration_name}/`
+4. Look at field mappings, filters that drop resources, error handling, and how API requests are built.
+
+## Classify
+
+Each workflow ends by putting the finding in one class:
+
+| Classification | When to use | Action |
+|---------------|-------------|--------|
+| **CODE_FIX** | Our bug, fixable in code (transformation, filter, mapping, pagination) | Fix on a feature branch, run tests, open a PR |
+| **INTEGRATION_VENDOR_ISSUE** | The vendor's API is down, changed, returns bad data, or is missing the resource | Document the evidence, draft a support email |
+| **INFRA_ISSUE** | Infrastructure: timeout, memory, crawl killed by a redeploy, schedule stuck | Document the pattern, check whether it recurs |
+| **CUSTOMER_ISSUE** | Resource isn't in the source system, or bad credentials or config that already show as a connection error. Bad credentials with no connection error are CODE_FIX: the integration raised a generic error instead of the credential or permission exception | Document what's wrong, suggest the customer's next step |
+| **UNKNOWN** | Can't tell; needs human review | Document all the evidence gathered |
+
+## Creating a Fix
+
+Read `.claude/references/integration-patterns.md` before writing the fix. Most important here:
+
+- **Root cause first.** Don't silence an error with `.get()`, a broad `try/except`, or a fallback default. First read the raw API response, check other endpoints, and re-read the spec.
+- **The spec is canonical; the sandbox is a sample.** A field missing from this response may exist in other states (blocked orders, deactivated accounts). Don't strip it from `format_*`.
+- **Never change a failing test to match new behavior** unless you have documented evidence the test was wrong. Default: re-investigate, fix the code, leave the test alone.
+- **`IntegrationNotImplemented` means the vendor's API has no source for the field at all**, not that the value is null.
+- **Record non-obvious choices** (a justified `.get()`, a non-canonical source field, an `IntegrationNotImplemented`) in `.claude/references/{integration_name}/api-summary.md` under "Field-mapping decisions": target field, source, reason, evidence. Edit a matching entry instead of adding a duplicate. The short code comment points to it.
+- **Check the fallout:** other customers affected? A regression? A backfill needed?
+- **Never write to vendor APIs while debugging.** What counts is whether the operation changes vendor state, not the HTTP method (SOAP and GraphQL reads are POSTs). When unsure, use `yarn crawl` (dry-run) and curl against documented read endpoints.
+
+## Backfilling after a fix
+
+A fix that changes stored values (a field mapping, a transform bug) only reaches rows as they are crawled again; rows already synced keep the old value. Whether to backfill is a judgment call (some customers only want the fix going forward), so confirm before resyncing.
+
+For one connection: set `resync.json` (`connection_id`, `functions_to_sync` limited to the affected function(s), `start_time` for the window) and run `yarn resync -s prod`. With a `start_time` and a resource that supports on-demand sync, it creates one on-demand sync job from `start_time` to now; otherwise it resets the scheduler row. For many connections in one org, use the `bulk-resync` skill.
+
+## Link the fix PR back to the Pylon ticket
+
+Only when the investigation started from a Pylon ticket (a stale-schedule or Datadog investigation has no ticket): after opening a fix PR, set the ticket's `pull_request` custom field to the PR URL.
+
+```
+mcp__pylon__update_issue(issue_id="<ticket-number>", custom_fields={"pull_request": "<pr-url>"})
+```
+
+The field holds one URL; setting it again overwrites it. It is internal, so no customer-visible note is needed. Read the ticket back and check `custom_fields.pull_request.value` equals the PR URL.

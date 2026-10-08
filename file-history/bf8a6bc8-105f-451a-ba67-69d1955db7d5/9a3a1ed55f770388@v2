@@ -1,0 +1,134 @@
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]) / ".claude" / "skills"
+
+
+def sub(path, old, new):
+    p = root / path
+    text = p.read_text()
+    if text.count(old) != 1:
+        raise SystemExit(f"{path}: expected one match for {old[:60]!r}, got {text.count(old)}")
+    p.write_text(text.replace(old, new))
+
+
+# investigate: drop stale "agent context" notes and dead trackstar: tools
+sub("investigate/SKILL.md",
+    "| Stale schedule, schedule data, agent context with function_name |",
+    "| Stale schedule, or schedule data for a function_name |")
+
+sub("investigate/SKILL.md",
+"""As an automated agent, use the MCP tools as the main data source. Scripts and the AWS CLI are for interactive use only.
+
+| Source | What it shows | Agent (MCP tool) | Interactive |
+|--------|---------------|------------------|-------------|
+| **Resource table** | What we stored for a resource | | DynamoDB `{resource-type}-{stage}` (orders, returns, inventory, products, inbound-shipments, warehouses, shipping-methods) |
+| **Scheduler table** | Crawl/sync status per connection | `trackstar:query_scheduler`: function_name, latest_data, stale, crawl timestamps, page_token, heartbeat | DynamoDB `scheduler-{stage}`, key: `(connection_id, function_name)` |
+| **Connections table** | Connection config, org_id, integration type | | DynamoDB `connections-{stage}`, key: `id` |
+| **Connection errors table** | Vendor API endpoints this connection can't access | `trackstar:get_connection_errors`: messages, affected endpoints, preventing_sync status | DynamoDB `connection-errors-{stage}`, key: `(connection_id, failed_url)` |
+| **Raw vendor API** | Ground truth from the source system | `trackstar:get_credentials` (API keys, tokens, base_url), then curl the vendor API | `get_credentials.py`, then curl |
+| **Datadog** | Errors, exceptions, failed API calls | `datadog:search_datadog_logs` (params `query`, `from`, `to`, `start_at`); `datadog:search_datadog_monitors` for monitor status/alerts (params `query`, `start_at`) | Datadog UI. Syntax: `query-datadog` skill |
+| **SVIX** | Webhook delivery status | | [reference/svix-webhooks.md](reference/svix-webhooks.md) |
+""",
+"""DynamoDB and `get_credentials.py` need AWS credentials. Local sessions use your own. The bot account has them, and so does a claude.ai/code session whose environment setup runs `.claude/setup-aws.sh` and `.claude/setup-aws-creds.sh`. If a call fails with `NoCredentials`, the session has none: use Datadog and say which checks you couldn't run.
+
+| Source | What it shows | Where |
+|--------|---------------|-------|
+| **Resource table** | What we stored for a resource | DynamoDB `{resource-type}-{stage}` (orders, returns, inventory, products, inbound-shipments, warehouses, shipping-methods) |
+| **Scheduler table** | Crawl/sync status per connection: latest_data, stale, crawl timestamps, page_token, heartbeat | DynamoDB `scheduler-{stage}`, key: `(connection_id, function_name)` |
+| **Connections table** | Connection config, org_id, integration type | DynamoDB `connections-{stage}`, key: `id` |
+| **Connection errors table** | Vendor API endpoints this connection can't access: messages, affected endpoints, preventing_sync | DynamoDB `connection-errors-{stage}`, key: `(connection_id, failed_url)` |
+| **Raw vendor API** | Ground truth from the source system | `get_credentials.py` (API keys, tokens, base_url), then a read-only request to the vendor API |
+| **Datadog** | Errors, exceptions, failed API calls | Datadog MCP: `search_datadog_logs` (params `query`, `from`, `to`, `start_at`); `search_datadog_monitors` for monitor status (params `query`, `start_at`). Syntax: `query-datadog` skill |
+| **SVIX** | Webhook delivery status | [reference/svix-webhooks.md](reference/svix-webhooks.md) |
+
+Example DynamoDB queries are in [reference/dynamo-tables.md](reference/dynamo-tables.md).
+""")
+
+ci = "investigate/workflows/customer-issue.md"
+sub(ci, """**Agent context:** direct DynamoDB queries are blocked. Search Datadog for the resource, or check the scheduler first to understand sync status.
+
+**Interactive:** query DynamoDB""", "Query DynamoDB")
+sub(ci, """**Agent context:** `trackstar:query_scheduler` with the connection_id.
+
+**Interactive:** query `scheduler-{stage}`;""", "Query `scheduler-{stage}`;")
+sub(ci, """**Agent context:** `datadog:search_datadog_logs`:
+
+```
+datadog:search_datadog_logs(""", """Use `search_datadog_logs`:
+
+```
+search_datadog_logs(""")
+sub(ci, """```
+datadog:search_datadog_logs(
+  query="@connection_id:<id> @function:<function>",""", """```
+search_datadog_logs(
+  query="@connection_id:<id> @function:<function>",""")
+sub(ci, """**Interactive:** the Datadog UI, or the MCP tool if available.
+
+""", "")
+sub(ci, """Get credentials:
+- **Agent:** `trackstar:get_credentials` with the connection_id
+- **Interactive:** `uv run""", """Get credentials with `uv run""")
+
+ss = "investigate/workflows/stale-schedules.md"
+sub(ss, """**Agent context:** `trackstar:query_scheduler` with the connection_id.
+
+**Interactive:** query DynamoDB directly;""", "Query DynamoDB `scheduler-{stage}`;")
+sub(ss, """**Agent context:** `trackstar:get_connection_errors` with the connection_id.
+
+**Interactive:** the errors table in DynamoDB, or Datadog.""", "Query DynamoDB `connection-errors-{stage}` for the connection_id, or search Datadog.")
+sub(ss, """**Agent context:** `datadog:search_datadog_logs`:
+
+```
+datadog:search_datadog_logs(""", """Use `search_datadog_logs`:
+
+```
+search_datadog_logs(""")
+sub(ss, """```
+datadog:search_datadog_logs(
+  query="@connection_id:<id> (timeout""", """```
+search_datadog_logs(
+  query="@connection_id:<id> (timeout""")
+sub(ss, """**Agent context:** `trackstar:get_credentials` with the connection_id, then a read-only GET to the vendor API to confirm auth works.
+
+**Interactive:** `uv run python3 .claude/skills/investigate/scripts/get_credentials.py --connection-id <id> -s prod`""",
+"""Get credentials with `uv run python3 .claude/skills/investigate/scripts/get_credentials.py --connection-id <id> -s prod`, then make a read-only request to the vendor API to confirm auth works.""")
+
+sub("investigate/workflows/datadog-investigation.md", """**Agent context:** `trackstar:query_scheduler` with the connection_id.
+
+**Interactive:** query DynamoDB""", "Query DynamoDB")
+
+sub("investigate/reference/crawl-reproduction.md", """**Agent context:** `datadog:search_datadog_logs` (attribute syntax is in the `query-datadog` skill):
+```
+datadog:search_datadog_logs(""", """Use `search_datadog_logs` (attribute syntax is in the `query-datadog` skill):
+```
+search_datadog_logs(""")
+
+dt = "investigate/reference/dynamo-tables.md"
+sub(dt, "**Example query** (interactive only; blocked in agent context):", "**Example query:**")
+sub(dt, "**Example query** (interactive only):", "**Example query:**")
+
+# distill: add a consistency audit job
+d = "distill/SKILL.md"
+sub(d, "compacts api-summary files to current API behavior, promotes patterns human reviewers taught on PRs into gotchas, rules or CLAUDE.md, and fixes skill instructions reviewers corrected. Use",
+    "compacts api-summary files, promotes patterns human reviewers taught on PRs into gotchas, rules or CLAUDE.md, fixes skill instructions reviewers corrected, and fixes instructions that no longer match the repo. Use")
+sub(d, "Three jobs: compact api-summary files, promote patterns human reviewers taught on PRs into shared rule files, and fix skill instructions whose output reviewers corrected.",
+    "Four jobs: compact api-summary files, promote patterns human reviewers taught on PRs into shared rule files, fix skill instructions whose output reviewers corrected, and fix instructions that no longer match the repo.")
+sub(d, "| PR-review distillation | PRs in this repo updated within the window that have review comments from humans | [workflows/pr-reviews.md](workflows/pr-reviews.md) |",
+    """| PR-review distillation | PRs in this repo updated within the window that have review comments from humans | [workflows/pr-reviews.md](workflows/pr-reviews.md) |
+| Consistency audit | Not window-based: every skill, agent, command, rule and knowledge file, every run | [Consistency audit](#consistency-audit) |""")
+sub(d, "## Editing doctrine — keep vs drop", """## Consistency audit
+
+Instructions go stale when the code or setup they describe changes, and an agent following a stale one refuses work it can do or calls a tool that doesn't exist. Check each file against the repo as it is now:
+
+- **Every named thing exists:** tools and MCP servers (`.claude/mcp-servers.json`, enabled plugins), scripts and file paths, yarn scripts (`package.json`), skills, agents, and `config.py` names. Point a reference to something gone at what replaced it, or remove the step.
+- **Every claim about where something can run holds.** "Blocked", "interactive only", "agent can't", "no AWS access": check it against the setup scripts (`.claude/bot-setup.sh`, `.claude/setup-aws*.sh`, `.claude/hooks/`) and the settings files. Restate it as the real condition, such as "needs AWS credentials", or remove it.
+- **Files agree.** When two files give different instructions for the same step, the rule file wins over the skill. Otherwise fix the one the code contradicts; if you can't tell which is right, park it.
+- **Example commands run as written:** flags match the script's current arguments.
+
+These are targeted fixes backed by evidence, so they are allowed in skills. List each in the PR body: the stale line, what disproves it, and what it says now.
+
+## Editing doctrine — keep vs drop""")
+
+print("applied")

@@ -1,0 +1,18 @@
+{
+  "name": "session-9f8dcf58",
+  "createdAt": 1791482020227,
+  "leadAgentId": "team-lead@session-9f8dcf58",
+  "leadSessionId": "9f8dcf58-53f8-4012-833d-f5eee84a6651",
+  "members": [
+    {
+      "agentId": "team-lead@session-9f8dcf58",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "joinedAt": 1791482020227,
+      "tmuxPaneId": "leader",
+      "cwd": "/Users/harshanandiwada/workspace/pokedex",
+      "subscriptions": [],
+      "backendType": "in-process"
+    }
+  ]
+}
