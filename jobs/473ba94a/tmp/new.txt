@@ -1,0 +1,44 @@
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1[36m:[0m1[36m:[0m [1m[31mI001[0m [[36m*[0m] Import block is un-sorted or un-formatted
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m169[36m:[0m16[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m178[36m:[0m13[36m:[0m [1m[31mS110[0m `try`-`except`-`pass` detected, consider logging the exception
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m178[36m:[0m20[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m291[36m:[0m16[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m334[36m:[0m27[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m362[36m:[0m20[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m450[36m:[0m17[36m:[0m [1m[31mRUF059[0m Unpacked variable `found_kit_key` is never used
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m522[36m:[0m27[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m618[36m:[0m20[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m692[36m:[0m24[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m721[36m:[0m20[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m790[36m:[0m13[36m:[0m [1m[31mS110[0m `try`-`except`-`pass` detected, consider logging the exception
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m790[36m:[0m20[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m881[36m:[0m9[36m:[0m [1m[31mS110[0m `try`-`except`-`pass` detected, consider logging the exception
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m881[36m:[0m16[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m958[36m:[0m20[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1055[36m:[0m13[36m:[0m [1m[31mSIM102[0m Use a single `if` statement instead of nested `if` statements
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1364[36m:[0m9[36m:[0m [1m[31mS110[0m `try`-`except`-`pass` detected, consider logging the exception
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1364[36m:[0m16[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1426[36m:[0m28[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1513[36m:[0m38[36m:[0m [1m[31mC401[0m Unnecessary generator (rewrite as a set comprehension)
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1530[36m:[0m26[36m:[0m [1m[31mC403[0m Unnecessary list comprehension (rewrite as a set comprehension)
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1558[36m:[0m21[36m:[0m [1m[31mSIM118[0m Use `key in dict` instead of `key in dict.keys()`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1592[36m:[0m23[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1629[36m:[0m23[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1766[36m:[0m13[36m:[0m [1m[31mPIE794[0m Class field `warehouse_customer_id` is defined multiple times
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1824[36m:[0m17[36m:[0m [1m[31mSIM102[0m Use a single `if` statement instead of nested `if` statements
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1836[36m:[0m17[36m:[0m [1m[31mSIM102[0m Use a single `if` statement instead of nested `if` statements
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m1929[36m:[0m23[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m2079[36m:[0m16[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m2099[36m:[0m24[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m2280[36m:[0m20[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m2311[36m:[0m27[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m2758[36m:[0m33[36m:[0m [1m[31mRUF015[0m Prefer `next(iter(connection_business_units))` over single element slice
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m2990[36m:[0m27[36m:[0m [1m[31mTRY201[0m Use `raise` without specifying exception name
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m3118[36m:[0m20[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m3149[36m:[0m20[36m:[0m [1m[31mBLE001[0m Do not catch blind exception: `Exception`
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m3632[36m:[0m5[36m:[0m [1m[31mSIM102[0m Use a single `if` statement instead of nested `if` statements
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m4135[36m:[0m35[36m:[0m [1m[31mB006[0m Do not use mutable data structures for argument defaults
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m4391[36m:[0m5[36m:[0m [1m[31mSIM102[0m Use a single `if` statement instead of nested `if` statements
+[1mintegrations/wms/deposco/integration.py[0m[36m:[0m4439[36m:[0m43[36m:[0m [1m[31mPERF102[0m When using only the values of a dict use the `values()` method
+Found 42 errors.
+[[36m*[0m] 1 fixable with the `--fix` option (24 hidden fixes can be enabled with the `--unsafe-fixes` option).

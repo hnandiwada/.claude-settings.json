@@ -1,0 +1,3563 @@
+import base64
+import decimal
+import hashlib
+import json
+import pickle
+import time
+import uuid
+from copy import deepcopy
+from datetime import timedelta
+import boto3
+import jwt
+import orjson
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from config import (
+    ACTIVE_SUBSCRIPTIONS_INDEX,
+    AGENT_CREDS_SECRET,
+    AI_API_KEYS_SECRET,
+    API_KEY_CACHE_TTL_SECONDS,
+    API_KEY_INDEX,
+    API_KEYS_TABLE,
+    AUTH_CODES_TABLE,
+    BATCH_GET_KEY_CHUNK,
+    BILLING_INVOICES_TABLE,
+    BILLING_MONTH_CLAIM_MINUTES,
+    BILLING_OVERRIDES_TABLE,
+    BILLING_PRICING_RULES_TABLE,
+    CARRIER_BUCKET_NAME,
+    CLERK_PUBLIC_KEY,
+    CONNECTION_ERRORS_TABLE,
+    CONNECTIONS_INDEX,
+    CONNECTIONS_TABLE,
+    CUSTOM_LOGOS_BUCKET,
+    DEFAULT_FIRST_CRAWL_LOOKBACK_DAYS,
+    DRY_RUN,
+    EVENT_LOG_ORG_CREATED_INDEX,
+    EVENT_LOG_TABLE,
+    IDEMPOTENCY_KEY_STILL_RUNNING_SECONDS,
+    IDEMPOTENCY_KEY_TTL_SECONDS,
+    IDEMPOTENCY_KEYS_TABLE,
+    EVENT_NOTIFICATIONS_TABLE,
+    EVENT_TYPES,
+    INACTIVE_BILLING_STATUSES,
+    INTEGRATION_SUBSCRIPTIONS_TABLE,
+    INTEGRATIONS_WITH_SHARED_SUBSCRIPTIONS,
+    LAMBDA_TASKS,
+    LARGE_FIELD_THRESHOLD,
+    LINK_TOKENS_TABLE,
+    MAGIC_LINKS_INDEX,
+    MAGIC_LINKS_TABLE,
+    MAX_IN_OPERANDS,
+    MIN_API_RETURN_SIZE,
+    ORG_CACHE_TTL_SECONDS,
+    ORGS_TABLE,
+    SKIP_GROWTH_ORG_IDS,
+    PRESIGNED_URL_EXPIRATION,
+    RDS_SECRET_PARAM,
+    RDS_STACK,
+    REQUESTS_PROXY,
+    RESOURCE_BUCKET_NAME,
+    RESOURCE_TABLES,
+    ROLLOUTS_MONTH_INDEX,
+    ROLLOUTS_TABLE,
+    ROUTINE_SECRETS,
+    SCHEDULER_TABLE,
+    SLACK_GROWTH_CHANNEL,
+    STAGE,
+    SYNC_JOBS_TABLE,
+    TASK_CHUNK_SIZE,
+    TEST_PAGE_TOKENS_TABLE,
+    WEBHOOK_PAYLOAD_BUCKET_NAME,
+    WEBHOOKS_TABLE,
+    WMS_BUCKET_NAME,
+)
+from Crypto.Cipher import AES
+from resources import ConnectionsError, resource_map
+from utils.exceptions import (
+    PokedexException,
+    ResourceNotFoundException,
+    format_exception,
+)
+from utils.logutil import getLogger
+from utils.schema import ValidationError, validate_task_payload
+from utils.utils import (
+    dt_to_str,
+    now,
+    send_slack_webhook,
+    str_to_dt,
+)
+
+logger = getLogger()
+
+sm = boto3.client("secretsmanager")
+ssm = boto3.client(
+    "ssm", config=Config(retries={"mode": "adaptive", "max_attempts": 10})
+)
+rds = boto3.client("rds")
+ecr = boto3.client("ecr")
+ecs = boto3.client("ecs")
+s3 = boto3.resource("s3")
+s3_client = boto3.client("s3")
+
+# process-local cache for Secrets Manager; keeps GetSecretValue + KMS Decrypt
+# out of the hot path. no TTL — pokedex secrets don't rotate in-place, so
+# cached values are valid for the process lifetime. redeploy/restart to
+# pick up a rotated secret.
+_secret_cache = {}
+
+# process-local cache for DDB table metadata (key_schema, GSIs). schemas are
+# effectively immutable during a process lifetime, so no TTL needed. without
+# this, every query triggers a DescribeTable via boto3's lazy attribute access.
+_table_meta_cache = {}
+
+# process-local TTL caches for the per-request auth hot path. every API call
+# reads the api-keys table to validate the key and the orgs table to resolve the
+# org; without this, one customer's burst can throttle the shared api-keys table
+# and degrade auth for everyone. entries are {value, expires_at}. the write
+# functions below pop their entry so a change lands right away in that process;
+# other warm containers pick it up when their TTL expires.
+_api_key_row_cache = {}
+_org_row_cache = {}
+
+
+def get_table_meta(table_name):
+    # callers pass `table.name` — that's a boto3 resource *identifier* set at
+    # construction time (dynamodb.Table("foo") → .name == "foo") and does NOT
+    # trigger DescribeTable. only *loaded* attributes (.key_schema,
+    # .global_secondary_indexes, .table_arn, etc.) hit the wire, which is why
+    # we cache their lookup below.
+    meta = _table_meta_cache.get(table_name)
+    if meta is None:
+        table = dynamodb.Table(table_name)
+        meta = {
+            "key_schema": table.key_schema,
+            "global_secondary_indexes": table.global_secondary_indexes or [],
+        }
+        _table_meta_cache[table_name] = meta
+    return meta
+
+
+custom_logos_bucket = s3.Bucket(CUSTOM_LOGOS_BUCKET)
+resource_bucket = s3.Bucket(RESOURCE_BUCKET_NAME)
+webhook_payload_bucket = s3.Bucket(WEBHOOK_PAYLOAD_BUCKET_NAME)
+INTEGRATION_DATA_BUCKETS = {
+    "carrier": s3.Bucket(CARRIER_BUCKET_NAME),
+    "wms": s3.Bucket(WMS_BUCKET_NAME),
+}
+TASK_BUCKETS = {
+    "submitter": s3.Bucket(LAMBDA_TASKS["submitter"]["trigger"]["bucket_name"]),
+    "webhook": s3.Bucket(LAMBDA_TASKS["webhook"]["trigger"]["bucket_name"]),
+    "linked-refresh": s3.Bucket(
+        LAMBDA_TASKS["linked-refresh"]["trigger"]["bucket_name"]
+    ),
+}
+lambda_client = boto3.client("lambda")
+sqs = boto3.client("sqs")
+permission_validator_queue = LAMBDA_TASKS["permission-validator"]["trigger"][
+    "queue_name"
+]
+dynamodb = boto3.resource("dynamodb")
+orgs_table = dynamodb.Table(ORGS_TABLE)
+auth_codes_table = dynamodb.Table(AUTH_CODES_TABLE)
+connections_table = dynamodb.Table(CONNECTIONS_TABLE)
+api_keys_table = dynamodb.Table(API_KEYS_TABLE)
+link_tokens_table = dynamodb.Table(LINK_TOKENS_TABLE)
+magic_links_table = dynamodb.Table(MAGIC_LINKS_TABLE)
+webhooks_table = dynamodb.Table(WEBHOOKS_TABLE)
+scheduler_table = dynamodb.Table(SCHEDULER_TABLE)
+sync_jobs_table = dynamodb.Table(SYNC_JOBS_TABLE)
+connection_errors_table = dynamodb.Table(CONNECTION_ERRORS_TABLE)
+event_log_table = dynamodb.Table(EVENT_LOG_TABLE)
+test_page_tokens_table = dynamodb.Table(TEST_PAGE_TOKENS_TABLE)
+event_notifications_table = dynamodb.Table(EVENT_NOTIFICATIONS_TABLE)
+billing_pricing_rules_table = dynamodb.Table(BILLING_PRICING_RULES_TABLE)
+billing_overrides_table = dynamodb.Table(BILLING_OVERRIDES_TABLE)
+billing_invoices_table = dynamodb.Table(BILLING_INVOICES_TABLE)
+rollouts_table = dynamodb.Table(ROLLOUTS_TABLE)
+idempotency_keys_table = dynamodb.Table(IDEMPOTENCY_KEYS_TABLE)
+
+
+# SM
+
+
+def get_raw_secret(secret_id):
+    if secret_id not in _secret_cache:
+        response = sm.get_secret_value(SecretId=secret_id)
+        _secret_cache[secret_id] = response["SecretString"]
+    return _secret_cache[secret_id]
+
+
+def get_app_creds(integration_name, raw=False):
+    secret_name = f"app_creds/{integration_name}"
+    return (
+        get_raw_secret(secret_name) if raw else json.loads(get_raw_secret(secret_name))
+    )
+
+
+def get_routine_creds(routine_name):
+    # routine /fire creds (JSON: {"id": "<routine_id>", "token": "sk-ant-oat01-..."})
+    secret_name = ROUTINE_SECRETS[routine_name]
+    return json.loads(get_raw_secret(secret_name))
+
+
+def get_ai_api_key(provider):
+    secret = json.loads(get_raw_secret(AI_API_KEYS_SECRET))
+    return secret[provider]
+
+
+def get_agent_creds():
+    return json.loads(get_raw_secret(AGENT_CREDS_SECRET))
+
+
+def get_agent_github_pat():
+    return get_agent_creds()["GH_TOKEN"]
+
+
+def get_dd_app_key():
+    return get_agent_creds()["DD_APPLICATION_KEY"]
+
+
+def get_org_private_key(org_id):
+    secret_name = f"private_key/{org_id}"
+    return get_raw_secret(secret_name)
+
+
+def store_org_private_key(org_id, private_key):
+    secret_name = f"private_key/{org_id}"
+    sm.create_secret(Name=secret_name, SecretString=private_key)
+
+
+def delete_org_private_key(org_id, force=False):
+    secret_name = f"private_key/{org_id}"
+    if force:
+        sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+    else:
+        sm.delete_secret(SecretId=secret_name)
+
+
+def get_rds_secret():
+    rds_secret_name = get_ssm_parameter(RDS_SECRET_PARAM)
+    if not rds_secret_name:
+        raise Exception("RDS SSM parameter not found")
+    raw_secret = get_raw_secret(rds_secret_name)
+    secret = json.loads(raw_secret)
+    return secret
+
+
+# RDS
+
+
+def get_rds_instance():
+    instances = rds.describe_db_instances()
+    for instance in instances["DBInstances"]:
+        if instance["DBInstanceIdentifier"].startswith(RDS_STACK):
+            return instance
+    raise Exception("RDS instance not found")
+
+
+# SSM
+
+
+def get_ssm_parameter(name):
+    response = ssm.get_parameter(Name=name, WithDecryption=True)
+    return response["Parameter"]["Value"]
+
+
+def store_ssm_parameter(name, value):
+    ssm.put_parameter(Name=name, Value=value, Overwrite=True, Type="String")
+
+
+def get_ssm_parameters_by_path(path):
+    params = {}
+    next_token = None
+    while True:
+        kwargs = {"Path": path, "Recursive": False, "WithDecryption": False}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = ssm.get_parameters_by_path(**kwargs)
+        for param in response.get("Parameters", []):
+            name = param["Name"].split("/")[-1]
+            params[name] = param["Value"]
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+    return params
+
+
+# S3
+
+
+def get_custom_logo_for_org(org_id):
+    return custom_logos_bucket.Object(f"{org_id}.png").get()
+
+
+def upload_custom_logo_for_org(org_id, base64_image):
+    """
+    Upload a base64-encoded image to S3 as a PNG file.
+
+    Args:
+        org_id: The organization ID to use as the filename
+        base64_image: Base64-encoded image string (format: 'data:image/...;base64,...')
+
+    Returns:
+        bool: True if upload was successful
+
+    Raises:
+        ValueError: If the input is not a valid base64-encoded image
+        Exception: For any S3 upload errors
+    """
+    try:
+        if not isinstance(base64_image, str) or not base64_image.startswith(
+            "data:image/"
+        ):
+            raise ValueError(
+                "Input must be a base64-encoded image string starting with 'data:image/'"
+            )
+
+        # Extract the base64-encoded part after the comma
+        file_content = base64.b64decode(base64_image.split(",", 1)[1])
+
+        if not file_content:
+            raise ValueError("Decoded image data is empty")
+
+        # Upload to S3 with .png extension
+        custom_logos_bucket.put_object(
+            Key=f"{org_id}.png",
+            Body=file_content,
+            ContentType="image/png",
+        )
+        return True
+
+    except Exception as e:
+        print(f"Error uploading file: {str(e)}")
+        print(f"Input type: {type(base64_image)}")
+        if "file_content" in locals():
+            print(f"Decoded size: {len(file_content)} bytes")
+        raise
+
+
+def delete_custom_logo_for_org(org_id):
+    custom_logos_bucket.Object(f"{org_id}.png").delete()
+
+
+def custom_logo_version(org_id):
+    try:
+        obj = custom_logos_bucket.Object(f"{org_id}.png")
+        obj.load()
+        # the object exists; boto3 gives None for a version id only when the bucket
+        # isn't versioned, so return "" there to keep "exists" distinct from a 404
+        return obj.version_id or ""
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            return None
+        raise
+
+
+def get_webhook_ingestion_folder(bucket_name, path):
+    bucket = s3.Bucket(bucket_name)
+    objects = bucket.objects.filter(Prefix=path)
+    # load each object
+    ret = []
+    for obj in objects:
+        got = obj.get()
+        body = got["Body"].read()
+        loaded = json.loads(body)
+        ret.append(loaded)
+    return ret
+
+
+def write_pickle_to_s3(task, payload, source):
+    validate_task_payload(task, payload)
+    chunk_size = TASK_CHUNK_SIZE.get(task)
+    data = payload["data"]
+
+    # only chunks if task is in TASK_CHUNK_SIZE and data is larger than chunk size
+    if chunk_size and len(data) > chunk_size:
+        chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
+    else:
+        chunks = [data]
+
+    current_date = now().strftime("%Y-%m-%d")
+    resource = payload["resource"]
+    connection_id = str(resource.integration.connection_id)
+    retry_count = payload.get("retry_count", 0)
+    workflow_id, base_pickle_id = parse_tracking_id(
+        payload.get("tracking_id"), source, retry_count
+    )
+
+    tracking_ids = []
+    for i, chunk_data in enumerate(chunks):
+        chunk_payload = {**payload, "data": chunk_data}
+        pickle_id = f"{base_pickle_id}_{i}" if len(chunks) > 1 else base_pickle_id
+        key = f"{connection_id}/{current_date}/{workflow_id}/{pickle_id}.pkl"
+        tracking_id = f"{workflow_id}/{pickle_id}"
+        chunk_payload["tracking_id"] = tracking_id
+        metadata = {
+            "source": source,
+            "tracking_id": tracking_id,
+            "connection_id": connection_id,
+            "retry_count": str(retry_count),
+        }
+        TASK_BUCKETS[task].put_object(
+            Key=key, Body=pickle.dumps(chunk_payload), Metadata=metadata
+        )
+        tracking_ids.append(tracking_id)
+
+    return tracking_ids
+
+
+def parse_tracking_id(tracking_id, source, retry_count):
+    if not tracking_id:
+        timestamp = now().strftime("%H%M%S")
+        workflow_id = f"{source}_{timestamp}_{uuid.uuid4().hex[:8]}"
+    else:
+        workflow_id = tracking_id.split("/")[0]
+    if retry_count > 0:
+        pickle_id = f"{tracking_id.split('/')[1]}_retry_{retry_count}"
+    else:
+        pickle_id = uuid.uuid4().hex[:8]
+    return workflow_id, pickle_id
+
+
+# large field offloading
+
+
+def offload_large_fields(table_name, row):
+    # collect all list/dict fields with sizes, sorted largest first
+    sized_fields = []
+    for field, value in row.items():
+        if not isinstance(value, (dict, list)) or field == "refs":
+            continue
+        # sorted keys, so the same content hashes the same in any vendor key order
+        serialized = orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
+        sized_fields.append((field, serialized, len(serialized)))
+    sized_fields.sort(key=lambda x: x[2], reverse=True)
+
+    # offload fields individually exceeding threshold
+    to_offload = []
+    remaining = []
+    for f, s, sz in sized_fields:
+        if sz > LARGE_FIELD_THRESHOLD:
+            to_offload.append((f, s))
+        else:
+            remaining.append((f, s, sz))
+    # no single field over threshold but combined may exceed dynamo 400kb limit,
+    # iteratively offload largest remaining until under threshold
+    while remaining and sum(sz for _, _, sz in remaining) > LARGE_FIELD_THRESHOLD:
+        f, s, sz = remaining.pop(0)
+        to_offload.append((f, s))
+    if not to_offload:
+        return row
+
+    # the caller keeps its full row; only the copy headed for dynamo loses the field
+    row = dict(row)
+    refs = dict(row.get("refs", {}))
+    resource_name = table_name.rsplit("-", 1)[0]
+    client = resource_bucket.meta.client
+    for field, serialized in to_offload:
+        checksum = base64.b64encode(hashlib.sha256(serialized).digest()).decode()
+        s3_key = f"{resource_name}/{row['connection_id']}/{row['id']}/{field}.json"
+        stored_checksum = None
+        version_id = None
+        try:
+            head = client.head_object(
+                Bucket=RESOURCE_BUCKET_NAME, Key=s3_key, ChecksumMode="ENABLED"
+            )
+            # objects written before we sent a checksum have none
+            stored_checksum = head.get("ChecksumSHA256")
+            version_id = head["VersionId"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                raise
+        # same content keeps the stored version, so the ref changes only when the
+        # content does and the diff can see it
+        if stored_checksum != checksum:
+            logger.info(
+                f"Offloading large field {field} for {resource_name} {row['id']}"
+            )
+            put = client.put_object(
+                Bucket=RESOURCE_BUCKET_NAME,
+                Key=s3_key,
+                Body=serialized,
+                ChecksumSHA256=checksum,
+            )
+            version_id = put["VersionId"]
+        refs[field] = {"key": s3_key, "hash": checksum, "version_id": version_id}
+        row[field] = [] if isinstance(row[field], list) else {}
+    row["refs"] = refs
+    return row
+
+
+def offload_large_fields_in_rows(table_name, rows):
+    offloaded = []
+    for row in rows:
+        offloaded.append(offload_large_fields(table_name, row))
+    return offloaded
+
+
+def hydrate_large_fields(row, strict=False):
+    refs = row.pop("refs", {})
+    for field, ref in refs.items():
+        # a value written inline after the field was offloaded is newer than the ref
+        if row.get(field):
+            continue
+        try:
+            # rows offloaded before the hash moved into the ref hold the bare key
+            if isinstance(ref, dict):
+                obj = resource_bucket.Object(ref["key"])
+                obj = obj.get(VersionId=ref["version_id"])
+            else:
+                obj = resource_bucket.Object(ref).get()
+            row[field] = orjson.loads(obj["Body"].read())
+        except Exception as e:
+            # the webhook lambda would rather retry than send the field empty; a
+            # read keeps serving the row
+            if strict:
+                raise
+            logger.error(f"Failed to hydrate field {field} from S3: {e}")
+    return row
+
+
+# oversized webhook payloads
+
+
+def webhook_payload_key(org_id, payload_id):
+    return f"{org_id}/{payload_id}.json"
+
+
+def store_webhook_payload(org_id, payload):
+    payload_id = uuid.uuid4().hex
+    webhook_payload_bucket.put_object(
+        Key=webhook_payload_key(org_id, payload_id), Body=orjson.dumps(payload)
+    )
+    return payload_id
+
+
+def read_webhook_payload(org_id, payload_id):
+    # the key is built from the caller's own authenticated org, so a payload id
+    # guessed from another org just misses instead of reading their data
+    key = webhook_payload_key(org_id, payload_id)
+    try:
+        s3_client.head_object(Bucket=WEBHOOK_PAYLOAD_BUCKET_NAME, Key=key)
+    except ClientError:
+        return None
+
+    # always a link, even for an event small enough to return whole, so there is
+    # one shape to code against and it gets exercised on every fetch
+    expires_at = now() + timedelta(seconds=PRESIGNED_URL_EXPIRATION)
+    return {
+        "download_url": s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": WEBHOOK_PAYLOAD_BUCKET_NAME, "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRATION,
+        ),
+        "download_url_expires_at": dt_to_str(expires_at),
+    }
+
+
+# dynamo
+
+
+def get_table_keys(table):
+    keys = {}
+    meta = get_table_meta(table.name)
+    for schema in meta["key_schema"]:
+        if schema["KeyType"] == "HASH":
+            keys["primary"] = schema["AttributeName"]
+        elif schema["KeyType"] == "RANGE":
+            keys["sort"] = schema["AttributeName"]
+    return keys
+
+
+def query(table_name, query_args, filters):
+    table = dynamodb.Table(table_name)
+    response = table.query(**query_args)
+    if "Items" in response:
+        items = response["Items"]
+        for f in filters:
+            items = list(filter(f, items))
+        response["Items"] = items
+    return response
+
+
+def query_paginated(table_name, query_args, filters):
+    response = query(table_name, query_args, filters)
+    items = response["Items"]
+    while "LastEvaluatedKey" in response:
+        query_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        response = query(table_name, query_args, filters)
+        items.extend(response["Items"])
+    return items
+
+
+def scan_paginated(table_name, scan_args):
+    table = dynamodb.Table(table_name)
+    response = table.scan(**scan_args)
+    items = response["Items"]
+    while "LastEvaluatedKey" in response:
+        response = table.scan(
+            ExclusiveStartKey=response["LastEvaluatedKey"], **scan_args
+        )
+        items.extend(response["Items"])
+    return items
+
+
+def query_single_page(table_name, query_args, filters, exclusive_start_key=None):
+    if exclusive_start_key:
+        query_args["ExclusiveStartKey"] = json.loads(
+            base64.b64decode(exclusive_start_key).decode("utf-8")
+        )
+    response = query(table_name, query_args, filters)
+    next_token = None
+    if response.get("LastEvaluatedKey"):
+        next_token = base64.b64encode(
+            json.dumps(response["LastEvaluatedKey"]).encode("utf-8")
+        ).decode("utf-8")
+    return response["Items"], next_token
+
+
+def scan_single_page(table, scan_args, exclusive_start_key=None):
+    if exclusive_start_key:
+        scan_args["ExclusiveStartKey"] = json.loads(
+            base64.b64decode(exclusive_start_key).decode("utf-8")
+        )
+    response = table.scan(**scan_args)
+    next_token = None
+    if response.get("LastEvaluatedKey"):
+        next_token = base64.b64encode(
+            json.dumps(response["LastEvaluatedKey"]).encode("utf-8")
+        ).decode("utf-8")
+    return response["Items"], next_token
+
+
+def get_best_index(table, query_params):
+    table_indexes = get_table_meta(table.name)["global_secondary_indexes"]
+    for idx in table_indexes:
+        if idx["IndexStatus"] != "ACTIVE":
+            continue
+        for key in query_params:
+            if key != idx["IndexName"]:
+                continue
+            for operator in query_params[key]:
+                op = operator
+                if operator.endswith("-insensitive"):
+                    op = operator[:-12]
+                # neq, in, and nin are not supported
+                if op not in ["neq", "in", "nin"]:
+                    return idx
+
+
+operator_to_lambda_filter = {
+    "eq": lambda row, p, v: row[p] == v,
+    "neq": lambda row, p, v: row[p] != v,
+    "gt": lambda row, p, v: row[p] > v,
+    "lt": lambda row, p, v: row[p] < v,
+    "gte": lambda row, p, v: row[p] >= v,
+    "lte": lambda row, p, v: row[p] <= v,
+    "in": lambda row, p, v: row[p] in v,
+    "nin": lambda row, p, v: row[p] not in v,
+    "contains": lambda row, p, v: v in row[p],
+    "not_contains": lambda row, p, v: v not in row[p],
+}
+
+
+def generate_filter_wrapper(p, v, raw_filter):
+    def full_filter(row):
+        return raw_filter(row, p, v)
+
+    return full_filter
+
+
+def create_dynamo_args(
+    table_name, primary_value, sec_value="", key_names={}, query_params={}
+):
+    if sec_value and query_params:
+        raise Exception("Cannot have both secondary key and query_params")
+    table = dynamodb.Table(table_name)
+    if not key_names:
+        key_names = get_table_keys(table)
+    key_expression = Key(key_names["primary"]).eq(primary_value)
+    if sec_value:
+        key_expression = key_expression & Key(key_names["sort"]).eq(sec_value)
+    index = get_best_index(table, query_params)
+    # the range attribute to build key conditions on: the field itself for a
+    # normal index, or the gsi_<field> shadow for a nullable one. the GSI is still
+    # named for the field — e.g. for ?reference_id=X, get_best_index returns
+    #   index = {"IndexName": "reference_id", "KeySchema": [
+    #       {"AttributeName": "connection_id",    "KeyType": "HASH"},
+    #       {"AttributeName": "gsi_reference_id", "KeyType": "RANGE"}]}
+    # so index_key_attr resolves to "gsi_reference_id".
+    index_key_attr = None
+    if index:
+        for index_key in index["KeySchema"]:
+            if index_key["KeyType"] == "RANGE":
+                index_key_attr = index_key["AttributeName"]
+    formatted_filters = []
+    attr_values = {}
+    attr_names = {}
+    page_token = None
+    limit = MIN_API_RETURN_SIZE
+    # indexed fields can only handle one filter
+    unapplied_filters = []
+    for param, entry in query_params.items():
+        # given an input like ?order_number[eq]=12345&order_number[gt]=999
+        # query_params will be {"order_number": {"eq":      "12345", "gt":      "999"}}
+        #                        ^param           ^operator  ^value   ^operator  ^value
+        # if it's like ?order_number[in]=foo&order_number[in]=bar
+        # query_params will be {"order_number": {"in":       ["foo", "bar"]}}
+        #                        ^param           ^operator  ^value is the whole list
+        # `lookup_param` (set below) is what `param` resolves to as the attribute we
+        # actually look up by: the field itself, or its gsi_<field> shadow for a
+        # nullable index (so ?reference_id= looks up by gsi_reference_id).
+        if param == "page_token":
+            page_token = entry["eq"]
+            continue
+        if param == "limit":
+            # clamp to MIN_API_RETURN_SIZE so the first ddb page can't
+            # hydrate past the 6mb lambda response payload limit
+            raw_limit = int(entry["eq"])
+            limit = min(raw_limit, MIN_API_RETURN_SIZE)
+            continue
+
+        lookup_param = param
+        if index and param == index["IndexName"] and index_key_attr:
+            lookup_param = index_key_attr
+
+        # indexed field with both gte and lte: use between as a single key condition
+        skip_operators = set()
+        if index and param == index["IndexName"] and "gte" in entry and "lte" in entry:
+            gte_val = entry["gte"]
+            lte_val = entry["lte"]
+            if gte_val > lte_val:
+                raise ValidationError(
+                    f"Invalid query parameter: {param} gte value of {gte_val} > lte value of {lte_val}"
+                )
+            key_expression = key_expression & Key(lookup_param).between(
+                gte_val, lte_val
+            )
+            skip_operators = {"gte", "lte"}
+
+        for operator, value in entry.items():
+            if operator in skip_operators:
+                continue
+
+            operator_attr_values = {}
+            if not isinstance(value, list):
+                attr_value = f":{param}_{operator}"
+                # e.g. :order_number_eq
+                if operator == "is_null":
+                    value = None
+                operator_attr_values[attr_value] = value
+                # is_null compares against None, not the boolean operator_value
+                value_in_filter = attr_value
+            else:
+                # for instances of in and nin
+                # and sometimes contains + not contains (for example, tags[contains])
+                # where the parameter is a CommaSeparatedList
+                attr_value_list = []
+                for idx, val_elem in enumerate(value):
+                    attr_value = f":{param}_{operator}_{idx}"
+                    attr_value_list.append(attr_value)
+                    # e.g. :order_number_in_0 and :order_number_in_1
+                    operator_attr_values[attr_value] = val_elem
+                if operator in ["in", "nin"]:
+                    # these are part of the same filter, comma joined
+                    # #{param} IN (:param_in_0, :param_in_1)
+                    value_in_filter = ", ".join(attr_value_list)
+                else:  # contains, not_contains
+                    # if this is a list, these are ANDed together - values in different filters
+                    # contains(param, :value1) AND contains(param, :value2)
+                    value_in_filter = attr_value_list
+
+            operator_to_ddb_key = {
+                "eq": Key(lookup_param).eq(value),
+                "gt": Key(lookup_param).gt(value),
+                "lt": Key(lookup_param).lt(value),
+                "gte": Key(lookup_param).gte(value),
+                "lte": Key(lookup_param).lte(value),
+            }
+            operator_to_ddb_filter = {
+                "eq": [f"#{param} = {value_in_filter}"],
+                "neq": [f"#{param} <> {value_in_filter}"],
+                "gt": [f"#{param} > {value_in_filter}"],
+                "lt": [f"#{param} < {value_in_filter}"],
+                "gte": [f"#{param} >= {value_in_filter}"],
+                "lte": [f"#{param} <= {value_in_filter}"],
+                "in": [f"#{param} IN ({value_in_filter})"],
+                "nin": [f"NOT #{param} IN ({value_in_filter})"],
+                "contains": (
+                    [f"contains (#{param}, {vf})" for vf in value_in_filter]
+                    if isinstance(value_in_filter, list)
+                    else [f"contains (#{param}, {value_in_filter})"]
+                ),
+                "not_contains": (
+                    [f"NOT contains (#{param}, {vf})" for vf in value_in_filter]
+                    if isinstance(value_in_filter, list)
+                    else [f"NOT contains (#{param}, {value_in_filter})"]
+                ),
+                "is_null": (
+                    [f"#{param} = {value_in_filter}"]
+                    if entry[operator] is True
+                    else [f"#{param} <> {value_in_filter}"]
+                ),
+            }
+
+            if not index or (index and param != index["IndexName"]):
+                attr_names[f"#{param}"] = param
+                attr_values.update(operator_attr_values)
+                ddb_filters = operator_to_ddb_filter[operator]
+                formatted_filters.extend(ddb_filters)
+            elif (
+                operator in ["neq", "in", "nin", "contains", "not_contains"]
+                or key_expression.expression_operator == "AND"
+            ):
+                raw_lambda_filter = operator_to_lambda_filter[operator]
+                lambda_filter = generate_filter_wrapper(param, value, raw_lambda_filter)
+                unapplied_filters.append(lambda_filter)
+            else:
+                key_expression = key_expression & operator_to_ddb_key[operator]
+
+    dynamo_args: dict[str, object] = {
+        "KeyConditionExpression": key_expression,
+        "ExpressionAttributeValues": attr_values,
+        "ExpressionAttributeNames": attr_names,
+    }
+    if index:
+        dynamo_args["IndexName"] = index["IndexName"]
+    filter_expression = " AND ".join(formatted_filters)
+    if filter_expression:
+        dynamo_args["FilterExpression"] = filter_expression
+    if page_token:
+        decoded_page_token = base64.b64decode(page_token)
+        loaded_page_token = json.loads(decoded_page_token)
+        expected_token_keys = set(key_names.values())
+        if index and index_key_attr:
+            expected_token_keys.add(index_key_attr)
+        if expected_token_keys != set(loaded_page_token.keys()):
+            raise ValidationError("Invalid page token. Did you change the filters?")
+        dynamo_args["ExclusiveStartKey"] = loaded_page_token
+    dynamo_args["Limit"] = limit
+    return dynamo_args, unapplied_filters
+
+
+def dict_to_dynamo(obj):
+    result = {}
+    for key, member in obj.items():
+        if isinstance(member, float):
+            member = decimal.Decimal(str(member))
+        elif isinstance(member, dict):
+            member = dict_to_dynamo(member)
+        elif isinstance(member, list):
+            formatted_list = []
+            for elem in member:
+                if isinstance(elem, float):
+                    elem = decimal.Decimal(str(elem))
+                elif isinstance(elem, dict):
+                    elem = dict_to_dynamo(elem)
+                # shouldn't need to handle list of list
+                formatted_list.append(elem)
+            member = formatted_list
+        result[key] = member
+    return result
+
+
+def dynamo_to_dict(obj, hydrate=True):
+    result = {}
+    for key, member in obj.items():
+        if isinstance(member, decimal.Decimal):
+            if int(member) == float(member):
+                member = int(member)
+            else:
+                member = float(member)
+        elif isinstance(member, dict):
+            member = dynamo_to_dict(member)
+        elif isinstance(member, list):
+            formatted_list = []
+            for elem in member:
+                if isinstance(elem, decimal.Decimal):
+                    if int(elem) == float(elem):
+                        elem = int(elem)
+                    else:
+                        elem = float(elem)
+                elif isinstance(elem, dict):
+                    elem = dynamo_to_dict(elem)
+                # shouldn't need to handle list of list
+                formatted_list.append(elem)
+            member = formatted_list
+        result[key] = member
+
+    if hydrate:
+        hydrate_large_fields(result)
+    return result
+
+
+## auth
+
+
+def create_org_row(org):
+    orgs_table.put_item(Item=org)
+
+
+def update_org_settings_row(org_id, update_fields):
+    key = {"id": org_id}
+    update_expression_list = []
+    expression_attribute_values = {}
+    for item, value in update_fields.items():
+        update_expression_list.append(f"{item} = :{item}")
+        expression_attribute_values[f":{item}"] = value
+    update_expression = "SET " + ", ".join(update_expression_list)
+    update_args = {
+        "Key": key,
+        "UpdateExpression": update_expression,
+        "ExpressionAttributeValues": expression_attribute_values,
+        "ReturnValues": "ALL_NEW",
+    }
+    result = orgs_table.update_item(**update_args)
+    # org changed, so drop the cached row to force a fresh read
+    _org_row_cache.pop(org_id, None)
+    return result
+
+
+def store_rollout(rollout):
+    rollout = dict(rollout)
+    # the timeline reads by month, so the partition it belongs to is derived
+    # here rather than trusted from the caller
+    rollout["month"] = rollout["rolled_out_at"][:7]
+    rollouts_table.put_item(Item=dict_to_dynamo(rollout))
+    return rollout
+
+
+def get_rollouts_for_month(month, stage=None):
+    # dev and prod share an account, so the dashboard can read either stage's
+    # history from whichever one is answering
+    table_name = ROLLOUTS_TABLE if stage in (None, STAGE) else f"rollouts-{stage}"
+    query_args = {
+        "IndexName": ROLLOUTS_MONTH_INDEX,
+        "KeyConditionExpression": Key("month").eq(month),
+        # newest first, which is the only order a release timeline is read in
+        "ScanIndexForward": False,
+    }
+    rollouts = []
+    try:
+        for item in query_paginated(table_name, query_args, []):
+            rollouts.append(dynamo_to_dict(item))
+    except ClientError as error:
+        if error.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+        # the table is per stage and per account, so a stage that has not had it
+        # deployed yet has no history rather than a broken dashboard
+        return None
+    return rollouts
+
+
+def scan_billing_pricing_rules():
+    rules = []
+    for item in scan_paginated(BILLING_PRICING_RULES_TABLE, {}):
+        rules.append(dynamo_to_dict(item))
+    return rules
+
+
+def get_billing_pricing_rule(rule_id):
+    response = billing_pricing_rules_table.get_item(
+        Key={"id": rule_id}, ConsistentRead=True
+    )
+    if "Item" not in response:
+        return None
+    return dynamo_to_dict(response["Item"])
+
+
+def store_billing_pricing_rule(rule):
+    rule = dict(rule)
+    rule["updated_at"] = dt_to_str(now())
+    billing_pricing_rules_table.put_item(Item=dict_to_dynamo(rule))
+    return rule
+
+
+def delete_billing_pricing_rule(rule_id):
+    billing_pricing_rules_table.delete_item(Key={"id": rule_id})
+
+
+# the overrides table holds two row kinds under one key shape: whole-invoice
+# amount rows (sort key = the month) and per-connection billable rows (sort key
+# = month#connection_id, so they sort beside their month). the connection_id
+# attribute is what tells them apart; nothing parses the sort key.
+def scan_billing_overrides():
+    overrides = []
+    for item in scan_paginated(BILLING_OVERRIDES_TABLE, {}):
+        row = dynamo_to_dict(item)
+        if "connection_id" not in row:
+            overrides.append(row)
+    return overrides
+
+
+def scan_billing_connection_overrides():
+    overrides = []
+    for item in scan_paginated(BILLING_OVERRIDES_TABLE, {}):
+        row = dynamo_to_dict(item)
+        if "connection_id" in row:
+            overrides.append(row)
+    return overrides
+
+
+def store_billing_connection_override(org_id, month, connection_id, billable):
+    row = {
+        "org_id": org_id,
+        "month": f"{month}#{connection_id}",
+        "invoice_month": month,
+        "connection_id": connection_id,
+        "billable": billable,
+        # a reader from before this row kind existed reads amount off every row
+        # in the table; the composite month key it files this under is never
+        # looked up, so a zero keeps it harmless instead of crashing it
+        "amount": 0,
+        "updated_at": dt_to_str(now()),
+    }
+    billing_overrides_table.put_item(Item=dict_to_dynamo(row))
+    return row
+
+
+def delete_billing_connection_override(org_id, month, connection_id):
+    billing_overrides_table.delete_item(
+        Key={"org_id": org_id, "month": f"{month}#{connection_id}"}
+    )
+
+
+# the composite sort key makes one org-month's connection rows a single
+# begins_with query instead of a table scan
+def get_billing_connection_overrides_for_org(org_id, month):
+    overrides = {}
+    kwargs = {
+        "KeyConditionExpression": Key("org_id").eq(org_id)
+        & Key("month").begins_with(f"{month}#")
+    }
+    while True:
+        response = billing_overrides_table.query(**kwargs)
+        for item in response["Items"]:
+            row = dynamo_to_dict(item)
+            overrides[row["connection_id"]] = row["billable"]
+        if "LastEvaluatedKey" not in response:
+            return overrides
+        kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+
+def store_billing_override(org_id, month, amount):
+    row = {
+        "org_id": org_id,
+        "month": month,
+        "amount": amount,
+        "updated_at": dt_to_str(now()),
+    }
+    billing_overrides_table.put_item(Item=dict_to_dynamo(row))
+    return row
+
+
+def delete_billing_override(org_id, month):
+    billing_overrides_table.delete_item(Key={"org_id": org_id, "month": month})
+
+
+def delete_billing_invoice(month, org_id):
+    billing_invoices_table.delete_item(Key={"month": month, "org_id": org_id})
+
+
+# a month is closed when its marker row says so, not when it has rows in it. the
+# marker is claimed before the first invoice is written, so a second closer stops
+# before storing anything, and it only flips to closed once every invoice is in.
+# the claim's timestamp doubles as a fencing token: a reclaim after a stale claim
+# is strictly newer, so every write can prove it isn't from an abandoned closer.
+BILLING_MONTH_MARKER = "#status"
+
+
+def claim_billing_month(month):
+    claim_token = dt_to_str(now())
+    marker = {
+        "month": month,
+        "org_id": BILLING_MONTH_MARKER,
+        "state": "closing",
+        "claimed_at": claim_token,
+    }
+    stale_before = dt_to_str(now() - timedelta(minutes=BILLING_MONTH_CLAIM_MINUTES))
+    try:
+        billing_invoices_table.put_item(
+            Item=dict_to_dynamo(marker),
+            # a closed month is never reclaimed, and neither is one another
+            # request is closing right now; a claim left behind by a request that
+            # died goes stale so the month can be closed later
+            ConditionExpression=Attr("org_id").not_exists()
+            | Attr("state").eq("reopened")
+            | (Attr("state").eq("closing") & Attr("claimed_at").lt(stale_before)),
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        return None
+    return claim_token
+
+
+def commit_billing_month(month, invoice_count, claim_token):
+    try:
+        billing_invoices_table.update_item(
+            Key={"month": month, "org_id": BILLING_MONTH_MARKER},
+            UpdateExpression=(
+                "SET #state = :closed, invoice_count = :count, closed_at = :closed_at"
+            ),
+            # only the claim holder may finalize; a closer resuming after its
+            # claim went stale and was taken over must fail, not commit
+            ConditionExpression=Attr("state").eq("closing")
+            & Attr("claimed_at").eq(claim_token),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":closed": "closed",
+                ":count": invoice_count,
+                ":closed_at": dt_to_str(now()),
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        return False
+    return True
+
+
+# None until the month is committed, so an interrupted close reads as open and
+# is recomputed rather than served as a half-written final answer — while a
+# month closed with nothing billed stays an empty final answer rather than
+# springing back to life when a rule is added later. only rows written by the
+# committed claim count: an abandoned earlier close can leave rows for orgs the
+# finishing close no longer computes (a rule deleted in between), and those
+# must not surface as part of the final month.
+def get_billing_invoices_for_month(month, consistent=False):
+    rows = []
+    committed_token = None
+    kwargs = {
+        "KeyConditionExpression": Key("month").eq(month),
+        "ConsistentRead": consistent,
+    }
+    while True:
+        response = billing_invoices_table.query(**kwargs)
+        for item in response["Items"]:
+            row = dynamo_to_dict(item)
+            if row["org_id"] == BILLING_MONTH_MARKER:
+                if row["state"] == "closed":
+                    committed_token = row["claimed_at"]
+                continue
+            rows.append(row)
+        if "LastEvaluatedKey" not in response:
+            break
+        kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    if committed_token is None:
+        return None
+    invoices = []
+    for row in rows:
+        if row["claim_token"] == committed_token:
+            invoices.append(row)
+    return invoices
+
+
+# callers reject edits based on this, so it must not miss a month that was
+# closed a moment ago
+# flips the month back to live computation; the marker keeps state=reopened so
+# the reopen shows in the record and a later close is allowed to reclaim it
+def reopen_billing_month(month):
+    try:
+        billing_invoices_table.update_item(
+            Key={"month": month, "org_id": BILLING_MONTH_MARKER},
+            UpdateExpression="SET #state = :reopened, reopened_at = :at",
+            ConditionExpression=Attr("state").eq("closed"),
+            ExpressionAttributeNames={"#state": "state"},
+            ExpressionAttributeValues={
+                ":reopened": "reopened",
+                ":at": dt_to_str(now()),
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        return False
+    # the frozen rows are dead once the marker is no longer closed; delete them
+    # so the next close starts clean
+    kwargs = {"KeyConditionExpression": Key("month").eq(month)}
+    while True:
+        response = billing_invoices_table.query(**kwargs)
+        for item in response["Items"]:
+            row = dynamo_to_dict(item)
+            if row["org_id"] != BILLING_MONTH_MARKER:
+                delete_billing_invoice(month, row["org_id"])
+        if "LastEvaluatedKey" not in response:
+            break
+        kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    return True
+
+
+def scan_closed_billing_months():
+    months = []
+    kwargs = {
+        "ConsistentRead": True,
+        "FilterExpression": Attr("org_id").eq(BILLING_MONTH_MARKER)
+        & Attr("state").eq("closed"),
+    }
+    while True:
+        response = billing_invoices_table.scan(**kwargs)
+        for item in response["Items"]:
+            months.append(dynamo_to_dict(item)["month"])
+        if "LastEvaluatedKey" not in response:
+            break
+        kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    return sorted(months)
+
+
+# scratch until commit_billing_month runs. each row carries its claim token, and
+# a write only lands over a row from the same or an older claim, so a closer
+# resuming after its claim was taken over can't replace the new closer's rows.
+def store_billing_invoice(invoice, claim_token):
+    invoice = dict(invoice)
+    invoice["closed_at"] = dt_to_str(now())
+    invoice["claim_token"] = claim_token
+    try:
+        billing_invoices_table.put_item(
+            Item=dict_to_dynamo(invoice),
+            ConditionExpression=Attr("org_id").not_exists()
+            | Attr("claim_token").lte(claim_token),
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        return None
+    return invoice
+
+
+def set_org_integration_disabled_functions(
+    org_id, integration_name, disabled_functions
+):
+    # set just one integration's entry in the map without reading it first: a plain
+    # read-modify-write of the whole map loses a concurrent write to a different
+    # integration. dynamo won't let one update both create the map and write a key
+    # inside it (overlapping paths), so write the nested key when the map already
+    # exists, and otherwise seed the map with just this entry. attribute_exists /
+    # attribute_not_exists keep both branches safe against a racing writer; if the map
+    # appears between the two attempts we retry and take the nested-write branch.
+    names = {"#map": "disabled_functions_by_integration", "#name": integration_name}
+    for _ in range(3):
+        try:
+            result = orgs_table.update_item(
+                Key={"id": org_id},
+                UpdateExpression="SET #map.#name = :functions",
+                ConditionExpression="attribute_exists(#map)",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues={":functions": disabled_functions},
+                ReturnValues="ALL_NEW",
+            )
+            _org_row_cache.pop(org_id, None)
+            return result
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        try:
+            result = orgs_table.update_item(
+                Key={"id": org_id},
+                UpdateExpression="SET #map = :seed",
+                ConditionExpression="attribute_not_exists(#map)",
+                ExpressionAttributeNames={"#map": "disabled_functions_by_integration"},
+                ExpressionAttributeValues={
+                    ":seed": {integration_name: disabled_functions}
+                },
+                ReturnValues="ALL_NEW",
+            )
+            _org_row_cache.pop(org_id, None)
+            return result
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            # a racing writer created the map first; loop back to the nested write
+    raise Exception(
+        f"could not set disabled_functions_by_integration for org {org_id} after retries"
+    )
+
+
+def set_org_type_disabled_functions(org_id, integration_type, disabled_functions):
+    # update only this type's entry, leaving the other types alone. we don't read the whole
+    # map and write it back because a save for a different type could slip in between and get
+    # lost. dynamo also won't create the map and set a key inside it in one write, so we set
+    # the key if the map already exists, otherwise create it holding just this entry, and try
+    # again if another save created the map first.
+    names = {"#map": "disabled_functions_by_type", "#type": integration_type}
+    for _ in range(3):
+        try:
+            result = orgs_table.update_item(
+                Key={"id": org_id},
+                UpdateExpression="SET #map.#type = :functions",
+                ConditionExpression="attribute_exists(#map)",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues={":functions": disabled_functions},
+                ReturnValues="ALL_NEW",
+            )
+            _org_row_cache.pop(org_id, None)
+            return result
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        try:
+            result = orgs_table.update_item(
+                Key={"id": org_id},
+                UpdateExpression="SET #map = :seed",
+                ConditionExpression="attribute_not_exists(#map)",
+                ExpressionAttributeNames={"#map": "disabled_functions_by_type"},
+                ExpressionAttributeValues={
+                    ":seed": {integration_type: disabled_functions}
+                },
+                ReturnValues="ALL_NEW",
+            )
+            _org_row_cache.pop(org_id, None)
+            return result
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            # a racing writer created the map first; loop back to the nested write
+    raise Exception(
+        f"could not set disabled_functions_by_type for org {org_id} after retries"
+    )
+
+
+def get_org_row(org_id):
+    response = orgs_table.get_item(Key={"id": org_id})
+    if "Item" not in response:
+        raise Exception(f"Org {org_id} not found: {response}")
+    org = dynamo_to_dict(response["Item"])
+    org["custom_logo_url"] = None
+    logo_version = custom_logo_version(org_id)
+    if logo_version is not None:
+        base_url = f"https://{CUSTOM_LOGOS_BUCKET}.s3.amazonaws.com/{org_id}.png"
+        # the key is stable per org, so re-uploading a new logo keeps the same url and
+        # browsers show the cached old image. the bucket is versioned, so tag the url
+        # with the current version id to force a fresh fetch after every upload.
+        if logo_version and logo_version != "null":
+            org["custom_logo_url"] = f"{base_url}?v={logo_version}"
+        else:
+            org["custom_logo_url"] = base_url
+    return org
+
+
+def get_first_crawl_lookback_days(org_row, integration_type):
+    # per-type settings; orgs not yet backfilled fall back to default
+    settings = org_row.get("first_crawl_lookback_settings", {})
+    return int(settings.get(integration_type, DEFAULT_FIRST_CRAWL_LOOKBACK_DAYS))
+
+
+def subscribe_to_notification(org_id, email, notification_type):
+    """
+    create or reactivate a notification subscription
+    """
+    id_key = f"{notification_type}#{email}"
+    id_active = f"{notification_type}#True"
+
+    # check if subscription already exists
+    response = event_notifications_table.get_item(Key={"org_id": org_id, "id": id_key})
+
+    if "Item" in response:
+        # reactivate existing subscription
+        event_notifications_table.update_item(
+            Key={"org_id": org_id, "id": id_key},
+            UpdateExpression="SET active = :true, id_active = :id_active, updated_at = :now",
+            ExpressionAttributeValues={
+                ":true": True,
+                ":id_active": id_active,
+                ":now": dt_to_str(now()),
+            },
+        )
+    else:
+        # create new subscription
+        event_notifications_table.put_item(
+            Item={
+                "org_id": org_id,
+                "id": id_key,
+                "email": email,
+                "notification_type": notification_type,
+                "active": True,
+                "id_active": id_active,
+                "created_at": dt_to_str(now()),
+                "updated_at": dt_to_str(now()),
+            }
+        )
+
+
+def unsubscribe_from_notification(org_id, email, notification_type):
+    """
+    deactivate a notification subscription (soft delete)
+    """
+    id_key = f"{notification_type}#{email}"
+
+    event_notifications_table.update_item(
+        Key={"org_id": org_id, "id": id_key},
+        UpdateExpression="SET active = :false, updated_at = :now REMOVE id_active",
+        ExpressionAttributeValues={":false": False, ":now": dt_to_str(now())},
+    )
+
+
+def get_active_subscribers(org_id, notification_type):
+    """
+    get all active subscribers for a notification type (optimized query via GSI)
+    """
+    id_active = f"{notification_type}#True"
+
+    response = event_notifications_table.query(
+        IndexName=ACTIVE_SUBSCRIPTIONS_INDEX,
+        KeyConditionExpression=Key("org_id").eq(org_id)
+        & Key("id_active").eq(id_active),
+    )
+
+    return [item["email"] for item in response["Items"]]
+
+
+def get_user_notification_settings(org_id, email):
+    """
+    get all notification subscriptions for a user (for UI)
+    """
+    response = event_notifications_table.query(
+        KeyConditionExpression=Key("org_id").eq(org_id),
+        FilterExpression=Attr("email").eq(email),
+    )
+
+    # return as dict: notification_type -> active
+    return {
+        item["notification_type"]: item.get("active", False)
+        for item in response["Items"]
+    }
+
+
+def scan_org_rows():
+    return scan_paginated(ORGS_TABLE, {})
+
+
+def delete_org_row(org_id):
+    orgs_table.delete_item(Key={"id": org_id})
+    # org is gone, so drop it from the cache
+    _org_row_cache.pop(org_id, None)
+
+
+def clean_up_test_org_rows():
+    org_rows = scan_org_rows()
+    for org_row in org_rows:
+        if not org_row["name"].startswith("test-create-"):
+            continue
+        # logic duplicated from api_test create_org cleanup_wrapper
+        org_id = org_row["id"]
+        logger.info(f"Deleting test org {org_row['name']}")
+        delete_org_row(org_id)
+        pk = get_org_private_key(org_id)
+        delete_org_private_key(org_id, force=True)
+        try:
+            api_key = get_api_key_by_org_id(org_id)
+            delete_api_key_row(api_key)
+        except Exception as e:
+            logger.error(f"Error deleting api key: {e}")
+        from utils.svix_util import SvixUtil
+
+        svix = SvixUtil()
+        try:
+            svix.delete_application(org_id)
+        except Exception as e:
+            logger.error(f"Error deleting svix application: {e}")
+        from utils.clerk import delete_clerk_org
+
+        try:
+            delete_clerk_org(org_id)
+        except Exception as e:
+            logger.error(f"Error deleting clerk org: {e}")
+        from utils.api import generate_sandbox_connection_id
+
+        connection_id = generate_sandbox_connection_id(pk, "wms")
+        delete_connections_row(connection_id, hard=True)
+
+
+def store_api_key_row(row):
+    api_keys_table.put_item(Item=row)
+    # this can overwrite an existing key, so drop any cached copy
+    _api_key_row_cache.pop(row["api_key"], None)
+
+
+def get_api_key_row(api_key):
+    response = api_keys_table.get_item(Key={"api_key": api_key})
+    return response["Item"]
+
+
+# cached variants for the per-request auth path; only successful lookups are
+# cached, so invalid keys still hit the table (and a newly created key works at
+# once). missing/invalid keys raise as before.
+def get_api_key_row_cached(api_key):
+    cached = _api_key_row_cache.get(api_key)
+    if cached and cached["expires_at"] > time.time():
+        return cached["row"]
+    row = get_api_key_row(api_key)
+    _api_key_row_cache[api_key] = {
+        "row": row,
+        "expires_at": time.time() + API_KEY_CACHE_TTL_SECONDS,
+    }
+    return row
+
+
+def get_org_row_cached(org_id):
+    cached = _org_row_cache.get(org_id)
+    if cached and cached["expires_at"] > time.time():
+        return cached["row"]
+    row = get_org_row(org_id)
+    _org_row_cache[org_id] = {
+        "row": row,
+        "expires_at": time.time() + ORG_CACHE_TTL_SECONDS,
+    }
+    return row
+
+
+def is_org_inactive(org_id):
+    return get_org_row_cached(org_id)["billing_status"] in INACTIVE_BILLING_STATUSES
+
+
+def update_api_key_row(api_key, update_fields):
+    key = {"api_key": api_key}
+    update_expression_list = []
+    expression_attribute_values = {}
+    for item, value in update_fields.items():
+        update_expression_list.append(f"{item} = :{item}")
+        expression_attribute_values[f":{item}"] = value
+    update_expression = "SET " + ", ".join(update_expression_list)
+    update_args = {
+        "Key": key,
+        "UpdateExpression": update_expression,
+        "ExpressionAttributeValues": expression_attribute_values,
+        "ReturnValues": "ALL_NEW",
+    }
+    result = api_keys_table.update_item(**update_args)
+    # fields changed (e.g. read_only), so drop the cached row to force a fresh read
+    _api_key_row_cache.pop(api_key, None)
+    return result
+
+
+def get_api_key_by_org_id(org_id):
+    response = api_keys_table.query(
+        IndexName=API_KEY_INDEX, KeyConditionExpression=Key("org_id").eq(org_id)
+    )
+    return response["Items"][0]["api_key"]
+
+
+def get_all_api_keys_by_org_id(org_id):
+    api_keys = []
+    response = api_keys_table.query(
+        IndexName=API_KEY_INDEX, KeyConditionExpression=Key("org_id").eq(org_id)
+    )
+    for item in response["Items"]:
+        api_keys.append(
+            {
+                "api_key": item["api_key"],
+                "created_at": item["created_at"],
+                "nickname": item["nickname"],
+                "read_only": item["read_only"],
+            }
+        )
+    return api_keys
+
+
+def delete_api_key_row(api_key):
+    api_keys_table.delete_item(Key={"api_key": api_key})
+    # key is gone, so the cache must stop treating it as valid
+    _api_key_row_cache.pop(api_key, None)
+
+
+def create_link_token_row(row):
+    link_tokens_table.put_item(Item=row)
+
+
+def set_link_token_disabled_functions(link_token, disabled_functions):
+    link_tokens_table.update_item(
+        Key={"link_token": link_token},
+        UpdateExpression="SET disabled_functions = :d",
+        ConditionExpression="attribute_exists(link_token)",
+        ExpressionAttributeValues={":d": disabled_functions},
+    )
+
+
+def get_link_token_row(link_token):
+    response = link_tokens_table.get_item(Key={"link_token": link_token})
+    if "Item" not in response:
+        raise PokedexException(
+            f"Link token {link_token} not found: {response}", 404, origin="trackstar"
+        )
+    return response["Item"]
+
+
+def delete_link_token_row(link_token):
+    link_tokens_table.delete_item(Key={"link_token": link_token})
+
+
+def create_magic_link_row(row):
+    magic_links_table.put_item(Item=row)
+
+
+def get_magic_link_row(magic_link):
+    response = magic_links_table.get_item(Key={"id": magic_link})
+    return response["Item"]
+
+
+def list_magic_links_by_org(org_id):
+    response = magic_links_table.query(
+        IndexName=MAGIC_LINKS_INDEX, KeyConditionExpression=Key("org_id").eq(org_id)
+    )
+    return response["Items"]
+
+
+def delete_magic_link_row(magic_link):
+    magic_links_table.delete_item(Key={"id": magic_link})
+
+
+def store_auth_code_row(row):
+    auth_codes_table.put_item(Item=row)
+
+
+def update_auth_code_column(auth_code, column, value):
+    auth_codes_table.update_item(
+        Key={"auth_code": auth_code},
+        UpdateExpression="SET #column = :value",
+        ExpressionAttributeValues={":value": value},
+        ExpressionAttributeNames={"#column": column},
+    )
+
+
+def update_auth_code_integration_secret(auth_code, raw_integration_secret):
+    app_integration_secret = app_encrypt(raw_integration_secret)
+    update_auth_code_column(auth_code, "integration_secret", app_integration_secret)
+
+
+def set_auth_code_connection(auth_code, connection_id, org_id):
+    auth_codes_table.update_item(
+        Key={"auth_code": auth_code},
+        UpdateExpression="SET connection_id = :connection_id, org_id = :org_id",
+        ExpressionAttributeValues={
+            ":connection_id": connection_id,
+            ":org_id": org_id,
+        },
+    )
+
+
+def get_auth_code_row(auth_code):
+    retries = 2
+    response = {}
+    while retries > 0:
+        # a normal read can miss a write from the last second. the exchange and
+        # permission validator each read what the other just wrote, so if both
+        # missed it the connection would keep the old token
+        response = auth_codes_table.get_item(
+            Key={"auth_code": auth_code}, ConsistentRead=True
+        )
+        if "Item" not in response:
+            retries -= 1
+            time.sleep(0.5)
+        else:
+            break
+    if "Item" not in response:
+        raise Exception(f"Auth code {auth_code} not found: {response}")
+    return response["Item"]
+
+
+def scan_auth_codes_by_link_token(link_token):
+    scan_args = {
+        "ProjectionExpression": "auth_code, integration_name, link_token, exchanged",
+        "FilterExpression": Attr("link_token").eq(link_token),
+    }
+    return scan_paginated(AUTH_CODES_TABLE, scan_args)
+
+
+def mark_auth_code_as_exchanged(auth_code):
+    auth_codes_table.update_item(
+        Key={"auth_code": auth_code},
+        UpdateExpression="SET exchanged = :exchanged",
+        ExpressionAttributeValues={":exchanged": True},
+    )
+
+
+def delete_auth_code_row(auth_code):
+    auth_codes_table.delete_item(Key={"auth_code": auth_code})
+
+
+def create_connections_row(row):
+    existing_row = None
+    try:
+        existing_row = get_connections_row(row["id"])
+        if existing_row == row:
+            return
+        else:
+            # Row exists but integration_secret is different, update it
+            update_connections_row(
+                row["id"], {"integration_secret": row["integration_secret"]}
+            )
+            return
+    except Exception:
+        pass
+
+    connections_table.put_item(Item=row)
+    if (
+        STAGE == "prod"
+        and "sandbox" not in row["integration_name"]
+        and row["org_id"] not in SKIP_GROWTH_ORG_IDS
+    ):
+        try:
+            # remove integration_secret from row
+            row.pop("integration_secret")
+            org = get_org_row(row["org_id"])
+            # prioritize most important first
+            priority_row = {
+                "org_name": org["name"],
+                "integration_name": row["integration_name"],
+                "customer_id": row["customer_id"],
+                "id": row["id"],
+                "integration_type": row["integration_type"],
+            }
+            # sort keys for consistent formatting
+            row = {k: row[k] for k in sorted(row)}
+            for k in row:
+                if k not in priority_row:
+                    priority_row[k] = row[k]
+            formatted_text = "\n".join(
+                [f"*{key}*: {value}" for key, value in priority_row.items()]
+            )
+            title = "New Connection Created!"
+            send_slack_webhook(SLACK_GROWTH_CHANNEL, title, formatted_text)
+        except Exception as e:
+            logger.error(e)
+
+
+def get_connections_row(connection_id, ignore_deleted=True, consistent=False):
+    response = connections_table.get_item(
+        Key={"id": connection_id}, ConsistentRead=consistent
+    )
+    # Ignore deleted connections if arg is true
+    if "Item" not in response:
+        raise Exception(f"Connection {connection_id} not found: {response}")
+    if ignore_deleted and response["Item"].get("deleted", False):
+        raise Exception("Connection deleted")
+    return response["Item"]
+
+
+def update_connections_row(connection_id, update_fields):
+    key = {"id": connection_id}
+    update_expression_list = []
+    expression_attribute_values = {}
+    for item, value in update_fields.items():
+        update_expression_list.append(f"{item} = :{item}")
+        expression_attribute_values[f":{item}"] = value
+    update_expression = "SET " + ", ".join(update_expression_list)
+    update_args = {
+        "Key": key,
+        "UpdateExpression": update_expression,
+        "ExpressionAttributeValues": expression_attribute_values,
+        "ReturnValues": "ALL_NEW",
+    }
+    return connections_table.update_item(**update_args)
+
+
+def get_connections_by_org_id(
+    org_id,
+    ignore_deleted=True,
+    page_token=None,
+):
+    # Ignore deleted connections if arg is true
+    filter_expression = {}
+    if ignore_deleted:
+        filter_expression = {"FilterExpression": Attr("deleted").ne(True)}
+    exclusive_start_key = {}
+    if page_token:
+        page_token = json.loads(base64.b64decode(page_token))
+        exclusive_start_key = {"ExclusiveStartKey": page_token}
+    response = connections_table.query(
+        IndexName=CONNECTIONS_INDEX,
+        KeyConditionExpression=Key("org_id").eq(org_id),
+        **filter_expression,
+        **exclusive_start_key,
+    )
+    return response
+
+
+def get_all_connections_by_org_id(org_id, ignore_deleted=True):
+    connections = []
+    page_token = None
+    while True:
+        response = get_connections_by_org_id(org_id, ignore_deleted, page_token)
+        connections.extend(response["Items"])
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        page_token = base64.b64encode(json.dumps(last_key).encode()).decode()
+    return connections
+
+
+def scan_connections_rows():
+    return scan_paginated(CONNECTIONS_TABLE, {})
+
+
+def scan_connections_rows_paginated(exclusive_start_key=None):
+    return scan_single_page(connections_table, {}, exclusive_start_key)
+
+
+def get_integration_secret(connection_id, org_id):
+    connection = get_connections_row(connection_id)
+    org_pk = get_org_private_key(org_id)
+    encoded_integration_secret = connection["integration_secret"]
+    integration_secret = org_decrypt(encoded_integration_secret, org_pk)
+    return integration_secret
+
+
+def update_integration_secret(connection_id, org_id, raw_integration_secret):
+    if not org_id:
+        raise Exception("no org_id provided")
+    org_pk = get_org_private_key(org_id)
+    org_integration_secret = org_encrypt(raw_integration_secret, org_pk)
+    connections_table.update_item(
+        Key={"id": connection_id},
+        UpdateExpression="SET integration_secret = :integration_secret",
+        ExpressionAttributeValues={":integration_secret": org_integration_secret},
+        # without this, updating a connection that doesn't exist yet creates a
+        # partial row with no integration_name, which the scheduler chokes on
+        ConditionExpression=Attr("id").exists(),
+    )
+
+
+# Set last_used to now and increment times_used by 1
+def set_connection_metadata(connection_id):
+    connections_table.update_item(
+        Key={"id": connection_id},
+        UpdateExpression="SET last_used = :last_used, times_used = if_not_exists(times_used, :zero) + :one",
+        ExpressionAttributeValues={
+            ":last_used": dt_to_str(now()),
+            ":zero": 0,
+            ":one": 1,
+        },
+        ConditionExpression=Attr("id").exists(),
+    )
+
+
+def first_crawl_complete(connection_row, schedule_row, function_name):
+    historical_sync_completed = connection_row.get("historical_sync_completed") or {}
+    if historical_sync_completed.get(function_name):
+        return True
+    latest_data = schedule_row.get("latest_data")
+    if not latest_data:
+        return False
+    return str_to_dt(latest_data) >= str_to_dt(connection_row["created_at"])
+
+
+def set_connections_historical_sync_completed(connection_id, function_name):
+    try:
+        # connections made before this field existed have no map to write a key into,
+        # and dynamo rejects the nested set rather than creating the parent
+        connections_table.update_item(
+            Key={"id": connection_id},
+            UpdateExpression="SET historical_sync_completed = if_not_exists(historical_sync_completed, :empty)",
+            ExpressionAttributeValues={":empty": {}},
+            # without this, updating a connection that doesn't exist yet (deleted
+            # mid-crawl, or a test's fake id) creates a bare row with no org_id
+            ConditionExpression=Attr("id").exists(),
+        )
+        connections_table.update_item(
+            Key={"id": connection_id},
+            UpdateExpression="SET historical_sync_completed.#function_name = :true",
+            ExpressionAttributeNames={"#function_name": function_name},
+            ExpressionAttributeValues={":true": True},
+            ConditionExpression=Attr("id").exists(),
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
+def scan_connection_rows(ignore_deleted=True):
+    # Ignore deleted connections if arg is true
+    filter_expression = {}
+    if ignore_deleted:
+        filter_expression = {"FilterExpression": Attr("deleted").ne(True)}
+    return scan_paginated(CONNECTIONS_TABLE, filter_expression)
+
+
+def delete_connections_row(connection_id, hard=False):
+    if not hard:
+        # Set deleted boolean to true
+        # Set deleted_at to now
+        return connections_table.update_item(
+            Key={"id": connection_id},
+            UpdateExpression="SET deleted = :deleted, deleted_at = :deleted_at",
+            ExpressionAttributeValues={
+                ":deleted": True,
+                ":deleted_at": dt_to_str(now()),
+            },
+            ReturnValues="ALL_OLD",
+        )
+    else:
+        # Delete row
+        return connections_table.delete_item(Key={"id": connection_id})
+
+
+def store_connection_error(
+    org_id,
+    connection_id,
+    integration_name,
+    failed_url,
+    message,
+    affected_endpoint,
+    preventing_sync,
+):
+    table_name = ConnectionsError().table_name()
+    dynamo_args, filters = create_dynamo_args(table_name, connection_id, failed_url)
+    existing_error_rsp = query(ConnectionsError().table_name(), dynamo_args, filters)
+    existing_error = (
+        existing_error_rsp["Items"][0] if existing_error_rsp["Items"] else {}
+    )
+
+    affected_endpoints = existing_error.get("affected_endpoints", [])
+    affected_endpoint_exists = False
+    for existing_affected_endpoint in affected_endpoints:
+        endpoint = existing_affected_endpoint["endpoint"]
+        existing_preventing_sync = existing_affected_endpoint["preventing_sync"]
+        if affected_endpoint == endpoint:
+            if preventing_sync == existing_preventing_sync:
+                affected_endpoint_exists = True
+            else:
+                affected_endpoints.remove(existing_affected_endpoint)
+            break
+
+    if not affected_endpoint_exists:
+        affected_endpoints.append(
+            {"endpoint": affected_endpoint, "preventing_sync": preventing_sync}
+        )
+
+    row = {
+        "failed_url": failed_url,
+        "affected_endpoints": sorted(affected_endpoints, key=lambda x: x["endpoint"]),
+        "integration_name": integration_name,
+        "error_message": message,
+        # first seen is sticky for the life of the error: keep the original date
+        # while the same error recurs, instead of resetting it every crawl
+        "created_date": existing_error.get("created_date") or dt_to_str(now()),
+        "updated_date": dt_to_str(now()),
+        "last_seen": dt_to_str(now()),
+    }
+    schema_errors = ConnectionsError().schema().validate(row)
+    assert not schema_errors, schema_errors
+    row["connection_id"] = connection_id
+    row["org_id"] = org_id
+    return store_resources(table_name, [row])
+
+
+def store_event(
+    org_id,
+    event_type,
+    integration_name,
+    integration_type,
+    message=None,
+    connection_id=None,
+    customer_id=None,
+    additional_fields=None,
+):
+    if event_type not in EVENT_TYPES:
+        raise ValueError(f"unknown event type: {event_type}")
+    row = {
+        "org_id": org_id,
+        "id": uuid.uuid4().hex,
+        "event_type": event_type,
+        "integration_name": integration_name,
+        "integration_type": integration_type,
+        "connection_id": connection_id,
+        "customer_id": customer_id,
+        "message": message,
+        "created_at": dt_to_str(now()),
+        "additional_fields": additional_fields or {},
+    }
+    event_log_table.put_item(Item=row)
+    return row
+
+
+def record_event(
+    org_id,
+    event_type,
+    integration_name,
+    integration_type,
+    connection_id=None,
+    customer_id=None,
+    message=None,
+    additional_fields=None,
+):
+    # a failure while logging an event must never break the operation that
+    # triggered it, so swallow errors here
+    try:
+        store_event(
+            org_id,
+            event_type,
+            integration_name,
+            integration_type,
+            message=message,
+            connection_id=connection_id,
+            customer_id=customer_id,
+            additional_fields=additional_fields,
+        )
+    except Exception as e:
+        logger.error(f"failed to record {event_type} event: {format_exception(e)}")
+
+
+def get_events_for_org(
+    org_id,
+    start_date=None,
+    end_date=None,
+    integration_name=None,
+    integration_type=None,
+    connection_id=None,
+    customer_id=None,
+    event_type=None,
+):
+    # query the org_id + created_at index so the date window is a key condition
+    # (only the window is read) rather than a filter over the whole org partition
+    key_expression = Key("org_id").eq(org_id)
+    # start_date is required at the api, so an end_date without it never happens.
+    # a bare call with neither bound reads the whole org partition.
+    if start_date and end_date:
+        key_expression = key_expression & Key("created_at").between(
+            start_date, end_date
+        )
+    elif start_date:
+        key_expression = key_expression & Key("created_at").gte(start_date)
+    dynamo_args = {
+        "IndexName": EVENT_LOG_ORG_CREATED_INDEX,
+        "KeyConditionExpression": key_expression,
+        "ScanIndexForward": False,
+    }
+    filters = []
+    if integration_name:
+        filters.append(Attr("integration_name").eq(integration_name))
+    if integration_type:
+        filters.append(Attr("integration_type").eq(integration_type))
+    if connection_id:
+        filters.append(Attr("connection_id").eq(connection_id))
+    if customer_id:
+        filters.append(Attr("customer_id").eq(customer_id))
+    if event_type:
+        filters.append(Attr("event_type").eq(event_type))
+    if filters:
+        filter_expression = filters[0]
+        for extra_filter in filters[1:]:
+            filter_expression = filter_expression & extra_filter
+        dynamo_args["FilterExpression"] = filter_expression
+    return query_paginated(EVENT_LOG_TABLE, dynamo_args, {})
+
+
+def get_all_connection_errors():
+    table_name = ConnectionsError().table_name()
+    return scan_paginated(table_name, {})
+
+
+def get_connection_errors(connection_id):
+    table_name = ConnectionsError().table_name()
+    key_names = {"primary": "connection_id"}
+    dynamo_args, filters = create_dynamo_args(
+        table_name, connection_id, key_names=key_names
+    )
+    return query_paginated(table_name, dynamo_args, filters)
+
+
+def get_connection_errors_for_org(org_id):
+    table_name = ConnectionsError().table_name()
+    dynamo_args = {
+        "IndexName": "org_id",
+        "KeyConditionExpression": Key("org_id").eq(org_id),
+    }
+    return query_paginated(table_name, dynamo_args, {})
+
+
+def clear_connection_error(connection_id, url):
+    return connection_errors_table.delete_item(
+        Key={"connection_id": connection_id, "failed_url": url}, ReturnValues="ALL_OLD"
+    )
+
+
+## resources
+
+
+def build_update_item_args(dynamo_row, table_key_names, keys_to_remove=()):
+    """
+    Build the arguments for DynamoDB update_item.
+    Uses condition expressions to only update items that have changed.
+    """
+    # define the base update expression and condition expression
+    update_expressions = []
+    condition_expressions = []
+
+    # start condition expression with a check for the primary key and sort key (if it exists)
+    new_items_conditions = [f"attribute_not_exists(#{k})" for k in table_key_names]
+    new_items_condition = f"({' AND '.join(new_items_conditions)})"
+    condition_expressions.append(new_items_condition)
+
+    # mirror logic from get_rows_for_dynamo_webhook
+    # skip updated date, and only add created date if it doesn't exist
+    for key in dynamo_row.keys():
+        # updates
+        set_key = f"#{key} = :{key}"
+        set_key_if_not_exists = f"#{key} = if_not_exists(#{key}, :{key})"
+        # conditions
+        write_row_if_new_key = f"attribute_not_exists(#{key})"
+        write_row_if_different_key = f"#{key} <> :{key}"
+
+        if key in table_key_names:
+            continue
+        elif key == "trackstar_updated_date":
+            update_expressions.append(set_key)
+        # always persist trackstar_created_dates from the first time the object is submitted (immutable)
+        elif key == "trackstar_created_date":
+            update_expressions.append(set_key_if_not_exists)
+        elif key == "trackstar_tags":
+            # if None, called via crawler - don't overwrite tags
+            # otherwise, called via API - hard overwrite tags
+            if dynamo_row[key] is None:
+                dynamo_row[key] = []
+                condition_expressions.append(write_row_if_new_key)
+                update_expressions.append(set_key_if_not_exists)
+            else:
+                condition_expressions.append(write_row_if_different_key)
+                update_expressions.append(set_key)
+        else:
+            # if the attribute is not a table key, add it to the update expression
+            update_expressions.append(set_key)
+            condition_expressions.append(write_row_if_new_key)
+            condition_expressions.append(write_row_if_different_key)
+
+    expression_attribute_names = {f"#{k}": k for k in dynamo_row.keys()}
+    update_expression = f"SET {', '.join(update_expressions)}"
+    # clear shadow GSI keys whose source field went null, so the row drops out of
+    # the sparse index instead of keeping a stale key (update_item only SETs)
+    if keys_to_remove:
+        remove_clauses = []
+        for remove_key in keys_to_remove:
+            remove_clauses.append(f"#{remove_key}")
+            expression_attribute_names[f"#{remove_key}"] = remove_key
+        update_expression = f"{update_expression} REMOVE {', '.join(remove_clauses)}"
+
+    return {
+        "Key": {k: v for k, v in dynamo_row.items() if k in table_key_names},
+        "UpdateExpression": update_expression,
+        "ConditionExpression": " OR ".join(condition_expressions),
+        "ExpressionAttributeNames": expression_attribute_names,
+        "ExpressionAttributeValues": {
+            f":{k}": v for k, v in dynamo_row.items() if k not in table_key_names
+        },
+        "ReturnValues": "UPDATED_OLD",
+    }
+
+
+def store_resources(table_name, rows):
+    """
+    Uses DynamoDB update_item to update or create items in a table.
+    Condition expressions ensure we only update items that have changed.
+    update_item fails if the item hasn't changed, which we leverage to
+    create/update items and dynamically set updated_date.
+    """
+    if DRY_RUN:
+        print(f"DRY RUN: Would have stored {len(rows)} rows in {table_name}")
+        return []
+    table = dynamodb.Table(table_name)
+    table_meta = get_table_meta(table_name)
+    # get table's primary and sort key names - these should not be updated
+    table_key_names = [key["AttributeName"] for key in table_meta["key_schema"]]
+    # nullable indexed fields are indexed via a gsi_<field> shadow (see
+    # Resource.nullable_indexes). map each deployed shadow key back to its source
+    # field, so every write can mirror the field's value into it — or clear it
+    shadow_key_sources = {}
+    for gsi in table_meta["global_secondary_indexes"]:
+        for gsi_key in gsi["KeySchema"]:
+            # the shadow is always the sort (RANGE) key; HASH is connection_id
+            if gsi_key["KeyType"] != "RANGE":
+                continue
+            attribute_name = gsi_key["AttributeName"]
+            if attribute_name.startswith("gsi_"):
+                shadow_key_sources[attribute_name] = attribute_name[len("gsi_") :]
+    updated_or_created_items = []
+
+    for raw_row in rows:
+        if "created_date" not in raw_row:
+            raise Exception(f"created_date is required: {raw_row}")
+        if "updated_date" not in raw_row:
+            raise Exception(f"updated_date is required: {raw_row}")
+
+        # copy each nullable index field into its shadow key when set, clear it
+        # when explicitly null, and leave it untouched when the source is absent
+        # (a partial write) — a present null must never reach a GSI key
+        keys_to_remove = []
+        if shadow_key_sources:
+            # shallow-copy so we never mutate the caller's row dict with shadows
+            raw_row = dict(raw_row)
+        for shadow_key, source_field in shadow_key_sources.items():
+            if source_field not in raw_row:
+                continue
+            if raw_row[source_field] is None:
+                keys_to_remove.append(shadow_key)
+                # drop any stale shadow (e.g. a reused/round-tripped row) so we
+                # never both SET and REMOVE it — dynamo rejects overlapping paths
+                if shadow_key in raw_row:
+                    del raw_row[shadow_key]
+            else:
+                raw_row[shadow_key] = raw_row[source_field]
+
+        # crawler and api rows arrive offloaded; a direct caller's row is offloaded here
+        offloaded = offload_large_fields(table_name, raw_row)
+        if offloaded is not raw_row:
+            # a direct caller never merged refs with the stored row, so keep the
+            # stored refs of fields this row does not carry
+            stored = table.get_item(
+                Key={k: raw_row[k] for k in table_key_names},
+                ProjectionExpression="#refs",
+                ExpressionAttributeNames={"#refs": "refs"},
+                ConsistentRead=True,
+            ).get("Item", {})
+            for field, ref in stored.get("refs", {}).items():
+                if field not in raw_row:
+                    offloaded["refs"][field] = ref
+        raw_row = offloaded
+        dynamo_row = dict_to_dynamo(raw_row)
+        update_args = build_update_item_args(
+            dynamo_row, table_key_names, keys_to_remove
+        )
+
+        try:
+            response = table.update_item(**update_args)
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code == "ConditionalCheckFailedException":
+                # row already exists and is up to date, skip it
+                resource_in_dynamo = table.get_item(Key=update_args["Key"])
+                existing_item = resource_in_dynamo.get("Item", {})
+                dict_to_return = {
+                    "new": raw_row,
+                    "existing": dynamo_to_dict(existing_item, hydrate=False),
+                }
+                logger.info(
+                    f"Exact row already exists in table {table_name} for item {raw_row.get('id')} and connection_id {raw_row.get('connection_id')}: {dict_to_return}"
+                )
+                continue
+            else:
+                logger.error(
+                    f"Unexpected error when storing row in table {table_name} for item {raw_row['id']}: {e}"
+                )
+                raise e
+        except Exception as e:
+            logger.error(
+                f"Unexpected error when storing row in table {table_name} for item {raw_row}: {e}"
+            )
+            raise e
+
+        # row was either created or updated
+        if "Attributes" in response:
+            action = "updated"
+            old_fields_and_values = response["Attributes"]
+        else:
+            action = "created"
+            old_fields_and_values = {}
+
+        updated_or_created_items.append(
+            {
+                "action": action,
+                "table": table_name,
+                "item": raw_row,
+                "old_fields_and_values": old_fields_and_values,
+            }
+        )
+
+    return updated_or_created_items
+
+
+def get_rows_for_dynamo_webhook(resource, rows):
+    # offload before the diff so it compares refs, never the existing row's big fields
+    table_name = resource.table_name()
+    rows_by_id = {}
+    for row in rows:
+        rows_by_id[row["id"]] = {
+            "new": offload_large_fields(table_name, row),
+            "existing": {},
+        }
+    existing_rows = resource.batch_get_resources(list(rows_by_id), hydrate=False)
+    for existing in existing_rows:
+        rows_by_id[existing["id"]]["existing"] = existing
+
+    full_schema = resource.complete_item_schema()
+    webhook_data_schema = resource.api_item_schema()
+    rows_for_dynamo = []
+    rows_for_webhook = []
+    for row_dict in rows_by_id.values():
+        new_row = deepcopy(row_dict["new"])
+        existing_row = deepcopy(row_dict["existing"])
+
+        to_store = False
+        existing_refs = existing_row.get("refs", {})
+        new_refs = new_row.get("refs", {})
+        # don't fire a webhook if store_resources didn't update
+        for key, value in new_row.items():
+            existing_value = existing_row.get(key)
+            if key in existing_refs and key not in new_refs:
+                # the stored value is in s3 and this one is inline, so they differ
+                # even when both read as empty here
+                to_store = True
+                continue
+            if key == "trackstar_created_date":
+                # always persist trackstar_created_dates from first submission (immutable)
+                new_row[key] = existing_value or value
+            elif key in ["trackstar_updated_date", "updated_date"]:
+                # don't want to fire if only these changed
+                continue
+            elif key == "trackstar_tags":
+                # if None, called via crawler - don't overwrite tags
+                # otherwise, called via API - hard overwrite tags
+                if value is None:
+                    new_row[key] = existing_value or []
+                else:
+                    if value == existing_value:
+                        continue
+                    to_store = True
+            elif key not in existing_row:
+                to_store = True
+                continue
+            else:  # key exists in both
+                if value == existing_value:
+                    continue
+                to_store = True
+        if not to_store:
+            continue
+
+        # keep the stored refs of fields this row does not carry; a field it
+        # carries inline replaces its ref
+        refs = {}
+        for field, ref in existing_refs.items():
+            if field not in new_row:
+                refs[field] = ref
+        refs.update(new_refs)
+
+        try:
+            loaded_new_row = full_schema.load(
+                deepcopy(new_row), partial=True, unknown="exclude"
+            )
+            # don't need to validate here
+            item_to_store = full_schema.dump(loaded_new_row)
+            # doing this to activate hidden fields
+        except Exception:
+            item_to_store = new_row
+        # no schema declares refs, so the dump drops it
+        if refs or "refs" in existing_row:
+            item_to_store["refs"] = refs
+
+        rows_for_dynamo.append(item_to_store)
+
+        action = "updated"
+        if not existing_row:
+            action = "created"
+
+        # skip webhook if only difference was removed fields
+        try:
+            new_webhook_row = webhook_data_schema.dump(new_row)
+        except Exception:
+            new_webhook_row = new_row
+        try:
+            existing_webhook_row = webhook_data_schema.dump(existing_row)
+        except Exception:
+            existing_webhook_row = existing_row
+        # the webhook lambda fetches the big fields itself, from these refs
+        if new_refs:
+            new_webhook_row["refs"] = new_refs
+        if existing_refs:
+            existing_webhook_row["refs"] = existing_refs
+
+        if action == "updated":
+            # removed subfields still triggered to_store, which updated trackstar_updated_date
+            # so we have to ignore that in our comparison
+            new_webhook_without_ts_updated = {
+                k: v
+                for k, v in new_webhook_row.items()
+                if k != "trackstar_updated_date"
+            }
+            existing_webhook_without_ts_updated = {
+                k: v
+                for k, v in existing_webhook_row.items()
+                if k != "trackstar_updated_date"
+            }
+            if new_webhook_without_ts_updated == existing_webhook_without_ts_updated:
+                continue
+
+        row_for_webhook = {
+            "action": action,
+            "table": table_name,
+            "item": new_webhook_row,
+            "old_fields_and_values": existing_webhook_row,
+        }
+        rows_for_webhook.append(row_for_webhook)
+    return rows_for_dynamo, rows_for_webhook
+
+
+def raw_store_resources(table_name, rows):
+    table = dynamodb.Table(table_name)
+    with table.batch_writer() as batch:
+        for row in rows:
+            row = dict_to_dynamo(row)
+            batch.put_item(Item=row)
+
+
+def get_subscription(subscription_id):
+    table = dynamodb.Table(INTEGRATION_SUBSCRIPTIONS_TABLE)
+    response = table.get_item(Key={"subscription_id": subscription_id})
+    return response.get("Item")
+
+
+def store_subscription_row(
+    subscription_id,
+    connection_id,
+    org_id,
+    integration_name,
+    integration_type,
+    notification_type,
+    source_type,
+):
+    table = dynamodb.Table(INTEGRATION_SUBSCRIPTIONS_TABLE)
+    existing = table.get_item(Key={"subscription_id": subscription_id}).get("Item")
+    if existing:
+        # subscription already exists - only shared-subscription integrations (amazon)
+        # should hit this branch. ADD is idempotent so re-subscribing is a no-op.
+        if integration_name not in INTEGRATIONS_WITH_SHARED_SUBSCRIPTIONS:
+            return
+        table.update_item(
+            Key={"subscription_id": subscription_id},
+            UpdateExpression="ADD aliases :alias",
+            ExpressionAttributeValues={":alias": {connection_id}},
+        )
+        return
+    item = {
+        "subscription_id": subscription_id,
+        "connection_id": connection_id,
+        "org_id": org_id,
+        "integration_name": integration_name,
+        "integration_type": integration_type,
+        "notification_type": notification_type,
+        "source_type": source_type,
+        "created_at": dt_to_str(now()),
+    }
+    # for shared-subscription integrations, always seed aliases so we never have to
+    # handle a "first alias-add" special case later
+    if integration_name in INTEGRATIONS_WITH_SHARED_SUBSCRIPTIONS:
+        item["aliases"] = {connection_id}
+    table.put_item(Item=item)
+
+
+def get_subscription_rows_by_connection_id(connection_id, check_aliases=False):
+    table = dynamodb.Table(INTEGRATION_SUBSCRIPTIONS_TABLE)
+    filter_expr = Attr("connection_id").eq(connection_id)
+    # shared-subscription integrations (see INTEGRATIONS_WITH_SHARED_SUBSCRIPTIONS): also match rows where
+    # this connection is an alias of a subscription originally registered by a sibling connection
+    if check_aliases:
+        filter_expr = filter_expr | Attr("aliases").contains(connection_id)
+    response = table.scan(FilterExpression=filter_expr)
+    return response.get("Items", [])
+
+
+def remove_connection_from_subscription_row(subscription_id, connection_id):
+    """
+    Clear this connection from a subscription row. Non-shared rows (single owner via
+    connection_id) are deleted outright; shared rows drop this connection from the
+    aliases set and delete the row only when the last owner leaves. Returns True if
+    the row is gone (caller should unsubscribe from the upstream API).
+    """
+    table = dynamodb.Table(INTEGRATION_SUBSCRIPTIONS_TABLE)
+    existing = table.get_item(Key={"subscription_id": subscription_id}).get("Item")
+    if not existing:
+        return True
+
+    aliases = existing.get("aliases")
+
+    # non-shared row (single owner tracked via connection_id)
+    if not aliases:
+        if existing["connection_id"] == connection_id:
+            table.delete_item(Key={"subscription_id": subscription_id})
+            return True
+        return False
+
+    # shared row - alias dance
+    if connection_id not in aliases:
+        return False
+
+    remaining = aliases - {connection_id}
+    if not remaining:
+        table.delete_item(Key={"subscription_id": subscription_id})
+        return True
+
+    table.update_item(
+        Key={"subscription_id": subscription_id},
+        UpdateExpression="DELETE aliases :alias",
+        ExpressionAttributeValues={":alias": {connection_id}},
+    )
+    return False
+
+
+# consistent with store_resources: table keys are immutable,
+# created_date is set once via if_not_exists, tags are api-specific not touched by crawls/webhooks
+BANNED_PARTIAL_UPDATE_FIELDS = {
+    "connection_id",
+    "id",
+    "created_date",
+    "trackstar_created_date",
+    "trackstar_tags",
+}
+
+
+def prepare_partial_update(resource, resource_id, updates):
+    # allow callers to pass full formatter output (which always includes id)
+    # verify it matches the resource_id, then strip so the banned-field check passes
+    if "id" in updates:
+        if updates["id"] != resource_id:
+            raise Exception(
+                f"id mismatch in partial update: fields id={updates['id']} vs resource_id={resource_id}"
+            )
+        updates = {k: v for k, v in updates.items() if k != "id"}
+    for field in BANNED_PARTIAL_UPDATE_FIELDS:
+        if field in updates:
+            raise Exception(f"Cannot partially update protected field: {field}")
+
+    # validate against resource schema
+    schema = resource.schema(partial=True)
+    validated = schema.load(updates, partial=True, unknown="exclude")
+    validated = schema.dump(validated)
+
+    # fetch existing row
+    try:
+        existing = resource.get_resource(resource_id)
+    except ResourceNotFoundException:
+        return None
+
+    # dicts merge in place (e.g. fba additional_fields.listing_status updates without overwriting asin, product_type, etc).
+    # lists are a hard overwrite since they represent the full current value
+    now_str = dt_to_str(now())
+    merged = {**existing}
+    for key, value in validated.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    merged["updated_date"] = now_str
+    merged["trackstar_updated_date"] = now_str
+    return merged
+
+
+def get_all_resources(
+    connection_id,
+    resource_name,
+    integration_type,
+    query_params={},
+) -> list:
+    # IMPORTANT: whenever possible, use resource.get_all_resources()
+    # otherwise, resources_queried won't work
+
+    # dynamo caps an `in` filter at 100 operands and counts duplicates toward
+    # that cap, so dedupe each one; anything still over 100 has to be chunked.
+    deduped_params = {}
+    oversized_in_field = None
+    for param, entry in query_params.items():
+        in_values = entry.get("in")
+        if in_values:
+            in_values = list(set(in_values))
+            entry = {**entry, "in": in_values}
+            if len(in_values) > MAX_IN_OPERANDS:
+                if oversized_in_field:
+                    raise Exception("cannot chunk more than one oversized `in` filter")
+                oversized_in_field = param
+        deduped_params[param] = entry
+    query_params = deduped_params
+
+    if oversized_in_field:
+        # split the oversized filter into 100-value queries and merge the rows
+        # (e.g. resolving products for a 100+ line order)
+        all_values = query_params[oversized_in_field]["in"]
+        chunked_resources = []
+        for start in range(0, len(all_values), MAX_IN_OPERANDS):
+            value_chunk = all_values[start : start + MAX_IN_OPERANDS]
+            # deepcopy so this chunk's values don't bleed into the next one
+            chunk_params = deepcopy(query_params)
+            chunk_params[oversized_in_field]["in"] = value_chunk
+            chunked_resources.extend(
+                get_all_resources(
+                    connection_id, resource_name, integration_type, chunk_params
+                )
+            )
+        return chunked_resources
+
+    resource = resource_map[integration_type][resource_name]()
+    table_name = resource.table_name()
+
+    # the status index can only look up one status at a time, so a filter like
+    # "not fulfilled" reads every stored row. look up each wanted status instead
+    table = dynamodb.Table(table_name)
+    only_filter_is_status = list(query_params) == ["status"]
+    query_uses_an_index = get_best_index(table, query_params)
+    one_status_uses_the_index = get_best_index(table, {"status": {"eq": None}})
+    if only_filter_is_status and not query_uses_an_index and one_status_uses_the_index:
+        status_filter = query_params["status"]
+        # keep each status the filter lets through: on the in list if there is one,
+        # not on the nin list, and not the neq value
+        wanted_statuses = []
+        for status in resource.statuses():
+            if "in" in status_filter and status not in status_filter["in"]:
+                continue
+            if "nin" in status_filter and status in status_filter["nin"]:
+                continue
+            if "neq" in status_filter and status == status_filter["neq"]:
+                continue
+            wanted_statuses.append(status)
+
+        status_resources = []
+        for status in wanted_statuses:
+            status_resources.extend(
+                get_all_resources(
+                    connection_id,
+                    resource_name,
+                    integration_type,
+                    {"status": {"eq": status}},
+                )
+            )
+        return status_resources
+
+    dynamo_args, filters = create_dynamo_args(
+        table_name, connection_id, query_params=query_params
+    )
+    items = query_paginated(table_name, dynamo_args, filters)
+    full_items = items
+    if dynamo_args.get("IndexName"):
+        # resource indexes are projections that don't include all fields,
+        # so we need to fill in the rest of the data from the main table
+        # see utils.api.api_get_resources
+        # and get_resources_single_page
+        ids_to_get = [item["id"] for item in items]
+        full_items = batch_get_resources(
+            connection_id, resource_name, integration_type, ids_to_get
+        )
+    dictified = [dynamo_to_dict(item) for item in full_items]
+    return dictified
+
+
+def get_resources_single_page(
+    connection_id,
+    resource_name,
+    integration_type,
+    query_params={},
+    exclusive_start_key=None,
+):
+    resource = resource_map[integration_type][resource_name]()
+    table_name = resource.table_name()
+
+    dynamo_args, filters = create_dynamo_args(
+        table_name, connection_id, query_params=query_params
+    )
+    items, next_token = query_single_page(
+        table_name, dynamo_args, filters, exclusive_start_key=exclusive_start_key
+    )
+    full_items = items
+    if dynamo_args.get("IndexName"):
+        # resource indexes are projections that don't include all fields,
+        # so we need to fill in the rest of the data from the main table
+        # see utils.api.api_get_resources
+        # and get_all_resources
+        ids_to_get = [item["id"] for item in items]
+        full_items = batch_get_resources(
+            connection_id, resource_name, integration_type, ids_to_get
+        )
+    dictified = [dynamo_to_dict(item) for item in full_items]
+    return dictified, next_token
+
+
+def get_resource(connection_id, resource_name, integration_type, item_id):
+    # can also use resource.get_resource()
+    resource = resource_map[integration_type][resource_name]()
+    table_name = resource.table_name()
+    dynamo_args, filters = create_dynamo_args(table_name, connection_id, item_id)
+    item = query(table_name, dynamo_args, filters)
+    if not item["Items"]:
+        raise ResourceNotFoundException(resource, item_id)
+    return dynamo_to_dict(item["Items"][0])
+
+
+def batch_get_resources(
+    connection_id, resource_name, integration_type, item_ids, hydrate=True
+):
+    # can also use resource.batch_get_resources()
+    resource = resource_map[integration_type][resource_name]()
+    table_name = resource.table_name()
+    keys = [{"connection_id": connection_id, "id": item_id} for item_id in item_ids]
+    chunked_keys = [
+        keys[i : i + BATCH_GET_KEY_CHUNK]
+        for i in range(0, len(keys), BATCH_GET_KEY_CHUNK)
+    ]
+    items = []
+    for chunk in chunked_keys:
+        batch_get_item_request = {"RequestItems": {table_name: {"Keys": chunk}}}
+        # retry unprocessed keys
+        retries = 0
+        max_retries = 5
+        unprocessed = {}
+        while retries < max_retries:
+            response = dynamodb.batch_get_item(**batch_get_item_request)
+            items.extend(response["Responses"][table_name])
+
+            # check for unprocessed keys
+            unprocessed = response.get("UnprocessedKeys", {})
+            if not unprocessed:
+                break
+
+            time.sleep(2)
+            batch_get_item_request = {"RequestItems": unprocessed}
+            retries += 1
+
+        if retries == max_retries and unprocessed:
+            raise Exception(
+                f"Failed to fetch {len(unprocessed[table_name]['Keys'])} items after {max_retries} retries"
+            )
+
+    return [dynamo_to_dict(item, hydrate=hydrate) for item in items]
+
+
+def delete_resource(connection_id, resource_name, item_id, integration_type):
+    resource = resource_map[integration_type][resource_name]()
+    table = dynamodb.Table(resource.table_name())
+    sort_key = get_table_keys(table)["sort"]
+    table.delete_item(Key={"connection_id": connection_id, sort_key: item_id})
+
+
+def delete_connection_resources(connection_id, resource_name, integration_type):
+    resource = resource_map[integration_type][resource_name]()
+    table_name = resource.table_name()
+    table = dynamodb.Table(table_name)
+    sort_key = get_table_keys(table)["sort"]
+    dynamo_args, filters = create_dynamo_args(table_name, connection_id)
+    dynamo_args["ProjectionExpression"] = sort_key
+    items = query_paginated(table_name, dynamo_args, filters)
+    if DRY_RUN:
+        print(f"DRY RUN: Would have deleted {len(items)} rows in {table_name}")
+        return
+    with table.batch_writer() as batch:
+        for item in items:
+            batch.delete_item(
+                Key={"connection_id": connection_id, sort_key: item[sort_key]}
+            )
+
+
+def get_resource_implemented(resource):
+    table_name = f"{resource.table_name()}-implemented"
+    table = dynamodb.Table(table_name)
+    integration_name = resource.integration.integration_name
+    row = table.get_item(Key={"integration_name": integration_name})
+    item = row["Item"]
+    del item["integration_name"]
+    return item
+
+
+def scan_all_resources_implemented():
+    rsp = {}
+    for resource_table_name in RESOURCE_TABLES:
+        table_name = f"{resource_table_name}-implemented"
+        rsp[table_name] = {}
+        scan_rsp = scan_paginated(table_name, {})
+        for row in scan_rsp:
+            integration_name = row.pop("integration_name")
+            rsp[table_name][integration_name] = row
+    return rsp
+
+
+def store_resource_implemented(resource, implemented_dict):
+    table_name = f"{resource.table_name()}-implemented"
+    item = {
+        "integration_name": resource.integration.integration_name,
+        **implemented_dict,
+    }
+    raw_store_resources(table_name, [item])
+
+
+def get_test_page_token(integration, test_name):
+    integration_type = integration.integration_type
+    integration_name = integration.integration_name
+    row = test_page_tokens_table.get_item(
+        Key={"integration_type": integration_type, "integration_name": integration_name}
+    )
+    page_token = row["Item"][test_name]
+    if isinstance(page_token, dict):
+        page_token = dynamo_to_dict(page_token)
+    return page_token
+
+
+def store_test_page_token(integration, test_name, page_token):
+    integration_type = integration.integration_type
+    integration_name = integration.integration_name
+    test_page_tokens_table.update_item(
+        Key={
+            "integration_type": integration_type,
+            "integration_name": integration_name,
+        },
+        UpdateExpression=f"SET {test_name} = :page_token",
+        ExpressionAttributeValues={":page_token": page_token},
+    )
+
+
+def get_id_for_unique_sku(resource, sku, return_dupes=False):
+    query_params = {"sku": {"eq": sku}}
+    dynamo_rsp = resource.get_all_resources(query_params)
+    if not dynamo_rsp:
+        raise PokedexException(
+            f"{resource.name()} with sku {sku} not found", 404, origin="trackstar"
+        )
+    if len(dynamo_rsp) > 1:
+        if return_dupes:
+            return [item["id"] for item in dynamo_rsp]
+        raise PokedexException(
+            f"Multiple {resource.name()}s with sku {sku} found", 500, origin="trackstar"
+        )
+    return dynamo_rsp[0]["id"]
+
+
+def get_ids_for_unique_skus(resource, skus):
+    query_params = {"sku": {"in": skus}}
+    dynamo_rsp = resource.get_all_resources(query_params)
+    if not dynamo_rsp:
+        raise PokedexException(
+            f"{resource.name()} with skus {skus} not found", 404, origin="trackstar"
+        )
+    sku_to_id = {}
+    duped_skus = set()
+    for item in dynamo_rsp:
+        sku = item["sku"]
+        if sku in sku_to_id:
+            duped_skus.add(sku)
+            del sku_to_id[sku]
+            continue
+        sku_to_id[sku] = item["id"]
+    return sku_to_id, duped_skus
+
+
+## scheduler
+
+
+def get_scheduler_row(connection_id, function_name, consistent=False):
+    # a stale miss reads as "no such schedule", so callers that answer 404 from it
+    # ask for a consistent read
+    response = scheduler_table.get_item(
+        Key={"connection_id": connection_id, "function_name": function_name},
+        ConsistentRead=consistent,
+    )
+    return response.get("Item", {})
+
+
+def get_connection_scheduler_rows(connection_id, consistent=False):
+    # use cached scheduler_table to avoid recreating Table object per call
+    query_args = {
+        "KeyConditionExpression": Key("connection_id").eq(connection_id),
+        "ConsistentRead": consistent,
+    }
+    response = scheduler_table.query(**query_args)
+    items = response["Items"]
+    while "LastEvaluatedKey" in response:
+        query_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        response = scheduler_table.query(**query_args)
+        items.extend(response["Items"])
+    return items
+
+
+def scan_all_scheduler_rows():
+    return scan_paginated(SCHEDULER_TABLE, {})
+
+
+def get_all_scheduler_rows_for_org(org_id):
+    # use cached scheduler_table to avoid recreating Table object per call
+    query_args = {
+        "IndexName": "org_id",
+        "KeyConditionExpression": Key("org_id").eq(org_id),
+    }
+    response = scheduler_table.query(**query_args)
+    items = response["Items"]
+    while "LastEvaluatedKey" in response:
+        query_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        response = scheduler_table.query(**query_args)
+        items.extend(response["Items"])
+    return items
+
+
+def scan_scheduler_rows_paginated(exclusive_start_key=None, stale_only=False):
+    scan_args = {}
+    if stale_only:
+        scan_args["FilterExpression"] = "stale = :stale"
+        scan_args["ExpressionAttributeValues"] = {":stale": True}
+    return scan_single_page(scheduler_table, scan_args, exclusive_start_key)
+
+
+def update_scheduler_row(connection_id, function_name, json_data):
+    key = {"connection_id": connection_id, "function_name": function_name}
+    update_expression = "SET "
+    expression_attribute_values = {}
+    for k, v in json_data.items():
+        update_expression += f"{k} = :{k}, "
+        expression_attribute_values[f":{k}"] = v
+    update_expression = update_expression.rstrip(", ")
+    scheduler_table.update_item(
+        Key=key,
+        UpdateExpression=update_expression,
+        ExpressionAttributeValues=expression_attribute_values,
+    )
+
+
+def set_all_schedules_paused(connection_id, paused):
+    # bulk pause/resume: flip the existing per-schedule `paused` flag on every
+    # schedule for the connection
+    schedule_rows = get_connection_scheduler_rows(connection_id)
+    updated_function_names = []
+    for schedule_row in schedule_rows:
+        function_name = schedule_row["function_name"]
+        update_scheduler_row(connection_id, function_name, {"paused": paused})
+        updated_function_names.append(function_name)
+    return updated_function_names
+
+
+def delete_scheduler_rows(connection_id):
+    dynamo_args, filters = create_dynamo_args(SCHEDULER_TABLE, connection_id)
+    items = query_paginated(SCHEDULER_TABLE, dynamo_args, filters)
+    if DRY_RUN:
+        print(f"DRY RUN: Would have deleted {len(items)} rows in {SCHEDULER_TABLE}")
+        return
+    with scheduler_table.batch_writer() as batch:
+        for item in items:
+            key = {
+                "connection_id": connection_id,
+                "function_name": item["function_name"],
+            }
+            batch.delete_item(Key=key)
+
+
+def generate_submit_update_expression(item):
+    set_expression_list = []
+    add_expression_list = []
+    expression_attribute_values = {}
+
+    for key, value in item.items():
+        if isinstance(value, set):
+            # append to list
+            add_expression_list.append(f"submit.{key} :{key}")
+            expression_attribute_values[f":{key}"] = value
+        else:
+            # set value
+            set_expression_list.append(f"submit.{key} = :{key}")
+            expression_attribute_values[f":{key}"] = value
+
+    return set_expression_list, add_expression_list, expression_attribute_values
+
+
+def update_crawl_items(
+    connection_id,
+    function_name,
+    items_to_update,
+    force_replace_submit=False,
+    condition_expression=None,
+    submit_delete=None,
+    submit_remove=None,
+):
+    key = {"connection_id": connection_id, "function_name": function_name}
+    update_expression, expression_attribute_values, expression_attribute_names = (
+        generate_sync_dynamo_args(
+            items_to_update, force_replace_submit, submit_delete, submit_remove
+        )
+    )
+    update_args = {
+        "Key": key,
+        "UpdateExpression": update_expression,
+        "ReturnValues": "ALL_NEW",
+    }
+    # a remove-only update has no values, and dynamo rejects an empty map
+    if expression_attribute_values:
+        update_args["ExpressionAttributeValues"] = expression_attribute_values
+    if expression_attribute_names:
+        update_args["ExpressionAttributeNames"] = expression_attribute_names
+    if condition_expression:
+        update_args["ConditionExpression"] = condition_expression
+    try:
+        update_rsp = scheduler_table.update_item(**update_args)
+    except Exception as e:
+        if (
+            isinstance(e, ClientError)
+            and e.response["Error"]["Code"] == "ConditionalCheckFailedException"
+        ):
+            return None
+        logger.error(f"args that caused submit update error: {update_args}")
+        existing_item = get_scheduler_row(connection_id, function_name)
+        logger.error(f"existing item that caused submit update error: {existing_item}")
+        raise e
+    return update_rsp
+
+
+# returns None when the pickle id isn't in tasks_started — indicates it belongs
+# to a prior crawl cycle that already reset, so accepting it would create an
+# orphan that clean_up_crawl_submit's intersection prune can never collect.
+def add_finished_task_if_started(connection_id, function_name, pickle_id):
+    try:
+        return scheduler_table.update_item(
+            Key={"connection_id": connection_id, "function_name": function_name},
+            UpdateExpression="ADD submit.tasks_finished :pid",
+            ConditionExpression="contains(submit.tasks_started, :pid)",
+            ExpressionAttributeValues={":pid": {pickle_id}},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return None
+        raise
+
+
+def generate_sync_dynamo_args(
+    items_to_update, force_replace_submit=False, submit_delete=None, submit_remove=None
+):
+    set_expression_list = []
+    add_expression_list = []
+    delete_expression_list = []
+    remove_expression_list = []
+    expression_attribute_values = {}
+    expression_attribute_names = {}
+    for item, value in items_to_update.items():
+        if item == "submit" and not force_replace_submit:
+            # Generate update expression for nested dictionaries
+            set_expressions, add_expressions, values = (
+                generate_submit_update_expression(value)
+            )
+            set_expression_list.extend(set_expressions)
+            add_expression_list.extend(add_expressions)
+            expression_attribute_values.update(values)
+        else:
+            set_expression_list.append(f"#{item} = :{item}")
+            expression_attribute_names[f"#{item}"] = item
+            expression_attribute_values[f":{item}"] = value
+    for key, values in (submit_delete or {}).items():
+        # deleting nothing is nothing to say, and dynamo has no empty set
+        if not values:
+            continue
+        delete_expression_list.append(f"submit.{key} :delete_{key}")
+        expression_attribute_values[f":delete_{key}"] = values
+    for key in submit_remove or []:
+        remove_expression_list.append(f"submit.{key}")
+    clauses = []
+    if set_expression_list:
+        clauses.append(f"SET {', '.join(set_expression_list)}")
+    if remove_expression_list:
+        clauses.append(f"REMOVE {', '.join(remove_expression_list)}")
+    if add_expression_list:
+        clauses.append(f"ADD {', '.join(add_expression_list)}")
+    if delete_expression_list:
+        clauses.append(f"DELETE {', '.join(delete_expression_list)}")
+    update_expression = " ".join(clauses)
+    return update_expression, expression_attribute_values, expression_attribute_names
+
+
+def should_update_latest_data(crawl_item):
+    submit_dict = crawl_item["submit"]
+    tasks_started = submit_dict["tasks_started"]
+    tasks_finished = submit_dict["tasks_finished"]
+    set_latest_data = submit_dict.get("set_latest_data")
+    if tasks_started == tasks_finished and set_latest_data:
+        return True
+    return False
+
+
+def clean_up_crawl_submit(crawl_item):
+    submit_dict = crawl_item["submit"]
+    key = {
+        "connection_id": crawl_item["connection_id"],
+        "function_name": crawl_item["function_name"],
+    }
+
+    update_args = generate_clean_up_crawl_submit_args(key, submit_dict)
+    if not update_args:
+        return submit_dict
+    rsp = scheduler_table.update_item(**update_args)
+    return submit_dict
+
+
+def generate_clean_up_crawl_submit_args(key, submit_dict):
+    tasks_started = submit_dict["tasks_started"]
+    tasks_finished = submit_dict["tasks_finished"]
+    if len(tasks_started) < 50 or len(tasks_finished) < 50:
+        return
+    intersection_to_remove = tasks_started & tasks_finished
+    intersection_to_remove.discard("")
+    # keep dummy value because dynamo doesn't support empty sets
+    logger.info(f"pruning {len(intersection_to_remove)} items")
+    if not intersection_to_remove:
+        return
+    update_expression = "DELETE submit.tasks_started :intersection_to_remove, submit.tasks_finished :intersection_to_remove"
+    expression_attribute_values = {":intersection_to_remove": intersection_to_remove}
+    update_args = {
+        "Key": key,
+        "UpdateExpression": update_expression,
+        "ExpressionAttributeValues": expression_attribute_values,
+    }
+    return update_args
+
+
+## sync jobs
+
+
+def create_sync_job(job_data):
+    sync_jobs_table.put_item(Item=job_data)
+
+
+def get_sync_job(job_id):
+    response = sync_jobs_table.get_item(Key={"id": job_id})
+    return response.get("Item")
+
+
+def get_sync_jobs_for_connection(connection_id, function_name=None, status=None):
+    key_condition = Key("connection_id").eq(connection_id)
+    if function_name:
+        key_condition = key_condition & Key("function_name").eq(function_name)
+    query_args = {
+        "IndexName": "connection_id-index",
+        "KeyConditionExpression": key_condition,
+    }
+    if status:
+        query_args["FilterExpression"] = Attr("status").eq(status)
+    response = sync_jobs_table.query(**query_args)
+    return response.get("Items", [])
+
+
+def get_open_sync_jobs():
+    dynamo_args = {
+        "IndexName": "status-index",
+        "KeyConditionExpression": Key("status").eq("open"),
+    }
+    return query_paginated(SYNC_JOBS_TABLE, dynamo_args, [])
+
+
+def get_sync_jobs_paginated(exclusive_start_key=None, stale_only=False, status=None):
+    # only open jobs can be stale
+    if stale_only and not status:
+        status = "open"
+    if status or stale_only:
+        query_args = {
+            "IndexName": "status-index",
+            "KeyConditionExpression": Key("status").eq(status),
+        }
+    else:
+        query_args = {}
+    if stale_only:
+        query_args["FilterExpression"] = "stale = :stale"
+        query_args["ExpressionAttributeValues"] = {":stale": True}
+    if exclusive_start_key:
+        exclusive_start_key = json.loads(
+            base64.b64decode(exclusive_start_key).decode("utf-8")
+        )
+        query_args["ExclusiveStartKey"] = exclusive_start_key
+    if status:
+        response = query(SYNC_JOBS_TABLE, query_args, [])
+    else:
+        response = sync_jobs_table.scan(**query_args)
+
+    if response.get("LastEvaluatedKey"):
+        last_evaluated_key = base64.b64encode(
+            json.dumps(response["LastEvaluatedKey"]).encode("utf-8")
+        ).decode("utf-8")
+    else:
+        last_evaluated_key = None
+    return response["Items"], last_evaluated_key
+
+
+def update_sync_job(
+    job_id,
+    updates,
+    force_replace_submit=False,
+    condition_expression=None,
+    submit_delete=None,
+    submit_remove=None,
+):
+    key = {"id": job_id}
+    update_expression, expression_attribute_values, expression_attribute_names = (
+        generate_sync_dynamo_args(
+            updates, force_replace_submit, submit_delete, submit_remove
+        )
+    )
+
+    update_args = {
+        "Key": key,
+        "UpdateExpression": update_expression,
+        "ReturnValues": "ALL_NEW",
+    }
+    # a remove-only update has no values, and dynamo rejects an empty map
+    if expression_attribute_values:
+        update_args["ExpressionAttributeValues"] = expression_attribute_values
+    if expression_attribute_names:
+        update_args["ExpressionAttributeNames"] = expression_attribute_names
+    if condition_expression:
+        update_args["ConditionExpression"] = condition_expression
+    try:
+        update_rsp = sync_jobs_table.update_item(**update_args)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return None
+        raise e
+    return update_rsp
+
+
+def should_sync_job_complete(sync_job):
+    submit_dict = sync_job["submit"]
+    tasks_started = submit_dict["tasks_started"]
+    tasks_finished = submit_dict["tasks_finished"]
+    # .get: completing the job takes the marker back off, and a straggler submitter can
+    # still land after that
+    mark_complete = submit_dict.get("mark_complete")
+    return tasks_started == tasks_finished and mark_complete and len(tasks_started) > 0
+
+
+def clean_up_sync_submit(sync_job):
+    submit_dict = sync_job["submit"]
+    key = {"id": sync_job["id"]}
+    update_args = generate_clean_up_crawl_submit_args(key, submit_dict)
+    if not update_args:
+        return submit_dict
+    rsp = sync_jobs_table.update_item(**update_args)
+    return submit_dict
+
+
+def delete_sync_job_row(sync_job_id):
+    sync_jobs_table.delete_item(Key={"id": sync_job_id})
+
+
+## webhooks
+
+
+def store_webhook_row(row):
+    webhooks_table.put_item(Item=row)
+
+
+def list_webhooks():
+    return scan_paginated(WEBHOOKS_TABLE, {})
+
+
+def list_webhooks_for_connection(connection_id):
+    key_names = {"primary": "connection_id"}
+    dynamo_args, filters = create_dynamo_args(
+        WEBHOOKS_TABLE, connection_id, key_names=key_names
+    )
+    return query_paginated(WEBHOOKS_TABLE, dynamo_args, filters)
+
+
+def start_poll(webhook):
+    webhook["last_poll_start"] = int(time.time())
+    webhooks_table.put_item(Item=webhook)
+
+
+def end_poll(webhook):
+    webhook["last_poll_end"] = int(time.time())
+    webhooks_table.put_item(Item=webhook)
+
+
+# security
+
+
+def app_encrypt(secret):
+    app_pk = get_org_private_key("trackstarhq")
+    return org_encrypt(secret, app_pk)
+
+
+def app_decrypt(secret):
+    app_pk = get_org_private_key("trackstarhq")
+    return org_decrypt(secret, app_pk)
+
+
+def org_encrypt(secret, org_pk):
+    secret_bytes = json.dumps(secret).encode("utf-8")
+    org_pk_bytes = org_pk.encode("utf-8")
+    org_pk_bytes = org_pk_bytes + b"\0" * (32 - len(org_pk_bytes))
+    cipher = AES.new(org_pk_bytes, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(secret_bytes)
+    return base64.b64encode(cipher.nonce + ciphertext + tag).decode("utf-8")
+
+
+def org_decrypt(secret, org_pk):
+    org_pk_bytes = org_pk.encode("utf-8")
+    org_pk_bytes = org_pk_bytes + b"\0" * (32 - len(org_pk_bytes))
+    secret_bytes = base64.b64decode(secret)
+    nonce, ciphertext, tag = (
+        secret_bytes[:16],
+        secret_bytes[16:-16],
+        secret_bytes[-16:],
+    )
+    cipher = AES.new(org_pk_bytes, AES.MODE_EAX, nonce)
+    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+    return json.loads(plaintext)
+
+
+def encode_access_token(secret, org_pk):
+    return jwt.encode(secret, org_pk, algorithm="HS256")
+
+
+def decode_access_token(secret, org_pk):
+    return jwt.decode(secret, org_pk, algorithms=["HS256"])
+
+
+def decode_auth_header(header):
+    clerk_public_key = get_raw_secret(CLERK_PUBLIC_KEY)
+    header = header.split(" ")[1]  # ignore Bearer
+    return jwt.decode(header, clerk_public_key, algorithms=["RS256"])
+
+
+# lambda
+
+
+def hit_requests_proxy(logger_config={}, request_args=(), request_kwargs={}):
+    # don't use this raw! use integration.hit_lambda_proxy to ensure api_call_made stuff works properly
+    functions = lambda_client.list_functions()
+    function_names = [f["FunctionName"] for f in functions["Functions"]]
+    fn_name = ""
+    for function_name in function_names:
+        if REQUESTS_PROXY in function_name and "prod" in function_name:
+            fn_name = function_name
+            break
+    request_payload = {
+        "request_args": request_args,
+        "request_kwargs": request_kwargs,
+        "logger_config": logger_config,
+    }
+    response = lambda_client.invoke(
+        FunctionName=fn_name,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(request_payload),
+    )
+    payload = response["Payload"].read()
+    return payload
+
+
+def invoke_lambda_crawler(
+    connection_id,
+    function_name,
+    first_crawl,
+    start_time_str=None,
+    end_time_str=None,
+    page_token=None,
+):
+    payload = {
+        "connection_id": connection_id,
+        "function_name": function_name,
+        "first_crawl": first_crawl,
+        "start_time_str": start_time_str,
+        "end_time_str": end_time_str,
+        "page_token": page_token,
+    }
+    lambda_client.invoke(
+        FunctionName=LAMBDA_TASKS["lambda-crawler"]["function_name"],
+        InvocationType="Event",  # fire-and-forget; don't block the caller
+        Payload=json.dumps(payload),
+    )
+
+
+# sqs
+
+
+def send_sqs_message(queue_name, body):
+    queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+    sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody=json.dumps(body),
+    )
+
+
+# carrier files
+
+
+def list_raw_files(
+    archive_prefix: str,
+    start_time: str,
+    end_time: str,
+    limit: int = 100,
+    continuation_token: str = None,
+    file_type: str = None,
+    file_name: str = None,
+) -> dict:
+    prefix = archive_prefix
+
+    list_kwargs = {
+        "Bucket": CARRIER_BUCKET_NAME,
+        "Prefix": prefix,
+        "MaxKeys": 1000,
+    }
+
+    if continuation_token:
+        decoded = base64.b64decode(continuation_token).decode("utf-8")
+        # resume after the last key returned to the caller
+        list_kwargs["StartAfter"] = decoded
+
+    files = []
+    exhausted = False
+    while not exhausted:
+        response = s3_client.list_objects_v2(**list_kwargs)
+
+        for obj in response.get("Contents", []):
+            key = obj["Key"]
+
+            # skip directories (size 0)
+            if obj["Size"] == 0:
+                continue
+
+            relative = key[len(prefix) :].lstrip("/")
+            file_date = relative.split("/")[0]
+            if len(file_date) == 10:
+                file_date = f"{file_date}T00:00:00Z"
+
+            # s3 keys are sorted, so past end_time means no more matches
+            if file_date > end_time:
+                exhausted = True
+                break
+
+            if file_date < start_time:
+                continue
+
+            # filter by file type
+            entry_name = key.split("/")[-1]
+            ext = entry_name.split(".")[-1].lower() if "." in entry_name else None
+            if file_type and ext and ext != file_type:
+                continue
+
+            # filter by file name substring
+            if file_name and file_name.lower() not in entry_name.lower():
+                continue
+
+            files.append(
+                {
+                    "key": key,
+                    "file_name": entry_name,
+                    # the key's date folder is the crawl start, not the file's time
+                    "created_date": dt_to_str(obj["LastModified"]),
+                    "file_type": ext,
+                }
+            )
+
+            if len(files) >= limit:
+                break
+
+        if len(files) >= limit or not response.get("IsTruncated"):
+            break
+
+        list_kwargs["ContinuationToken"] = response["NextContinuationToken"]
+        list_kwargs.pop("StartAfter", None)
+
+    next_token = None
+    if len(files) >= limit:
+        next_token = base64.b64encode(files[-1]["key"].encode("utf-8")).decode("utf-8")
+
+    return {
+        "data": files[:limit],
+        "total_count": len(files[:limit]),
+        "next_token": next_token,
+    }
+
+
+def generate_download_urls(
+    files: list, expiration: int = PRESIGNED_URL_EXPIRATION
+) -> list:
+    expires_at = now() + timedelta(seconds=expiration)
+
+    for file in files:
+        file["download_url"] = s3_client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": CARRIER_BUCKET_NAME,
+                "Key": file["key"],
+            },
+            ExpiresIn=expiration,
+        )
+        file["download_url_expires_at"] = dt_to_str(expires_at)
+    return files
+
+
+IDEMPOTENCY_IN_PROGRESS = "in_progress"
+IDEMPOTENCY_SUCCEEDED = "succeeded"
+
+
+def idempotency_key_dynamo_key(connection_id, idempotency_key):
+    return {"connection_id": connection_id, "idempotency_key": idempotency_key}
+
+
+def create_idempotency_key_row(
+    connection_id, idempotency_key, request_hash, request_id
+):
+    # returns None when the row was created, else the row that already exists
+    now_ts = int(time.time())
+    row = {
+        "connection_id": connection_id,
+        "idempotency_key": idempotency_key,
+        "status": IDEMPOTENCY_IN_PROGRESS,
+        "request_hash": request_hash,
+        "request_id": request_id,
+        "created_at": now_ts,
+        "expires_at": now_ts + IDEMPOTENCY_KEY_TTL_SECONDS,
+    }
+    for attempt in range(2):
+        try:
+            idempotency_keys_table.put_item(
+                Item=row,
+                # dynamo deletes expired rows late, so one still on the table is free,
+                # as is one left in progress by a request that died before finishing
+                ConditionExpression=Attr("connection_id").not_exists()
+                | Attr("expires_at").lte(now_ts)
+                | (
+                    Attr("status").eq(IDEMPOTENCY_IN_PROGRESS)
+                    & Attr("created_at").lte(
+                        now_ts - IDEMPOTENCY_KEY_STILL_RUNNING_SECONDS
+                    )
+                ),
+            )
+            return None
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        existing = get_idempotency_key_row(connection_id, idempotency_key)
+        if existing is not None:
+            return existing
+        # the other request deleted its row between our put and get, so try the
+        # put once more
+    raise RuntimeError(
+        f"could not create idempotency_key row {idempotency_key} for {connection_id}"
+    )
+
+
+def get_idempotency_key_row(connection_id, idempotency_key):
+    rsp = idempotency_keys_table.get_item(
+        Key=idempotency_key_dynamo_key(connection_id, idempotency_key),
+        ConsistentRead=True,
+    )
+    if "Item" not in rsp:
+        return None
+    return dynamo_to_dict(rsp["Item"])
+
+
+def mark_idempotency_key_succeeded(
+    connection_id, idempotency_key, write_ids, batch, skip_retrieval, response
+):
+    idempotency_keys_table.update_item(
+        Key=idempotency_key_dynamo_key(connection_id, idempotency_key),
+        UpdateExpression=(
+            "SET #status = :status, #write_ids = :write_ids, #batch = :batch, "
+            "#skip_retrieval = :skip_retrieval, #response = :response"
+        ),
+        ExpressionAttributeNames={
+            "#status": "status",
+            "#write_ids": "write_ids",
+            "#batch": "batch",
+            "#skip_retrieval": "skip_retrieval",
+            "#response": "response",
+        },
+        ExpressionAttributeValues={
+            ":status": IDEMPOTENCY_SUCCEEDED,
+            ":write_ids": write_ids,
+            ":batch": batch,
+            ":skip_retrieval": skip_retrieval,
+            ":response": response,
+        },
+    )
+
+
+def delete_idempotency_key_row(connection_id, idempotency_key):
+    idempotency_keys_table.delete_item(
+        Key=idempotency_key_dynamo_key(connection_id, idempotency_key)
+    )

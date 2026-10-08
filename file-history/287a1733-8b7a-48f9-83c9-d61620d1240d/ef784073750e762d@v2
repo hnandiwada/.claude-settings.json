@@ -1,0 +1,465 @@
+# Integration Development Gotchas
+
+Patterns that recur across integrations. Vendor-specific instances belong in `references/{integration}/api-summary.md` — only generalizable lessons get promoted here.
+
+## How to write a gotcha
+
+Each entry is a generalizable lesson, not an integration-specific story. **The default is not to add an entry.** This list grows once per real cross-integration pattern; over-adding turns the file into noise that future agents skim past.
+
+**Applicability test before adding:** would this gotcha apply to at least half of the *next ten* integrations of any type we'd plausibly build? If you have to squint to imagine half — it's a vendor quirk, not a gotcha. Vendor quirks belong in `references/<name>/api-summary.md` "Known gotchas / unknowns"; cross-cutting patterns belong here.
+
+Examples that pass the test: "proto3 / gRPC-Gateway APIs omit zero-valued fields" (any vendor exposing protobuf-derived JSON), "sandbox is always impoverished compared to spec" (universal), "tier-3 hardcoded warehouse ID conventions" (every new WMS without an endpoint).
+
+Examples that fail the test: "Vendor X's order webhooks fire twice in the first 24 hours after install" (vendor-specific), "this customer's account uses metric units" (org-specific).
+
+Format rules:
+
+- **No "surfaced by" attribution.** Don't write `Surfaced by: <integration>, <date>`. Future agents shouldn't have to chase the originating integration to understand the rule.
+- **No vendor names in the example.** Use generic shapes ("vendors that document OAuth2 client_credentials with a JSON body"), not the specific integration that triggered the lesson.
+- **No links to gitignored files.** Pointing at `references/<name>/api-summary.md` or per-integration scratch doesn't survive — readers in other worktrees / repos won't have those.
+- **Tight format.** Three bullets is enough for most gotchas: *the pattern*, *when it bites*, *how to handle*. No history, no example chains, no walk-through.
+- **One gotcha, one entry.** If you find yourself writing a third paragraph, it's two gotchas — split them or drop the weaker one.
+
+When in doubt: **don't add.** One well-stated cross-cutting gotcha beats five overfit ones that obscure the real signal.
+
+## proto3 / gRPC-Gateway APIs
+
+Some vendors expose REST/JSON facades auto-generated from protobuf definitions (gRPC-Gateway). Telltale signs in the spec:
+- Enum values prefixed with the type name: `ORDER_STATUS_BLOCKED`, `INVENTORY_STATUS_AVAILABLE`
+- `int64` fields documented as JSON `string` (proto3 serializes int64/uint64/sint64 as strings to avoid precision loss in JavaScript)
+- `openapi.json` references protobuf descriptors, or the spec mentions buf/grpc-gateway
+- Snake_case keys throughout (some gateways do camelCase, but snake_case is more common)
+- All list endpoints are POST with body, not GET with query params (gRPC has no GET semantic)
+
+Behavior to expect and code defensively for:
+
+- **Default-value omission.** proto3 drops fields equal to their type's zero value from JSON output. Missing field ≠ "field doesn't exist"; it means "field had its zero value." So:
+  - A boolean `next_page: false` is absent from the response (not `false`).
+  - An `int64 count: 0` is absent (not `"0"` or `0`).
+  - An empty array (`returns: []`) is absent on no-records responses.
+  - An empty string field is absent.
+  When iterating: don't assume absent means error. Treat absent as the type's zero. Add a comment ONCE near the parsing helper — don't repeat on every field.
+- **int64 as JSON string.** Source returns `"850"`, not `850`. Don't blindly cast — confirm whether it's whole units or minor units (cents). Document the unit decision in `api-summary.md`.
+- **Snake_case vs camelCase discrepancy.** gRPC-Gateway can be configured either way. The spec schema may show `order_by` while docs examples show `orderBy`. Verify with a live response; the response is canonical.
+- **Sandbox impoverishment.** proto3 omission compounds sandbox sparseness — a missing field could mean (a) sandbox doesn't seed it, or (b) field was zero. You usually can't distinguish without spec + a non-zero example.
+
+When you identify a vendor as proto3/gRPC-Gateway during api-validation, flag it in `api-summary.md` "Known gotchas" up front so the function-writer doesn't re-discover it.
+
+## Resource ID strategy and idempotency
+
+Trackstar's idempotency contract — same source resource → same Dynamo row — depends on choosing a stable, globally-unique source-side identifier for `id`. See `references/integration-patterns.md` "Resource ID strategy" for the full doctrine. Highlights:
+
+- Internal vendor ID is the default choice. Switch to SKU / order_number / external reference only when (a) customers identify the resource by that field in the source UI, AND (b) you've verified global uniqueness with a sandbox probe.
+- A failing link test is **signal that ID strategy is wrong**, not a reason to override `ignore_link_tests()`.
+- If sandbox can't confirm uniqueness, escalate to vendor support before shipping. Wrong `id` → idempotency bugs that need backfill to recover.
+
+## Schema Issues
+- `raw_status`: Only populate if API returns status string; use `IntegrationNotImplemented` if computed
+- `supplier_object`: Can be `None` - always null-check before field access
+- Receipt line_items need `inventory_item_id`, `sku`, `quantity`
+
+## Data Access
+- Start with direct access everywhere
+- Add .get() only after KeyError reveals field is sometimes absent
+- Document why when adding .get() — and inline the rationale (don't reference api-summary.md from the comment, since that file is gitignored)
+
+## Vendor strings need the canonical normalizer, not ad-hoc `.strip()` / truthiness
+- **Pattern:** a vendor string can arrive as a null-like placeholder (`"NULL"`, `"None"`, whitespace-only, `""` — all truthy to a plain `if value:` / `value or fallback`) or as a padded variant of a real value (`" ABC "`), which a plain equality or dedupe check treats as different from `"ABC"`.
+- **When it bites:** the canonical `String` deserializer runs every value through `get_real_string_value`, which nulls the placeholders (`string_is_empty` catches `"null"`/`"none"`/`""`/whitespace) and trims the rest. Ad-hoc handling diverges from it two ways: a placeholder stays truthy, so a required-non-null field then fails `Field may not be null` and aborts the crawl page (or an `or fallback` never fires); and a padded real value stays un-trimmed, so it splits into false duplicates against its clean twin.
+- **How to handle:** route the value through `get_real_string_value(...)` before any comparison, dedupe, or fallback (`get_real_string_value(value) or fallback`) so it matches the deserializer exactly — placeholders become `None`, real values are trimmed and preserved. Don't hand-roll `.strip()` or a truthiness check.
+
+## ID Stability
+- Confirm IDs are stable and non-null across crawls
+- Define fallback (e.g., SKU) only if the primary ID is nullable AND the fallback is uniqueness-verified
+- Receipt IDs must be stable across crawls
+
+## API Discrepancies
+- Sample responses in docs are often idealized
+- Always test with real API before implementing
+- Save actual responses to `references/{integration}/samples/` (gitignored)
+- Spec is canonical, sandbox is sample — implement spec fields even when absent from sandbox
+
+## Sandbox impoverishment patterns
+
+- All orders in `BLOCKED` / `PENDING` state → non-blocked code paths unvalidated
+- Empty resource collections (zero returns, zero inventory) → function shipped without ever running on real data
+- All product `units_stocked_*` fields zero → format paths for non-zero stock unexercised (common with proto3 + sparse sandbox)
+- Test products lingering after sandbox cleanup attempts → ask the vendor whether there's a reset endpoint
+
+When sandbox impoverishment is detected, the wrap phase auto-drafts a vendor support email (see `skills/wrap-integration/workflows/coverage-and-support.md` step 2).
+
+## Complex Objects
+- Receipts may need data from multiple endpoints
+- Watch for variable shadowing in loops
+- Verify warehouse IDs correlate between different API responses
+
+## WMS warehouse decision tree (never `pytest.skip` get_warehouses)
+
+Every WMS integration must produce a non-empty warehouses response — `warehouse_id` is required by the order, return, inbound shipment, and shipping method schemas, and link tests cross-reference it. The implementation depends on what the vendor exposes:
+
+1. **Warehouse endpoint exists** (`/warehouses`, `/locations`, `/facilities`, etc.) → implement `get_warehouses` directly, no special tricks. Most integrations.
+2. **No endpoint, but inventory carries `warehouse_id`** → don't override `get_warehouses` at all. The base `WMSIntegration.get_warehouses` (`integrations/wms/WMSIntegration.py:283`) walks the cached InventoryItems' `inventory_by_warehouse_id` keys and synthesizes warehouse rows automatically. Just make sure `format_inventory_item` populates `inventory_by_warehouse_id` keyed by real warehouse IDs.
+3. **Neither** (single-warehouse vendor or no warehouse concept at all) → hardcode a default warehouse ID and have `get_warehouses` return it as a single-element list. Canonical exemplars: `linnworks` (`DEFAULT_WAREHOUSE_ID = "00000000-..."` constant) and `shippingbo` (install-time configurable via `integration_secret["warehouse_id"]`). Every order, inbound shipment, return, and shipment must then set `warehouse_id` to the same default.
+
+When it bites: agents tempted to `pytest.skip("no warehouse endpoint")` ship integrations whose orders fail schema validation in production because `warehouse_id` is missing. The base implementation auto-fill (tier 2) is invisible — easy to miss if you only look at integrations that override `get_warehouses`.
+
+How to handle: identify the tier during api-validation (the `Warehouse availability` field in `api-summary.md` "API Characteristics" tells the function-writer which tier applies). For tier 3, decide during scaffolding whether the default warehouse ID is a constant, an install-form field, or an auto-derived value, and document in the manifest.
+
+Also: WMS base scope is **always** products + inventory + warehouses, even if the Linear ticket only lists one of them. Skipping any of the three leaves downstream resources structurally broken.
+
+## OAuth2 client_credentials with plain-JSON body
+
+- Some vendors document "OAuth2 client_credentials" but the token endpoint takes a **JSON body** (`{"client_id": ..., "client_secret": ...}`) without a `grant_type` field — not the standard form-encoded shape.
+- When it bites: copying a form-encoded auth exemplar into a JSON-body integration sends the wrong content-type and gets a generic 4xx with no clear hint.
+- How to handle: re-read the auth section of the spec for the literal request body shape before reaching for an exemplar. Pin the body shape (JSON vs form-encoded) in `api-summary.md` "Auth flow detail" so the function-writer picks a matching exemplar.
+
+## Self-seeded sandbox data is not vendor enforcement
+
+- Sandbox data populated by us (or a prior agent run) proves what we put in, not what the vendor allows. "152 unique SKUs" in a self-seeded sandbox is evidence we used unique SKUs, not that the vendor enforces uniqueness.
+- When it bites: agents conclude "field X is unique / always present / always positive" from sandbox crawl data and ship code that breaks on real customer data.
+- How to handle: probe API behavior directly. For uniqueness, attempt the violating operation (POST a duplicate) and observe the vendor's response. For field presence, look for an endpoint returning historical data the seed script didn't touch. A negative API response is evidence; a sandbox snapshot is not.
+
+## Date-only fields are not localized timestamps
+
+- Many vendors mix `yyyy-MM-dd HH:mm:ss` (a wall-clock instant) and `yyyy-MM-dd` (a calendar day) in the same response. The first needs timezone localization to round-trip to UTC; the second does not — it represents a date, not midnight in some timezone.
+- When it bites: agents apply the same `tz.localize(naive).astimezone(utc)` helper to both, producing phantom off-by-one days for the date-only field. Example: GMT+8 vendor with `expectedDate: "2024-01-01"` (a calendar day, not "midnight Beijing on 2024-01-01") localizes to UTC `2023-12-31T16:00:00Z` — wrong calendar day on read, fails round-trip on write.
+- How to handle: branch by presence of a time component. Date-only → `f"{s}T00:00:00Z"` with no shift. Full datetime → localize + convert. Star's `gmt8_to_utc` is the canonical example. On the write side, declaring the integration schema field as `Date` (vs canonical `DateTime`) triggers the harness alignment in `base_resource.py:737-755` so test round-trip equality still holds.
+
+## A naive datetime *filter* is evaluated against the vendor's clock, not ours
+
+- The localization problem has a request-side twin that is easier to miss than the response-side one above. When a list endpoint filters on a naive `yyyy-MM-dd HH:mm:ss` string, the vendor compares it to its own wall clock. Send a UTC `now()` as the upper bound to a vendor running UTC+8 and the window ends eight hours in that vendor's past, so the most recent records are silently outside it.
+- When it bites: the crawl returns `total: 0` or a short page and looks like "nothing new" rather than an error, so it survives review and only surfaces as a customer reporting missing recent records. A wide backfill window hides it completely — it only appears once the window's upper bound approaches now, which is every incremental crawl.
+- How to handle: probe it rather than reasoning about it. Query a window whose upper bound is `now()` in UTC against records you know exist, then the same window shifted by the vendor's offset; if the first returns nothing and the second returns them, the filter is local-time. Do not assume it is uniform across the vendor: on the same host, endpoint families can differ, so confirm per family. And rule out read-back/index lag first (see the entry above) — a freshly written record invisible to *any* time window but findable by id is lag, not clock skew, and shifting the window there makes things worse.
+
+## Dynamic OneOf enums sourced from already-crawled resources
+
+- Schema validators can read from already-stored resources at write time via `Resource(self).get_all_resources()` inside the schema function, gated on `if self.connection_id:` so the unauthenticated docs render still works. Pattern surfaces real warehouse/sku/channel/etc. ids to the customer in the install form before they submit a write, and turns vendor-side "X not enabled here" errors into client-side validation errors.
+- When it bites: validation rejects writes against ids that exist at the vendor but haven't been crawled yet (e.g. a channel enabled today but our crawl ran yesterday). Surfaces as a confusing `OneOf` error pointing at a stale id list.
+- How to handle: use the pattern for ids that are (a) frequently invalid in customer input and (b) cheap to enumerate (warehouses, shipping methods, suppliers). Skip it for high-cardinality or fast-changing sets (skus on busy catalogs). Always include a static fallback (`["N/A - Connect an account to see options"]`) for the no-connection path so the schema docs still render.
+
+## Code comments must stand alone in pokedex
+
+- Integration code lives in pokedex; reviewers and future agents reading it may not have the skill/reference side (`api-summary.md`, `references/<name>/`, etc.) in scope — those files exist but aren't necessarily open in the reviewer's context.
+- When it bites: comments like `# see api-summary.md for rationale` look helpful while writing but are dead pointers for everyone else reading the code. The rationale disappears.
+- How to handle: a comment explaining a non-obvious choice stands on its own. If the rationale is too long for an inline comment, surface it in the PR description (lives with the change forever). For patterns that recur across many fields — proto3 zero-omission, gRPC-Gateway POST conventions, an integration-wide unit convention — put one paragraph at the top of `integration.py` as a module-level header instead of repeating it at every call site.
+
+## xmltodict collapses a single repeated XML element to a dict, not a list
+
+- XML schemas mark repeated elements `maxOccurs="unbounded"` (order lines, packs, inbound lines, references). `xmltodict.parse` returns a **list** when 2+ siblings are present, a **bare dict** when exactly one is present, and the wrapper is **absent or `None`** when there are zero — the shape silently depends on cardinality.
+- When it bites: a `for line in parsed["Lines"]["Line"]:` loop iterates the dict's *keys* (strings) on a single-line document, and **raises `KeyError`/`TypeError` on an empty document** (the `Lines` wrapper is `None`, or has no `Line` key). The single-line bug hides until a real one-line record shows up; the empty bug hides until a quiet crawl window or the auth-code/permission-validation path (short window → zero records) — neither surfaces against a populated sandbox.
+- How to handle: route every unbounded section through one small helper — `extract_list(parent, child_key)` — that returns `[]` when the parent is falsy/absent or the key is missing, wraps a lone dict in `[dict]`, and passes a list through. Apply it at every repeated level (lines, packs, pack-lines, references); guard only structural wrapper nodes, never data fields (or you mask genuinely-missing-field bugs).
+
+## A record just created may not be readable yet — treat read-back lag as normal
+
+- Vendors with async write pipelines accept a create and then answer the detail/list read with an empty result for seconds to minutes — often as `200` with "no records" / `items: []`, not a 404. Presence of the record's id field in the read body, not the create's status code, is the readiness signal.
+- When it bites: a create whose immediate read-back raises not-found invites a duplicate-creating retry (by the caller or a retry layer), or the formatted create response gets built from the empty read and drops fields. Sandboxes typically lag less than prod, so tests stay green while prod duplicates.
+- How to handle: poll the read-back with short sleeps over a bounded window; on exhaustion, format from what the create itself returned or raise a distinct "created but not yet readable — do not retry" error. Never raise `ResourceNotFoundException` there — that's the signal callers retry on.
+
+## Raw datetime objects in query params serialize wrong — and tests can't catch it
+
+- Crawl methods receive `start`/`end` as datetime objects; passing one straight into a `params` dict makes the HTTP client serialize it as `2020-01-01 00:00:00+00:00` (space, offset form), not the ISO-8601 `...Z` form most vendors parse. Always wrap with `dt_to_str` at every params site.
+- When it bites: the test fixture's wide-open start window (e.g. 2020) returns the full dataset whether or not the vendor parsed the malformed cutoff, so every `get_*` test passes while the incremental path — the entire point of the param — is broken or silently degrades to a full re-crawl in production.
+- How to handle: grep every `params` dict for bare `start`/`end` before wrap-up, and live-verify one changed-since query with a recent cutoff (expect a small, correctly filtered result), not just the wide window.
+
+## A vendor "SKU"/code may not be globally unique — probe before using it as `id`
+
+- Some WMS/cart APIs let two distinct products share the same `code`/SKU. The canonical `id` must be globally unique for idempotency, so a non-unique code cannot be the product `id`.
+- When it bites: link tests and idempotency look fine against a sparse sandbox, then two same-code products collide in production (overwrites, double-writes). An inventory endpoint that exposes only `code` (no internal id) forces a code-keyed inventory even when products key on internal id, and any per-(code, warehouse) aggregate must SUM across the colliding rows, not last-write-wins (last-write-wins silently truncates onhand).
+- How to handle: probe uniqueness early (a read scan for duplicate codes, or a create probe in a writes-safe sandbox). If non-unique, key the resource by internal id and require the internal id on writes (a `@validates_schema` that rejects code-only line items, since code to internal-id is ambiguous). Keep code as the link key only where the linked endpoint also exposes only code.
+
+## "lines_changes"-style write APIs: UPDATE needs the existing line id; ADD duplicates
+
+- Some vendors express order/receipt line edits as a `lines_changes: [{type, ...}]` array. `type:"ADD"` always appends a new line, so using it for an update accumulates quantity (set qty 1 on an existing-qty-1 line and the read-back shows 2) instead of replacing.
+- When it bites: only at live write-validation (compose phase); a spec-only write build cannot see it. The create path passes while the update path silently double-counts.
+- How to handle: in `update_*`, first fetch the existing record's lines via a by-id read that returns the vendor line ids, match incoming canonical lines to existing lines (by product), and emit `type:"UPDATE"` with the existing line id; fall back to `ADD` only for genuinely new lines.
+
+## Request helpers must handle 204 / empty bodies (`.json()` raises on them)
+
+- Cancel/delete (and some PATCH/PUT) endpoints return `204 No Content` with an empty body. A request helper that unconditionally does `return response.json()` raises `JSONDecodeError` on the success path.
+- When it bites: read-only auth review never exercises it; it surfaces only when a live write test hits a 204 (for example cancel_order).
+- How to handle: in the shared request helper, after the `if not response.ok:` block and before `.json()`, return `None` (and still clear `api_call_errors[path]`) when `response.status_code == 204` or the body is empty.
+
+## Link tests crawl one page each: the base resource must emit broad coverage on page one
+
+- The WMS link tests populate `context["inventory_ids"]` from a single `get_inventory` page and intersect it with one page of products/inbounds/ledger. If `get_inventory` emits items per paginated secondary-source page rather than per authoritative SKU, the first-page SKU samples of two resources need not intersect even when the full datasets do, so the link assertion flakes.
+- When it bites: the per-resource get test passes in isolation (the link check is skipped when inventory is not in context), then fails only in the full sweep where inventory ran first.
+- How to handle: have `get_inventory`'s first page cover the full SKU set (drive it from the authoritative per-SKU source it already full-scans, such as stock balances) so any resource linking to inventory overlaps deterministically. `ignore_link_tests` is a last resort, legitimate only when the data model genuinely lacks the link, not to paper over a coverage/pagination artifact.
+## Full-replace (PUT) on a line-item sub-collection needs a vendor remove primitive
+
+- The pattern: a canonical PUT on `line_items` (orders, inbound shipments, returns) is meant to be authoritative — items the caller omits should be deleted. Whether you can honor that is decided entirely by the vendor write API, and a large share of WMS APIs cannot express removal at all.
+- When it bites: the update endpoint turns out to be additive (the quantity you send is added to what's there, with no decrement or delete), or update-only (it changes lines matched by sku/id but rejects new ones and ignores omissions), or it has no delete/replace op (only a quantity-cancel that zeroes a line but leaves it on the order), or full-replace works but reassigns a downstream-visible line id and breaks a channel's fulfillment push. In every case, stripping omitted items client-side and trusting the upsert to delete them either does nothing, double-counts, or quietly destroys lines a partial edit never meant to touch.
+- How to handle: before building full-replace, confirm the primitive exists — a true set-replace, or add+remove / diff+delete keyed by a stable line id. If the API is additive-only or update-only, full PUT is not safely achievable; represent the API faithfully (loudly reject the unsupported direction) rather than faking it, and record the limitation in `api-summary.md`. Removal capability is not implied by the presence of an update endpoint — verify it directly.
+
+## Single-active-token auth (Laravel Sanctum default): a new login revokes prior tokens
+
+- Some token-exchange vendors (Laravel Sanctum out of the box is the common one) keep exactly one active token per user. Every call to the login endpoint mints a new token and silently invalidates ALL previously issued ones. The token has no TTL otherwise, so it reads as "long-lived, no refresh" right up until something logs in again.
+- When it bites: the integration's own test suite fails before any customer sees it. `test_install` re-runs `get_integration_secret` (a fresh login) mid-suite, which revokes the token the module-cached `integration` fixture handed to the get tests, so every get test after `test_install` 401s. Per-cluster `--gets` runs pass (they exclude `test_install`); the full `yarn test -k <name>` sweep fails. In production the same thing happens whenever the customer logs into the vendor's own UI with the connected account: our stored token dies and the sync 401s with no recovery.
+- How to handle: implement re-auth-on-401 in the request helper (byrd is the exemplar) — on a 401, call `refresh_integration_secret()` (a full re-login with the stored creds, since there's usually no refresh endpoint), `update_integration_secret(...)` to persist the new token, and retry the request ONCE inline (not a recursive call — bound it to one retry). Then ask the vendor for a dedicated API credential that doesn't share the single-active-token slot with interactive UI logins; re-auth-on-401 keeps our sync alive but revokes the customer's UI session each time it fires, so it's a mitigation, not a cure.
+
+## WMS with no inventory/products endpoint: skip the mandatory base tests + register the install probe
+
+- `test_get_inventory` and `test_get_products` carry NO `is_implemented` guard (inventory and products are the WMS base layer), so they run unconditionally and fail with `NotImplementedError` for a vendor whose API genuinely has no such endpoint. Likewise `test_install` defaults to probing `get_inventory` for any integration not named in its per-integration list.
+- When it bites: a vendor that only exposes orders/warehouses/customers (an order-centric WMS) passes every per-resource test but fails the full sweep on `test_get_inventory`, `test_get_products`, `test_get_inbound_shipments`, and `test_install`.
+- How to handle: confirm the absence first (probe the endpoints — a 404 is the evidence), then on the integration's test class override the unguarded tests to `pytest.skip("<vendor> has no <resource> endpoint (404)")` (pulpo/adp precedent), and add the integration to the appropriate `get_*` list in `base_test.py::test_install` so the install probe reads via a resource the vendor actually has. That `base_test.py` list is a per-integration registry (extended one name at a time per build), not a behavior change.
+
+## A create/POST endpoint may return a minimal object, not the full resource
+
+- Some vendors' `POST /resource` returns only a stub (`{id, sku, name, created_at}`), not the full read-shape object. Running `format_*` on that stub `KeyError`s on any field the create response omits (barcode, dimensions, nested customs, etc.).
+- When it bites: `create_*` is built spec-only and passes local schema checks, then the first live write fails inside `format_*` on a field that GET returns but POST doesn't. Invisible until an actual POST runs — a strong argument for validating writes live before shipping.
+- How to handle: after the POST, re-`GET` the created resource by its returned id and run `format_*` on the GET result, not the POST response. Same idiom as a post-cancel re-GET. Confirm the create response shape live (a debug print on one real write) rather than assuming it mirrors GET.
+
+## Un-seedable inventory (physical-receiving-only) is a data gap, not a reason to un-implement warehouses
+
+- Some WMS vendors only create inventory after goods are physically received at a warehouse, with no API to add stock (and sometimes no inbound endpoint at all). The `/inventory` endpoint exists and works — it just returns empty on a fresh account. `test_get_inventory` and tier-2 `test_get_warehouses` then fail on "no X returned" even though the code is correct.
+- When it bites: this looks like the "never `pytest.skip` get_warehouses" rule (which is about agents avoiding warehouse *implementation*), but it is a different situation — warehouses ARE implemented (tier-2 synthesis), the sandbox just has nothing to synthesize from. Orders still carry their own `warehouse_id`, so production data is fine.
+- How to handle: keep the tier-2 implementation, `pytest.skip` `test_get_inventory` + `test_get_warehouses` with a reason that names the data gap (not "no endpoint"), and draft a vendor support email to seed inventory + a received inbound so the skips can be lifted later. Distinct from the 404 case above (no endpoint) — here the endpoint is real and the gap is data.
+
+## List-typed canonical fields reject `None` — the write-only-field rule needs the List escape valve
+
+- Doctrine says a field the vendor accepts on write but never echoes on read becomes `None` on the read path (not `IntegrationNotImplemented`). That guidance assumes a scalar field. List-typed canonical fields (e.g. `Return.notes`) default `not_implemented_default=[]`, which forces `allow_none=False` in `FieldMixin.set_default_on_init` — the schema physically rejects `None` for them.
+- When it bites: you expose a write-only string like a return note, dutifully flip the matching read field to `None`, and every read record fails validation with `'notes': ['Field may not be null.']`. Spec-only builds hit it on the first live read test.
+- How to handle: for List-typed canonical fields the two valid read-side shapes are `IntegrationNotImplemented` (source exposes nothing to read) or a real list built from source data. Keep `IntegrationNotImplemented` when the read response has no such field at all, and record the write/read asymmetry in `api-summary.md` instead of the code.
+
+## Inventory that changes without bumping `updated_at` needs full-snapshot crawls
+
+- Some vendors mutate stock quantities without touching the record's `updated_at`/`lastChanged`, so an incremental updated-since inventory crawl silently misses quantity movements.
+- When it bites: inventory drifts out of sync in production while every crawl completes green; customers report wrong onhand that a forced full resync fixes.
+- How to handle: before choosing incremental crawling for inventory, probe whether a quantity-only change moves the vendor's updated timestamp. If it doesn't, crawl inventory as a full snapshot every run and window only the other resources.
+
+## Mixing `None` and `IntegrationNotImplemented` for one field within a crawl page aborts the page
+
+- The crawler enforces one implemented-signature per field per crawl page: records carrying `IntegrationNotImplemented` and records carrying `None`/a real value cannot coexist ("Implemented dict conflict … set to False but got value", raised in `celery_tasks/crawler.py`).
+- When it bites: a field genuinely present on some records and structurally absent on others — synthetic parent rows beside variant rows, lookups that resolve for some records only. Passes sandbox, first surfaces in prod on the first mixed page.
+- How to handle: pick one shape for the field across the whole integration — `None` for every record whenever any record can provide it. Dict-typed fields on synthetic rows use an empty `{}` so their implemented-signature matches sibling rows.
+
+## A fix verified on one connection is not verified
+
+- Vendor accounts differ in configuration (channels, permission scopes, warehouse setups), so a request-shape change that fixes one connection can break connections that were healthy.
+- When it bites: a blanket change (new header, changed params) validated only against the reporting customer's account zeroes out reads for differently-configured accounts; the regression surfaces after merge, when someone finally tests other accounts.
+- How to handle: confirm the failure signature actually appears in prod telemetry before shipping, test the fix against several differently-configured live connections, and prefer fallback-on-error (keep the old request shape, retry with the new one on the specific failure) over unconditional request changes.
+- The mirror also holds: a shared-behavior change motivated by ONE connection's failure must be checked against every other connection on the integration before it ships — enumerate them and show the change is a no-op (or an improvement) for each.
+
+## Per-integration exceptions extend the framework's existing allowlist
+
+- Shared resource validators and base test classes carry per-integration lists for legitimate exceptions (e.g. the shipment-without-line-items list in `resources/wms/orders.py`, the `test_install` probe lists in `base_test.py`). When one integration genuinely can't satisfy a shared validation, the fix is one more name in the existing list.
+- When it bites: the same exception implemented locally instead — skipping records, synthesizing data to pass validation, or patching a shared base class — either misrepresents the source or changes behavior for every other integration.
+- How to handle: search the shared validator/base for an existing per-integration list first and extend it with the one name. If no list exists, surface the gap rather than forking behavior locally or editing a shared base class for one integration's sake.
+
+## Redocusaurus doc sites bundle the OpenAPI spec inside a JS chunk
+
+- Some vendor docs (Docusaurus + redocusaurus plugin) render the API reference client-side; the page HTML is an empty shell and the "obvious" spec URLs (`/openapi/*.json`) return the SPA fallback. The real spec is embedded in a webpack chunk as `JSON.parse('...')`.
+- When it bites: scraping the docs URL yields nothing, tempting a build from guesswork or a stale third-party mirror.
+- How to handle: fetch `runtime~main.*.js`, read the chunk-name/hash map, pull the chunk whose content matches the API paths, and extract the `JSON.parse('...')` literal (unescape `\'` and `\\` as a JS single-quoted string). The decoded object's `spec` key is the full OpenAPI document — save it under `.claude/references/{name}/spec_extract/`.
+
+## APIs that return HTTP 200 on failure (GraphQL and REST alike)
+
+- GraphQL-over-HTTP vendors put failures in the response body — a top-level `errors[]` array (often beside a `data` key full of nulls) or per-object business errors — while the transport status stays 200. Plenty of REST vendors do the same: an `errors` key or refused-rows list in a 200 body, including on writes, where a bulk endpoint can accept some rows and refuse others without ever leaving 2xx.
+- When it bites: a request helper that only checks `response.ok` treats the error envelope as data, so failed queries and rejected mutations flow into formatters (KeyErrors far from the cause) or get echoed to customers as 200 successes. On writes it is worse: a no-op write reports success, and nothing downstream ever notices the record was never created.
+- How to handle: after parsing, check for `errors[]` (and any per-object error field the schema defines) and raise with a real error status. Every write method checks the response body's error/refused fields before treating the write as applied — a 2xx transport status is never by itself proof a write landed.
+
+## Permission failures scope to the endpoint, not the connection
+
+- Vendors reuse 401/403 for "valid key, endpoint not provisioned" (an unbought module, a billing scope, an add-on), and some resources only work when optional extra credentials are configured.
+- When it bites: mapping that response to invalid credentials flags the whole connection broken over one endpoint, alerting the customer for nothing; raising `NotImplementedError` instead disables the resource for every connection, because `is_implemented` reads the method source for that raise.
+- How to handle: match the vendor's specific not-provisioned signal (a distinguishing message or code — not every 401) and raise a `PermissionsException` scoped to that function, so only that resource goes quiet; any other 401 stays a whole-connection credential error. A resource gated on optional credentials raises `PermissionsException` when they are absent, never `NotImplementedError`.
+
+## A stored-row lookup in a get function only needs an `in_perm_validator()` guard when the integration raises permissions exceptions
+
+- `Resource(self).get_all_resources()` / `get_resource()` / `batch_get_resources()` raise `PermValidatorQueryException` whenever `in_perm_validator()` is true, so a get function that joins stored rows (carrying a write-only field forward, resolving a dependency map) looks like it always needs an `if not self.in_perm_validator():` guard around the lookup.
+- When it doesn't: the permission validator only runs for an integration whose class source calls `self.create_permissions_exception(...)` — that is exactly what `BaseIntegration.raises_permissions_exceptions()` scans the source for, and at install the validation job is only enqueued when it returns true. An integration that never raises a permissions exception never enters the validator, so `in_perm_validator()` is never true for it and the unguarded stored lookup cannot raise. A reviewer flagging the missing guard is right in general and wrong for such an integration.
+- How to handle: check whether the integration calls `self.create_permissions_exception(...)` anywhere (or inherits a shared base that does) before adding the guard. If it does, guard the stored lookup and let the vendor read stand alone (skip the enrichment, still make the API call) — the call is what proves the endpoint reads. If it doesn't, the guard is dead code; leave the lookup unguarded.
+
+## Missing stored data on the test connection is a seeding problem, not a design constraint
+
+- A get function that reads stored rows (`check_first_crawl_complete()`, `get_all_resources()`, `get_resource_implemented()`) fails on a fresh dev connection: `DependencyFirstCrawlIncompleteException` because the dependency never finished a first crawl, or `KeyError: 'Item'` because no persisting crawl has seeded the `-implemented` row yet (one row per integration, so it's missing only for a new integration).
+- When it bites: building around the empty store instead of filling it. Catching the exception, `pytest.skip`-ing the test, or dropping `load_not_implemented` ships a function that behaves differently from production, where the store is always populated.
+- How to handle, outside the permission validator: populate the store. Run the dependency's crawl as a persisting full backfill (`crawl.json` with `"first_crawl": true`, then `yarn crawl -s dev -d false -f` with no `--max-pages`) and confirm its scheduler row's `latest_data` reaches the connection's `created_at`. The same run stores the `-implemented` row; if the sandbox can't produce one, write the row yourself with `store_resource_implemented` (`utils/boto.py`) from a `.claude/tmp/` script. Then keep `load_not_implemented` in the code.
+- How to handle, inside the permission validator: nothing is stored there, and stored reads raise `PermValidatorQueryException`. When the function needs the dependency's data to make its own call, fetch it live with `Resource(self).make_perm_call()` or call the vendor endpoint directly; when the data is only enrichment, skip it under `self.in_perm_validator()` and still make the call. Skip `get_resource_implemented` / `load_not_implemented` there too.
+
+## Write methods run inside the customer's synchronous API call
+
+- A `create_*`/`update_*`/`cancel_*` method executes while a customer's HTTP request to us is blocked waiting on the answer — unlike a crawl, there is no queue to absorb a long wait.
+- When it bites: a retry loop or sleep that is harmless in a crawl (60s waiting out a vendor transient) holds the customer's request open for the whole wait, and stacked retries can push it past gateway timeouts, so the customer gets a 504 with the write's outcome unknown.
+- How to handle: keep write-path waits to seconds (a short bounded read-back poll is fine); surface a vendor transient as an error the caller can retry rather than sleeping through it.
+
+## A write path that reuses the crawl's format function must repeat the crawl's enrichment
+
+- Crawl paths often enrich a record before formatting it: copying fields off a parent object, joining a lookup built earlier in the loop, filling a value the list endpoint returns but the detail endpoint doesn't. A write method that hands the vendor's mutated object to the same `format_*` function skips all of it.
+- When it bites: the formatter reads a key that only the enrichment supplied, so the write raises a KeyError and returns a 500 while crawls stay green. Child records (variants, lines, sub-items) hit this hardest because their endpoints return a narrower object than the parent's listing.
+- How to handle: put the enrichment in a named function and call it from both paths, so the write can't drift from the crawl. Confirm what the write response actually contains by reading the raw object rather than assuming it matches the list shape.
+
+## SFTP feed listings include subdirectories
+
+- `SftpClient.list_files` / `list_files_with_mtime` return every directory entry, and EDI-style vendors keep `Processed/` or `Archive/` subdirectories inside each feed folder alongside the data files.
+- When it bites: the first read of a feed folder tries to open a directory name as a file and the crawl dies on a confusing transport error, often only after the folder's first real file rotates out and the subdirectory is all that's left.
+- How to handle: filter listings by extension (`.xml`, `.csv`) or use `list_and_read` (which skips directories) before opening anything; never filter by a hardcoded subdirectory name, since vendors add new ones.
+
+## The WMS test suite treats orders as mandatory
+
+- `wms_test.py::test_get_orders` has no `is_implemented` skip guard (unlike shipping_methods/bills), so a WMS integration without a working `get_orders` fails its suite either way: a stub override that raises defeats the framework's auto-skip, and deleting the override just moves the raise to the base class.
+- When it bites: ack-only vendors (the order feed only confirms orders we pushed) or vendors with no order read at all — the suite is red no matter how correct the rest of the build is.
+- How to handle: implement the read against what the vendor offers (for ack-only feeds: return only Trackstar-created orders and skip unknown confirmations — `capacity/integration.py` is the shipped shape) and add a scoped `test_get_orders` override that catches exactly the "no orders returned" assertion with a `pytest.skip` naming the reason. Never a blanket skip.
+
+## An end-of-pass reconciliation sweep is only correct if the pass covered everything
+
+- Full-snapshot crawls often reconcile at the end: build a map of every record up front, delete from it as the feed returns each one, then write what's left over as zeroed / inactive. That leftover set is only meaningful when the pass actually visited every page and the feed actually returned everything it should have.
+- When it bites: a pass resumed from a stored page token rebuilds the whole map but visits only the tail, so every record on the earlier pages looks unseen and gets zeroed. Same result when the source truncates and serves a short but clean feed, since an early empty page is indistinguishable from the real end of the list. Both wipe live data while the crawl reports success and its watermark stays fresh.
+- How to handle: make the sweep unreachable unless the pass was complete. Have `store_<resource>_page_token` return False so every pass starts at page 1, and carry a flag for every point in the pass where you know you failed to read something — a vendor error that cost a record, a prefetch that didn't finish — then skip the sweep (logging why) if it is set at the end. Skipping turns a silent wipe into stale-but-correct data, which is the recoverable failure; a stale record can be fixed by the next clean pass, an overwritten one cannot.
+- Lead with the flags, but keep a "too many records went unseen" ratio behind them as the backstop. The flags are precise and name their own cause; the ratio needs a threshold nobody can source and fires late, but it is the only thing that catches a source truncating cleanly with no error at all. Order them so the log line reports the precise cause when there is one.
+
+## A vendor's published schema can be stale against its own live exports
+
+- Vendors ship an XSD/OpenAPI/WSDL alongside real sample files, and the two disagree: the live files carry elements the schema never declares. On one Datex WMS the real export had 20+ undeclared elements, including the order and shipment status fields themselves — the two fields any status mapping is built on.
+- When it bites: code written from the schema silently omits fields that are always present in practice, or worse, validates incoming files against the schema and rejects every real one. Nothing surfaces until the first live crawl, because the schema-derived code is internally consistent.
+- How to handle: when both a schema and real files are available, treat the real files as canonical and the schema as a floor — it tells you what is guaranteed, not what arrives. Diff the two before mapping and record the undeclared elements. Never validate incoming vendor payloads against the vendor's own published schema.
+
+## File-drop integrations often expose only terminal states
+
+- A vendor that exchanges files rather than serving an API frequently exports only completed events — a shipping confirmation once an order ships, a warehouse receipt once an inbound is received — with no feed for the open or in-progress record.
+- When it bites: the integration looks complete and every mapping is right, but the customer never sees an order between placing it and its shipping, or an inbound between sending it and its arrival. It reads as missing data or a sync delay, and gets investigated as a bug, when it is the vendor's data model.
+- How to handle: enumerate the export file types against the full resource lifecycle before building, not after. If there is no open-state feed, say so plainly in the PR and to the customer as a product limitation, and confirm with the vendor that no additional export exists — do not synthesize an open record from a terminal one.
+
+## Real vendor sample files carry end-consumer personal data
+
+- Sample files supplied on a ticket are usually genuine production records: shipping confirmations and returns contain a real person's name, street address, phone and email.
+- When it bites: the natural move — commit the authoritative samples so future readers can see the real shape — puts a customer's home address in the repo permanently. It also reaches the repo indirectly, when an agent quotes a sample value into a reference note that later gets committed.
+- How to handle: commit the vendor's synthetic template samples and the schema documentation; reference real files by name and leave them out of the repo, noting in the api-summary which is which. Before committing reference artifacts, scan them for the personal-data values that appear in the real files, not just for credentials.
+
+## Infor ION OAuth2 password grant: service-account keys go in username/password, not client fields
+
+- Infor CloudSuite / ION integrations authenticate with a downloaded `.ionapi` file. The token call is an OAuth2 **password grant**, but the field mapping is unusual: the service-account key pair (`saak`/`sask`) goes in `username`/`password`, while `ci`/`cs` are `client_id`/`client_secret`. Sending the SA keys as client credentials (the more common client-credentials shape) fails auth.
+- When it bites: a first pass assumes client_credentials from `ci`/`cs` and never sends `saak`/`sask`, so the token endpoint rejects it.
+- How to handle: token endpoint is `{pu}{ot}` from the `.ionapi`; body is `grant_type=password`, `username={saak}`, `password={sask}`, `client_id={ci}`, `client_secret={cs}`. The suite gateway base is `{iu}/{tenant}/WM/wmwebservice_rest` + the spec path. Mint the token in `get_integration_secret` and re-mint on 401. Infor SCE also overloads HTTP 500 for auth/context failures ("context is null"), so the stale-token re-mint should trigger on that 500 body too, not just 401 — but only on that specific message, since 500 is also used for real errors.
+
+## Manifest fields customers paste get loose validation plus code normalization
+
+- Install-form values a customer copies out of a vendor UI or an email (folder paths, subdomains, account slugs, base URLs) arrive in every variant: leading/trailing slashes, whitespace, a full URL where a bare host was expected.
+- When it bites: a strict manifest regex rejects a value the customer reasonably pasted, and the install fails with a validation error the customer can't interpret — they won't read help docs to learn the exact expected shape.
+- How to handle: keep the manifest regex loose (reject only values that can't be salvaged) and canonicalize in `get_integration_secret` (`"/" + value.strip("/")`, strip scheme, lowercase the host). Good UX assumes the customer never read the format rules.
+
+## A per-record raise wedges a crawl over a non-archiving feed
+
+- Some feeds re-serve the same files or rows on every crawl — an SFTP folder the vendor never archives, a report that always returns the full window. A raise on one bad record there is not a one-time failure: the same record re-fires it on every crawl, and under batching it blocks every later file behind it.
+- When it bites: one malformed record (a blank date, a reference to an unknown object, a multi-parent row) permanently stalls the whole resource; the crawl errors forever while the vendor keeps adding new data behind the wedge.
+- How to handle: per-record problems skip with a `logger.warning` and let the cursor advance; reserve raises for feed-wide assumption violations (a filename convention breaking, a schema change) where continuing would corrupt everything. Stale-but-crawling beats wedged.
+
+## Offset pagination: know what the offset indexes before choosing how to advance it
+
+- Two related traps in offset/limit paging: how to advance the offset depends on whether the server's offset counts the rows it returns or a wider pre-filter set, and a query with no stable `ORDER BY` can repeat or drop rows across pages.
+- When it bites: when the server filters or joins after windowing, short pages appear mid-stream — advancing by rows-received then re-reads the same window forever (and some APIs reject offsets that aren't limit multiples). When the offset indexes the filtered result set, advancing by the limit past a legitimately short page skips records. Unstable ordering silently corrupts keyed aggregation built across pages — totals look plausible and nothing errors.
+- How to handle: check which set the offset counts. Short pages possible mid-stream → advance by the limit and treat only an empty page as the end. Offset counts the returned rows and the response carries a trustworthy total/hasNext → advance by rows returned and stop on the total or when `hasNext` is false. Either way, pin an explicit, unique sort key on every paginated query. When one emitted item aggregates rows that can straddle a page boundary, hold the aggregate a full page's last rows started until the next page confirms it complete — pages submitted independently can land out of order, so a partial total emitted first can stick while the complete one is dropped as a no-change duplicate. The same determinism rule applies client-side: anything a stored page token indexes into (sku chunks, id batches) must be rebuilt identically across processes — sort before chunking, since a Python `set`'s iteration order changes between runs, so a resumed crawl would rebuild different chunks and pull a different slice.
+
+## Incremental crawls over an `updated_at` filter: slide on the timestamp, not a cursor or page number
+
+- A cursor or page number counts positions in the filtered result. If a row the crawl already passed changes mid-crawl and leaves the filter (or moves to the end of an `updated_at` sort), every later row shifts up one place and the next page starts one row too late. The skipped row keeps its old `updated_at`, so no later crawl picks it up, and nothing errors.
+- When it bites: any incremental crawl that needs more than one page for a window on a busy account.
+- How to handle: a sliding window. Sort ascending on `updated_at`, and after each full page hand back the last row's `updated_at` (floored to the second if the filter is inclusive) as `next_start`, so the next call starts from that timestamp on page 1. Use the vendor's cursor as `next_token` only when a full page shares `start`'s timestamp, since restarting from it would return the same page. Sort on `updated_at` plus a unique key (`updated_at,id`): some APIs return rows that share an `updated_at` in a different order once paged, so a cursor through a tie repeats some rows and skips others. Every `next_start` makes the crawler wait for that page to finish submitting, so this costs one wait per page.
+
+## Offset-aware vendor timestamps: parse them, never slice or string-compare
+
+- Some vendors emit ISO timestamps carrying a UTC offset (`2026-08-26T10:00:00.123+0530`), and one feed can mix offsets (DST transitions, multi-region warehouses).
+- When it bites: the shared `utils.format_iso` strips fractional seconds by splitting on `.`, which also discards a trailing offset — the vendor's wall-clock time gets recorded as UTC (a 5.5-hour error for `+0530`). Separately, a string `max()`/`min()` over mixed-offset timestamps picks the wrong row, because lexical order is not time order once offsets differ.
+- How to handle: parse with `datetime.fromisoformat` and compare as tz-aware datetimes; don't route an offset-bearing string through `format_iso`.
+
+## Per-record lookups inside a list crawl burn rate caps — batch or cache them
+
+- The pattern: resolving a detail per row with one vendor call each (a product per line item, a stock row per sku) inside a `get_*` loop.
+- When it bites: vendors with daily call caps (e.g. 5000/day) spend the whole cap on lookups, wedging every other flow on the connection; even without a cap, the crawl takes hours and loads far more data than it needs.
+- How to handle: use the vendor's multi-id/`IN` query where one exists — and handle ids it silently omits from the result rather than assuming every id comes back — or build the lookup map once per crawl, doing the full bulk load only on a first crawl and cached per-key lookups on incremental passes.
+
+## One product on two vendor order lines: merge the lines, don't drop either
+
+- Vendors regularly split one product across several order lines — two marketplace listings of the same item, a kit expanded into components, a partially picked line split in two — while canonical orders allow one line per `product_id`.
+- When it bites: the second line raises `Duplicate product_id` in order validation and wedges the whole crawl page, so every order on it stops syncing, not just the affected one. It usually shows up in prod long after tests pass, since sandbox orders rarely carry the split.
+- How to handle: build `line_items` as a dict keyed by product id in the format function and add to the existing line's quantity on a repeat, then `list(line_items.values())` at the end. Read the raw lines first to confirm they really are the same product rather than a mapping bug upstream.
+
+## An updated-since early break is unsafe when the list sorts by a parent but the canonical row is a child
+
+- A common crawl shape is "sort by `updatedAt` descending, stop paging once a row predates the window." That is only correct when the row being sorted is the row being stored. When one canonical record per **child** object is emitted (one product per variant, one item per line, one row per revision) while the endpoint pages and sorts by the **parent**, the parent's timestamp does not move when only a child changes.
+- When it bites: the crawl looks healthy and fast, and silently never picks up child-only edits again. It is invisible in testing because a first crawl reads everything, and because parent and child timestamps agree on freshly created records.
+- How to handle: before writing the early break, check whether a child edit moves the parent's sort key — pull a page, compare each child's `updatedAt` against its parent's, and count how many lead. Any meaningful number means the resource has to take a full snapshot each crawl. The rule to apply: a resource may only early-break on the paged row's timestamp when the canonical row is keyed on that same paged row.
+
+## Verify a vendor cursor against page-number paging before trusting it
+
+- Cursor pagination is normally the safer choice, but a cursor is only as good as the vendor's boundary handling. A cursor that names the first row of the next page but is applied *exclusively* drops exactly one record per page boundary.
+- When it bites: nothing errors and every page looks well-formed, so the loss scales quietly with collection size — a 20,000-row catalogue at 100 per page silently loses ~200 records per crawl. On a two-row collection it can return nothing at all.
+- How to handle: when an API offers both a cursor and page numbers, verify them against each other once during characterization — page 1, then fetch page 2 both ways and diff the ids. If they disagree, use page numbers and record why, so the next reader does not "improve" it back to the cursor.
+
+## An unrecognized filter field can return 200 and the whole table
+
+- Many REST frameworks drop query params they don't recognize instead of rejecting them, so a filter naming a field the vendor has never heard of returns HTTP 200 and the complete unfiltered set. There is no error, no warning, and no shape difference from a filter that worked.
+- When it bites: a misspelled or wishfully-invented field name reads as a working incremental sync. Every crawl silently pulls the full table, and a filter used to join two resources (receipts to their purchase order, shipments to their order) returns every row rather than the matching ones, so the join is built from the wrong set. Tests pass, because a wide test window expects a large result anyway.
+- How to handle: prove each filter moves `meta.total` (or the equivalent count) against the unfiltered call before trusting it, once per field name, not once per endpoint. A window that must return nothing (a far-future date range) is the sharpest version of that check. A filter that narrows on one endpoint can be ignored on the next, and support for the *operator* does not imply support for the *field*. Same for sort params: request a sort and verify the returned ordering rather than trusting the 200.
+
+## A list endpoint can strip nested fields the detail endpoint returns
+
+- List and detail often serve the same object through different serializers, and the list one drops expensive nested collections: a package's contents, a line's lots, a shipment's items. Both responses look complete, with the same object type and no marker saying anything was trimmed.
+- When it bites: the nested collection is characterized as "the vendor doesn't expose this" purely because only the list was sampled. Whatever depended on it gets mapped as unavailable, or filled in by copying a parent collection down, which invents an allocation the vendor never stated. Everything validates, so nothing surfaces it.
+- How to handle: before recording any nested field as unavailable, fetch one record from the detail endpoint and diff its keys against the list item, at every level of nesting rather than just the top. If the field only exists on detail, check whether a list parameter can include it, and prove that by the response contents rather than a 200. Otherwise the crawl pays one detail call per row, which is a real cost worth stating in the PR.
+
+## A read that consumes what it returns: check for an "already sent" flag before trusting a list endpoint
+
+- Some WMS and ERP APIs treat their outbound endpoints as a queue rather than a query. The call returns only the records that have not been collected yet and marks them collected as a side effect, so the first call looks perfect and every call after it returns zero rows. JDA / Blue Yonder does this with an `uploaded` flag on order and pre-advice extracts; the same shape shows up wherever a vendor thinks of the API as a delivery mechanism instead of a view.
+- When it bites: the integration passes every test on the first crawl, ships, and then silently syncs nothing forever. Nothing errors. The connection looks healthy and the customer's data just stops moving. It is also destructive to the customer's own consumers: whatever else is reading that queue now misses the rows we drained.
+- How to spot it: call the same list endpoint twice in a row during characterization and compare row counts. A second call returning zero when nothing changed is the tell. Look for a request parameter with "re-extract", "reprocess", "include sent" or "uploaded" in the name.
+- How to handle: set the re-extract parameter in the shared request helper as a default, not at each call site. A cluster writer adding a new read months later will not remember, and the failure is invisible. Also tell the vendor if characterization drained their test queue, since the state change is on their system.
+
+## Measure the uniqueness of a keyset pagination column before you page on it
+
+- Keyset walks work by asking for rows strictly after the last one seen (`whereClause=key > 'X'`). That is only correct if the column is unique. If two rows share a value and the page boundary falls between them, the second one is skipped permanently and silently, on every crawl, forever.
+- When it bites: never in a sandbox, because sandboxes are small enough to fit one page. It appears once a real customer's data grows past the page size, as inventory or orders that are simply missing with no error anywhere.
+- An id-looking name is not evidence. A "tag id" on a warehouse inventory row turned out to identify a physical tag, not a row, and repeated across locations: 287 rows carried only 254 distinct values, 26 of them duplicated. A separate `key` field was the actual unique row id.
+- How to handle: pull a full page during characterization and count distinct values against row count for the column you plan to page on. If nothing is unique, either drain the whole walk inside the get method and return `next_token: None`, or page on a composite key with a matching composite predicate. Record the measurement, not the assumption, in api-summary.
+## Fractional quantities against an Integer canonical schema
+
+- Canonical quantity fields are Integers, but some vendors report fractional quantities (unit-of-measure conversions, partial units, weight-picked goods), so every quantity read has to pick a conversion.
+- When it bites: rounding invents stock that doesn't exist (a 0.4 rounds to 0 on one field and a 0.6 to 1 on another), and mixing round and truncate across code paths breaks the cross-field math the validators check — sums stop reconciling while every individual value looks plausible.
+- How to handle: truncate toward zero (`math.floor` for the non-negative case) uniformly across every quantity in the integration — the fleet-majority convention — and never round. A line floored to zero is real signal (the vendor holds only a fraction of a unit), not a row to drop. Record the vendor's fractional semantics and the truncation choice in the integration's api-summary.
+
+## OAuth2 vendors report bad credentials in the body, so a status-code-only check misreports them
+
+- RFC 6749 §5.2 has the token endpoint return `invalid_client` / `invalid_grant` in a **400** body, not a 401. An auth helper that classifies bad credentials on `status_code == 401` alone raises a generic exception instead, so the connection never enters the invalid-credentials state and the customer is told "something went wrong" rather than "your credentials are wrong."
+- When it bites: hardest when the token exchange happens in `get_integration_secret` and `validate_integration_secret` is `pass` — that one branch is then the entire install-time credential check, and a customer with a bad secret gets an unactionable error at install.
+- How to handle: on any non-ok response from a token endpoint, read `error` out of the JSON body (guarded for non-JSON) and treat `invalid_client` / `invalid_grant` as invalid credentials alongside a 401. Everything else stays a generic exception so a vendor outage isn't reported as a credential problem.
+
+## A supplied credential of exactly one secret's length is usually only half the credential set
+
+- A password-grant vendor needs `client_id` + `client_secret` + `username` + `password` (often plus a tenant/account id). Handoffs routinely carry only the one long opaque string, which looks like a complete API key and authenticates nowhere.
+- When it bites: the whole build proceeds as if it were live-validatable, then every crawl, install, and write probe fails identically on auth, and the failures get mistaken for code defects.
+- How to handle: before scoping the build, run the token exchange once. `{"error": "invalid_client"}` with the string as `client_secret` confirms the set is incomplete rather than the string being wrong. Treat that as no-creds (spec-only build) from the start and make the missing fields the top vendor ask, instead of discovering it per-function later.
+
+## Hand-written vendor docs can describe a fraction of the API — look for a machine spec first
+
+- A PDF, a Word file, or a wiki page written for one customer documents the calls that customer asked about, not the surface. The same host often serves a complete machine-readable spec anonymously at a conventional path (`/openapi.json`, `/swagger.json`, `/v*/api-docs`) or advertises an interactive one (`/docs`, `/redoc`, `/swagger-ui`), because the framework mounts it by default and nobody turned it off.
+- When it bites: scope, exemplar choice and the public "this API doesn't support X" claim all get set from the partial document. Flows the vendor does expose get recorded as unavailable, and a field a canonical schema requires gets mapped as unsourceable when a second documented endpoint carries it.
+- How to handle: during characterization, request the conventional spec paths on the API host (not the docs site) before trusting a hand-written document, and diff the operation list against it. Build the flow-availability map from whichever source is broader, and say in the api-summary which one it came from — a "not available from this API" claim is only as good as the surface it was checked against.
+
+## A vendor's write field names can differ from its read field names by one letter
+
+- The same logical field is often spelled differently on the way in and on the way out (`estimated_delivery_date` on create, `estimated_deliver_date` on read; `item` on create, `po_items` on read). A writer building the request body from the read sample gets it wrong, and the api-summary's captured sample makes the wrong spelling look authoritative.
+- When it bites: when the vendor accepts unknown keys silently. A mismatch that 422s is cheap — you see it on the first write test. A mismatch the vendor swallows returns a success message, creates the record, and drops the value, so the write test passes and the field is quietly empty forever. The loud and silent versions of this bug can sit on two fields of the same request body.
+- How to handle: build write bodies from the vendor's own documented **request** example, never from a read response, and treat the two spellings as independent facts. After the first successful create of each resource, re-read the record and diff what you sent against what came back — a green create is not evidence the value landed. Where a read-back endpoint exists, one paired probe (correct key vs suspect key) settles it in a minute.
+
+## Spec-only write code hides bugs behind each other
+
+- When writes are built from the spec and validated later in one pass, the first required-field error masks every defect after it: the request never reaches the vendor's later validation, the created record never exists, so the update path, the immutable-field rules and the business-key length caps are all unreachable.
+- When it bites: a write surface looks like it has one bug. Fixing it exposes a second, fixing that exposes a third, and each round reads like a regression introduced by the last fix rather than something that was always there.
+- How to handle: budget the first live write validation as several rounds, not one, and check each new failure's provenance before assuming the previous fix caused it — the request/response log usually shows the newly-reached code path was never executed before. Expect the vendor's undocumented requirements (a field the docs mark optional, a length cap on the business key, a field required on update but not create) to surface in that order.
+
+## An empty vendor response can be an error body under HTTP 200
+
+- Some APIs answer an empty date window with `{"Error": "No data found"}` and a 200, and answer other empty windows with the same shape under a 4xx. A request helper that keys only off `response.ok` returns the error body to callers as data.
+- When it bites: twice. First the error body flows into a format function as if it were a record. Then, once the helper is fixed to raise on any body carrying an `Error` key, the two paths produce *different* exceptions — one carrying the vendor's real status and raw body, one carrying whatever status the helper re-stamps — so a `get_*` that catches on the status code works for some endpoints and fails for others. An incremental crawl hits a quiet window most days, so this fails constantly once it ships.
+- How to handle: make the helper raise on an `Error` body regardless of status, and have each `get_*` catch its own documented sentinel by matching the message text with `in` rather than on the status code or an equality check. Substring matching survives both paths, because the unwrapped message is a substring of the raw body.
+
+## A test fixture's literal business key collides with itself on the second run
+
+- The framework's default write bodies use literal values (`sku`, `"123"`), which is fine until the vendor enforces uniqueness on that key. The first run creates the record and passes; every run afterwards fails on a duplicate, including CI.
+- When it bites: the failure looks like a code regression rather than a fixture problem, and on a vendor with no delete endpoint the polluting record can never be cleaned up. Uniqueness often covers more than the obvious field — a vendor rejecting a duplicate `sku` may be checking `upc` too, so randomizing one of them isn't enough.
+- How to handle: override `full_<resource>` with a randomized business key for every write the vendor treats as an insert, randomize every field the uniqueness error names, and check for a length cap before picking the suffix (a uuid4 is 36 characters and vendors cap these keys well below that). Prefix them so a human can identify what testing created.
+
+## Link tests fail when two resources' test windows don't overlap
+
+- Link assertions join resources through a module-scoped `context` populated by each `test_get_*`. When one resource's test pins a date window (because the sandbox's data sits in the past) and another uses the framework default, the two crawl disjoint time ranges and the join finds nothing — `no order_ids from returns in orders` and the like.
+- When it bites: the failure reads as an ID-strategy problem, which tempts a writer into changing the canonical `id` or reaching for `ignore_link_tests`. Both are wrong: the ids are fine, the windows just never saw the same record.
+- How to handle: pin the windows together, around a record you have verified exists on both sides, rather than pinning one resource in isolation. On a vendor where a resource only enters the feed through a secondary endpoint (shipped orders arriving via the shipment feed), the window has to cover the date that secondary feed filters on, not the record's own date.

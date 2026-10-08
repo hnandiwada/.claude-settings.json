@@ -1,0 +1,555 @@
+# Phase 0 — Inventory: what is actually open
+
+Goal: a table of `package · from → to · PR · ecosystem · class (tbd)` for every Dependabot PR that still needs to go in. Read no package source and create no branch here.
+
+## List the PRs
+
+Dependabot PRs in pokedex are authored by `dependabot[bot]` and labelled `dependencies` plus `python:uv` (`pyproject.toml`) or `javascript` (`package.json`). List them with the GitHub MCP and keep the rows whose `user.login` is `dependabot[bot]`:
+
+```
+list_pull_requests(owner="trackstarhq", repo="pokedex", state="open", perPage=100,
+                   fields=["number","title","html_url","user","labels","head","created_at"])
+```
+
+Titles carry the versions as-is:
+
+| Ecosystem | Label | Title | Branch |
+|---|---|---|---|
+| uv | `python:uv` | `build(deps): bump {package} from {old} to {new}` | `dependabot/uv/{package}-{new}` |
+| npm | `javascript` | `build(deps): update {package} requirement from ^{old} to ^{new}` | `dependabot/npm_and_yarn/{package}-tw-{new}` |
+
+## Read the current versions from `origin/main`
+
+PR titles can be days old. The installed versions are the ones at a fresh `origin/main`:
+
+```bash
+git fetch origin main
+git show origin/main:pyproject.toml
+git show origin/main:package.json
+```
+
+## Build the table
+
+One row per package, newest target version only:
+
+```markdown
+| package | on main | target | PR | ecosystem | class | verdict |
+|---|---|---|---|---|---|---|
+| gunicorn | 26.1.0 | 26.2.0 | #5792 | uv | tbd | |
+| svix | 1.99.1 | 2.0.0 | #5790 | uv | tbd | major |
+```
+
+Once it has more than three rows, save it to `.claude/tmp/dependabot-{date}.md`, and fill in `class` and `verdict` as Phase 1 finishes each one.
+
+## Drop rows before vetting anything
+
+Run these four checks in order. A row that hits one leaves the table, and its reason goes in the PR body so the human knows why a PR they can see isn't on the host branch.
+
+1. **Already on `main`.** `pyproject.toml` at `origin/main` already has the target version: an earlier run shipped it and Dependabot hasn't noticed. List the PR under "already on main, close without merging". It is not a supersede; merging it changes nothing.
+2. **Superseded by a newer PR for the same package.** Dependabot opens a new PR per release and leaves the old ones open. Keep only the highest target version; the older PR numbers still go in the "supersedes" list.
+3. **Blocked by a pin comment.** Read the comment beside the dependency in `pyproject.toml`. Two set a hard bound:
+   - `celery==5.5.3`: a 5.6.x bump fails with `ImportError: The curl client requires the pycurl library`.
+   - `patchright==1.56.0`: needs `<1.57.0` for the local browser.
+
+   Drop a bump past a stated bound and quote the comment in the PR body. Don't bump it and test to see what happens.
+
+   Other comments say why a pin exists without capping it. They tell Phase 1 what to check; they are not a reason to drop the row: `certifi>=2026.7.22` is a floor naming the DM and FedEx certificate chains, `cryptography` names RS256 for JWT, and `pydantic` names the stagehand extract schemas.
+4. **Ignored by config.** `.github/dependabot.yml` ignores `boto3` patches, `python-amazon-sp-api` patches, `aws-cdk-lib` patches, all of `patchright`, and `apiflask` majors. A PR that contradicts this means the config changed; read the current file.
+
+## Flag before moving on
+
+- **Major version bumps.** Mark them. Each gets its own vetting pass in Phase 1. If its evidence is anything but clean, drop it from the host branch and say in the body it was left open for a separate look, so one unclear major doesn't hold up the clean minors.
+- **npm rows.** pokedex commits no npm lockfile, so `^6.3.0` already installs the newest 6.x today and the bump changes nothing that ships. Fold it in to tidy the version range, and say exactly that in the body; don't claim it was verified.
+
+## Output
+
+The filled table, plus one line per dropped row with the PR and the reason. Phase 1 works the surviving rows.
+
+One surviving PR becomes the **host** (its branch carries every bump, its body holds the evidence). Picking it needs each row's class, so it happens at the start of Phase 2. Every other surviving PR is superseded and named in the host's body.
+# Phase 1 — Vet: the per-package evidence loop
+
+Goal: one verdict per surviving row, each backed by a check a reviewer can re-run. Run the loop once per package. Commit nothing in this phase.
+
+## Step 1 — Find the real consumer
+
+Grep first, but don't stop at a miss:
+
+```bash
+git fetch origin main
+grep -rnE "^\s*(import|from) <module>" --include=*.py . | grep -vE "^\./(\.venv|node_modules)"
+```
+
+Keep `--include=*.py` and the `.venv` exclusion, or the installed libraries bury the repo's own call sites.
+
+**Zero hits does not mean unused.** Check these first:
+
+- **Import-time patching.** `ddtrace` instruments Flask, Celery, `requests` and `boto3` without pokedex importing it.
+- **Default resolution.** `certifi` is the CA bundle `requests` and `httpx` load, with no import anywhere.
+- **Shipped only as a dependency of a dependency.** `requests` reaches the image through `curlify` and `datadog`, not through `pyproject.toml`.
+- **Runtime and build wiring.** `awslambdaric` is the Lambda entry point in the image; `redis` backs `flask-limiter`'s storage through `LIMITER_URI`.
+
+[reference/package-playbooks.md](../reference/package-playbooks.md) names the consumer for every dependency that has one. If a package isn't there and the grep is empty, find where it is wired in before calling it a leaf.
+
+## Step 2 — Classify
+
+Give it exactly one class from the table in [SKILL.md](../SKILL.md); the stricter class wins a tie. The class decides the rest of the loop.
+
+## Step 3 — Diff the package source
+
+Required for every non-leaf bump.
+
+For a uv package, install both wheels:
+
+```bash
+rm -rf /tmp/dep-old /tmp/dep-new && mkdir -p /tmp/dep-old /tmp/dep-new
+uv pip install --target /tmp/dep-old --no-deps --quiet <package>==<old-version>
+uv pip install --target /tmp/dep-new --no-deps --quiet <package>==<new-version>
+diff -rq /tmp/dep-old /tmp/dep-new
+```
+
+`--no-deps` keeps the diff to the package's own change. `-rq` lists the files that differ; read the ones that matter in full with `diff -u`.
+
+For an npm package, fetch and unpack both tarballs, then compare the `package/` folders:
+
+```bash
+rm -rf /tmp/dep-old /tmp/dep-new && mkdir -p /tmp/dep-old /tmp/dep-new
+npm pack <package>@<old-version> --pack-destination /tmp/dep-old --silent
+npm pack <package>@<new-version> --pack-destination /tmp/dep-new --silent
+for side in old new; do tar -xzf /tmp/dep-$side/*.tgz -C /tmp/dep-$side; done
+diff -rq /tmp/dep-old/package /tmp/dep-new/package
+```
+
+Keep the `rm -rf` at the top of both blocks: the folders are reused per package, and `tar -xzf <dir>/*.tgz` fails if an earlier tarball is still there.
+
+Two results end the investigation:
+
+- **Only the version string changed.** The bump changes nothing that runs, and that is the whole finding. Say what you saw: "diffing the two wheels shows the entire change is the `__version__` string".
+- **Code changed, but nothing the call sites touch.** Compare the declared names in each changed module instead of eyeballing the diff:
+
+  ```bash
+  for side in old new; do
+    grep -hoE "^ *(class|def) [A-Za-z_]+|^ *[A-Za-z_]+ *[:=]" /tmp/dep-$side/<pkg>/<changed_module>.py \
+      | tr -d ' ' | sort -u > /tmp/names-$side
+  done
+  diff /tmp/names-old /tmp/names-new
+  ```
+
+  If names were only added, nothing the code calls was removed or renamed. Report which modules you compared and that nothing was removed, not "looks fine".
+
+**If the diff is too big to read** (a hundred files, a vendored binary, a regenerated client), narrow it to the modules the call sites import, and say in the body what you read and what you didn't. A changed binary that never runs is a valid "changed but unreachable" finding, but prove it by naming the code path that would have to run it.
+
+Read the release notes second, to decide what to look for in the diff. For each behavior change they claim, check whether its condition holds here (an env var set, a feature enabled, a code path taken). "The release changes X" is not a finding until you say whether X reaches this repo.
+
+## Step 4 — Gather the class's evidence
+
+### Silent-runtime
+
+The risk is a trace, metric, or span that quietly stops carrying what it did, so no test goes red.
+
+1. List what the package patches and check it against the libraries pokedex runs (Flask, Celery, `requests`, `boto3`, `psycopg`).
+2. **Run every private API the code reaches into under both versions** and assert directly that the behavior holds. Don't infer it from the diff.
+3. For each behavior change the release claims, check whether its condition is met here: is the env var set in `config.py` or the CDK templates, is the feature referenced in the codebase at all?
+
+### Trust-anchor
+
+For a CA bundle, list the subjects on both sides and diff them:
+
+```bash
+uv pip install --target /tmp/certifi-old --no-deps --quiet certifi==<old>
+uv pip install --target /tmp/certifi-new --no-deps --quiet certifi==<new>
+for d in old new; do
+  openssl crl2pkcs7 -nocrl -certfile /tmp/certifi-$d/certifi/cacert.pem \
+    | openssl pkcs7 -print_certs -noout \
+    | grep "^subject" | sed 's/.*CN *= *//' | sort -u > /tmp/roots-$d.txt
+done
+diff /tmp/roots-old.txt /tmp/roots-new.txt
+```
+
+Name the added and removed roots by subject and give the root count on each side. Then check every removal: for each vendor host the pin exists for, fetch its chain and confirm its root is still in the new bundle.
+
+```bash
+openssl s_client -connect <host>:443 -servername <host> -showcerts </dev/null 2>/dev/null \
+  | grep -E "^ *[0-9] s:|^ *[0-9] i:"
+```
+
+A removed root whose replacement from the same authority is still there is routine retirement. A removal that leaves a host's chain without its root is a blocker: drop the bump and name the host.
+
+For a crypto primitive: name the primitive the code uses, confirm it still exists with the same signature in the new version, and round-trip it (encrypt then decrypt, sign then verify) under both versions.
+
+### Contract
+
+For each call site from step 1, give the file and line, list the arguments it passes, and check each against the new version. Report per call site, not per package: "three call sites matter, and the params each passes were verified".
+
+If a test already guards the coupling, run it and name it. If none does, say it is unguarded; don't imply a test covers it.
+
+### Infrastructure
+
+Synthesize on both versions and diff every rendered template with sorted keys, so reordering doesn't look like drift:
+
+```bash
+# start from a clean tree on the old version; commit work in progress, never a bare `git stash` (the stash is shared across worktrees)
+yarn synth -s dev   # writes cdk.out/
+cp -r cdk.out /tmp/synth-old
+# apply the bump in pyproject.toml, uv lock, then:
+yarn synth -s dev
+cp -r cdk.out /tmp/synth-new
+for f in /tmp/synth-old/*.template.json; do
+  n=/tmp/synth-new/$(basename "$f")
+  diff <(uv run python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True,indent=2))" "$f") \
+       <(uv run python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True,indent=2))" "$n") \
+    && echo "same: $(basename "$f")"
+done
+```
+
+Report how many templates you compared and whether any logical ID changed or any resource would be replaced on deploy. Zero differences is the clean result.
+
+**Skip the synth only when the lockfile proves it moot**: `uv lock` moved no CDK package and nothing a CDK package depends on. Say so in the body as the reason; don't just leave the check out.
+
+### Leaf
+
+Import the package and exercise what the code calls:
+
+```bash
+uv run python3 -c "import <module>; print(<module>.__version__)"
+```
+
+For `faker`, that means every method the sandbox integrations call, not just the import; they are shipped integrations, not tests. Then run `yarn test nonints`.
+
+## Step 5 — Record the verdict
+
+Add one line to the inventory table, and write a short evidence paragraph for the PR body: finding first, then what makes it safe. Name the call site's file and line, what you checked, and what came back, so a reviewer can re-run it. A verdict with no repeatable check behind it is not evidence.
+
+> **ddtrace** is the one with teeth: `utils/logutil.py:118` walks the private `span._parent`, and crossing a minor is exactly how that breaks silently and fragments traces. Verified under 4.12.0 that `child._parent is parent` holds, still returns a `Span`, and still stops at the service boundary.
+
+If the evidence comes back bad, Phase 2 drops the package from the branch and the same paragraph says what broke.
+# Phase 2 — Combine and ship
+
+Goal: every bump that vetted clean folded onto **one existing Dependabot PR**, whose body holds the evidence. No new branch, no new PR.
+
+## Pick the host PR
+
+Choose from the surviving rows:
+
+1. **Highest blast-radius class wins**, in this order: silent-runtime, trust-anchor, contract, infrastructure, leaf. The riskiest package leads the title, and its evidence is what a reviewer reads first.
+2. **Ties go to the lowest PR number.**
+
+If the host's own bump is later dropped, pick the next row by the same rule and start again from its branch. Every other surviving row is **superseded**: named in the body, closed by a human after the host merges.
+
+If only one bump survives, that PR is the host, it gets the evidence body, and nothing is superseded.
+
+## Build on the host's branch
+
+Read the branch name from the host PR's `head.ref`; don't build it yourself. uv and npm Dependabot branches are named differently, so a built name can point at a branch that doesn't exist.
+
+```bash
+HOST_BRANCH=$(<read head.ref from the host PR>)
+git fetch origin main "$HOST_BRANCH"
+git checkout -B deps-host "origin/$HOST_BRANCH"
+git merge origin/main
+```
+
+The branch already has its own bump as a commit; the merge brings it up to date with `main`. **Never rebase, amend, or force-push it.** A force-push fights Dependabot for the branch and breaks anyone's checkout. Only add commits.
+
+Then, **one package at a time**, for every surviving bump except the host's own:
+
+1. Change the version in `pyproject.toml` (or the range in `package.json`). Leave the comment beside the pin exactly as it is.
+2. For a uv bump, run `uv lock`. An npm bump has no committed lockfile, so `package.json` is the whole change.
+3. Commit the pair: `build(deps): bump <package> from <old> to <new>`.
+
+One commit per package lets a bad bump be reverted without touching the rest.
+
+**Don't cherry-pick the other Dependabot commits, and don't hand-edit `uv.lock`.** Each Dependabot commit resolves the same `requires-dist` block its own way, so they conflict; running `uv lock` from `pyproject.toml` gives one consistent result.
+
+If any uv bump is in the set, read the final `uv.lock` diff before touching the PR. It should move the bumped packages and their dependencies and nothing else. A package that moved without a bump naming it is a finding for the body.
+
+## Verify
+
+```bash
+yarn test nonints
+```
+
+This is the floor for the whole branch, not the evidence for any one bump. Give the pass count and name anything red.
+
+- A failure that happens the same way on `origin/main` is environmental: name the test, say it fails the same on main, and move on.
+- A failure that is green on main and red here belongs to a bump: find which one, drop it, and say so.
+
+If any bump is Infrastructure-class, run the Phase 1 synth diff against this branch's regenerated lockfile, not a per-package trial.
+
+## Push to the host branch
+
+```bash
+git push origin "HEAD:$HOST_BRANCH"
+```
+
+No `-u`, no `--force`. Retry a network failure up to four times with exponential backoff (2s, 4s, 8s, 16s).
+
+After anyone but Dependabot pushes to its branch, Dependabot stops rebasing it and resolving its conflicts. From here the branch is yours: if it later conflicts with `main`, merge `main` in again.
+
+**If the push is rejected** (branch protection, or no write access to `dependabot/*`), don't force it. Instead: make a fresh branch from `origin/main` with the same commits, open a new PR with the same body, and list every Dependabot PR as superseded, including the would-be host. Say in the body that the push to the Dependabot branch was rejected, so the bumps went to a new branch.
+
+## Update the host PR
+
+Leave it open and non-draft: the combined PR should get an automated pass and a human review.
+
+- **Retitle** it to name every folded package: `build(deps): bump <a>, <b>, <c>`, host first, then the rest in inventory order.
+- **Replace the body completely.** Dependabot's body is a changelog for one package and no longer describes the diff.
+
+Start the new body from `.github/pull_request_template.md`. **Copy the ship-on-merge block between the `<!-- ship-on-merge -->` markers verbatim and leave every box unticked** (`.claude/rules/pull-requests.md`). Replace the template's override line with this exact line (a dependency bump is a non-integration PR):
+
+    test override: `yarn test nonints`
+
+### Body
+
+Keep it within the PR ceiling in `.claude/rules/communications.md`. Only the per-package evidence runs longer, because the reviewer can't rebuild it. In order:
+
+1. **Lead line:** the open Dependabot bumps are folded into this PR so `uv.lock` resolves once and a human approves once. Add one sentence: every uv bump edits the same `requires-dist` block, so versions were set in `pyproject.toml` and the lockfile regenerated with `uv lock`, not resolved by hand.
+2. **The template checklist**, ticked honestly. If no tests were added, say so: "No new tests; existing guards cover the risky bumps."
+3. **What changed:** one line per package, `name old -> new`.
+4. **Supersedes:** `Supersedes #A, #B and #C, which can be closed once this merges.` Then one line each for any PR already on `main` (close without merging) and any bump dropped from the queue, with its reason (blocked by a pin, major left for its own pass, bad evidence).
+5. **Per-package evidence:** one short bolded paragraph per non-leaf package, riskiest first, from [vet.md](vet.md) step 5. Each names the call site by file and line, what was checked, and what came back. A leaf package gets one sentence.
+6. **Verification:** one line with the `yarn test nonints` pass count, any named guard tests that ran, and any check skipped with the reason it was moot.
+7. **The test override line and the ship block.**
+
+## Stop here
+
+The end state is the host PR updated and ready for a human. Don't merge it, don't approve it, and don't close the superseded PRs; naming them in the body is the handoff.
+
+Report back in a few lines: the host PR link, the packages folded in, the superseded PR numbers, and each dropped bump with its reason.
+# Package playbooks
+
+One section per dependency in `pyproject.toml` and `package.json` with real blast radius: who uses it, what a bump can break, and what proves it didn't. Everything else is under [Leaves](#leaves).
+
+Line numbers move. Re-read each file at a fresh `origin/main` before quoting a line in the PR body.
+
+---
+
+## Silent-runtime
+
+### ddtrace
+
+**Used by** `utils/logutil.py` (`from ddtrace.trace import tracer as raw_tracer`), and by every Flask request, Celery task, `requests` call and `boto3` call through import-time patching with no import in the repo.
+
+**Can break.** `SafeTracer.local_span_chain` walks `cur._parent`, a private attribute, to tag every span up to the service boundary. If `_parent` starts returning `None`, tags go on `current_span()` only and traces quietly split across `before_request` and `api.*` spans. Nothing raises. A comment at the walk says to re-check it on a bump.
+
+**Prove it.** Install both versions and assert the three things the walk depends on: `child._parent is parent`, it returns a `Span` rather than a context object, and the walk stops when `parent.service != cur.service`. Then run the guards in `test/utils/logutil_test.py` (`test_span_parent_returns_the_parent_span`, `test_local_span_chain_returns_current_then_same_service_parents`, `test_local_span_chain_stops_at_a_different_service`).
+
+Check release claims against this repo instead of repeating them:
+
+- LLM Observability changes need LLMObs enabled. Look for `DD_LLMOBS_*` in `config.py` and the CDK templates, and for any reference in the codebase.
+- Client-IP or request-tag changes affect span tags, not rate limiting: the limiter key comes from Flask's `remote_addr` via `get_remote_address()` at `api.py:379`, passed to `Limiter(key_func=get_rate_limit_key, ...)` at `api.py:400`.
+
+### datadog
+
+**Used by** `utils/ecs_protection.py` (`from datadog.dogstatsd.base import statsd` at line 10, `statsd.increment` at line 104).
+
+**Can break.** That metric is the error signal for ECS scale-in protection. If the statsd client quietly resolves to a different host or port, the metric goes nowhere and the protection can no longer be watched. No exception is raised.
+
+**Prove it.** Diff `DogStatsd.__init__` between the versions and follow how host and port resolve when no env var is set. Instantiate both and confirm they send to the same place, and that `increment` keeps its signature. Then check whether any env var the new version reads (`DD_DOGSTATSD_URL`, `DD_DOGSTATSD_HOST`, and similar) is set in `config.py` or the CDK templates. `DD_DOGSTATSD_NON_LOCAL_TRAFFIC` in `templates/cluster_services.py` configures the sidecar agent, not this client.
+
+Run `test/celery/ecs_protection_test.py`.
+
+### datadog-lambda
+
+**Used by** the Lambda runtime setup, not by any import: `templates/lambda_services.py:125` sets the container entrypoint to `python -m awslambdaric` with cmd `datadog_lambda.handler.handler`, and `DD_LAMBDA_HANDLER` names the real handler underneath.
+
+**Can break.** If `datadog_lambda.handler.handler` is renamed or moved, every Lambda fails to start at deploy, not at merge. If the wrapper changes what it does to the event or context, handlers get a different payload and nothing local catches it.
+
+**Prove it.** Confirm `datadog_lambda/handler.py` still exports `handler` in the new version, and diff the wrapper for changes to how it passes the event and context through. Run `yarn test lambda`.
+
+---
+
+## Trust-anchor
+
+### certifi
+
+**Used by** nothing directly. It is the default CA bundle `requests` and `httpx` load, and `requests` reaches the image through `curlify` and `datadog`. The pin comment in `pyproject.toml` says it exists for the DM and FedEx certificates.
+
+**Can break.** A retired CA root breaks every TLS handshake to a vendor whose chain ends there. It fails at crawl time against one vendor, not in CI.
+
+**Prove it.** Run the CA bundle diff in the Trust-anchor section of [workflows/vet.md](../workflows/vet.md): roots by subject, count on each side, and each removal judged as routine retirement (the same authority's newer roots are still there) or a distrust that leaves someone stranded. The hosts the pin exists for, whose live chains must end at a root still in the new bundle:
+
+```bash
+openssl s_client -connect api.distributionmgmt.com:443 -servername api.distributionmgmt.com -showcerts </dev/null 2>/dev/null | grep -E "^ *[0-9] [si]:"
+openssl s_client -connect api.fedex.com:443 -servername api.fedex.com -showcerts </dev/null 2>/dev/null | grep -E "^ *[0-9] [si]:"
+```
+
+Report the count even when a bump only adds roots. Never wave a removal through on the count alone.
+
+### pycryptodome
+
+**Used by** `utils/boto.py` (`from Crypto.Cipher import AES` at line 69, `decrypt_and_verify` at line 3020).
+
+**Can break.** That code decrypts stored connection credentials. A changed AES mode default, tag length, or nonce handling makes existing secrets undecryptable. It shows up as every connection failing auth, not as an import error.
+
+**Prove it.** Confirm the cipher construction the code uses keeps its signature. Then encrypt under the old version and decrypt under the new one with the same key and nonce: a ciphertext written by the old version must still open under the new one. Run `test/utils/boto_test.py`.
+
+### cryptography
+
+**Used by** `integrations/erp/netsuite/integration.py` (certificate generation, around the `public_bytes(serialization.Encoding.PEM)` call), and indirectly by `paramiko` for SSH and `pyjwt` for RS256.
+
+**Can break.** A removed or deprecated primitive breaks NetSuite's certificate flow, SFTP key exchange, or RS256 verification. Majors remove primitives on a deprecation schedule.
+
+**Prove it.** Check the release for removals, not additions, and match each against the primitives above. Confirm the NetSuite serialization call still exists with the same signature, and that `pyjwt` and `paramiko` in the lockfile still declare a compatible range.
+
+---
+
+## Contract
+
+### svix
+
+**Used by** `utils/svix_util.py`, which imports `ApplicationIn`, `AppPortalAccessIn`, `EventTypeImportOpenApiIn`, `MessageCreateOptions`, `MessageIn` and `Svix` from `svix.api`, plus `HttpError` and `HTTPValidationError` from `svix.exceptions`. Called from `api.py:700` (`create_application`) and `scripts/rollout.py:381` (`import_openapi`). This is the outbound delivery client; signature checks happen on the customer's side, not here.
+
+**Can break.** `message.create` reads `options.with_content`, so `MessageCreateOptions` must keep that attribute or webhook payloads go out without their bodies. A renamed or removed model class breaks delivery for every customer at once.
+
+**Prove it.** Diff the two wheels. If the only change is the `__version__` string, that is the finding and you're done. Otherwise confirm each imported name above still exists with the same shape, and run the guard `test_send_message_passes_options_supported_by_installed_svix_sdk` in `test/lambda/webhook_test.py`, plus `test/lambda/submitter_test.py`.
+
+A major bump gets its own pass: check the migration notes for renames across the whole imported set before deciding whether it joins the host PR.
+
+### apiflask and apispec-oneofschema
+
+**Used by** `api.py` and `utils/schema.py` (apiflask), and `api.py`, `utils/api.py` and `utils/integrations.py` (apispec-oneofschema).
+
+**Can break.** These generate the public OpenAPI spec and validate incoming request bodies. A change here alters the customer-facing API contract and the spec published to the docs site and to Svix event types, without any local call changing.
+
+**Prove it.** Run the openapi test (`yarn test --openapi`) and diff the generated spec against the one on `origin/main`. Any spec change is a customer-facing change and goes in the body, intended or not. `.github/dependabot.yml` ignores apiflask majors because 3.x breaks spec generation (TRA-1989), so a major should not appear here at all.
+
+### stagehand, browserbase and patchright
+
+**Used by** `transports/browser/backend.py` (`from stagehand import Stagehand, browserbase`) and `transports/browser/page.py`. `Stagehand` is only built in `BrowserbaseBackend`; `LocalBackend` sets `supports_stagehand = False`, so every stagehand call goes through the hosted API.
+
+**Can break.** The parameter shapes each call site passes. Three matter:
+
+- `act`: `page.py:306` and `page.py:340`, reaching `backend.py:513`, passing `input` plus `options` keys.
+- `stagehand_navigate`: `page.py:111`, reaching `backend.py:521`, passing `url`, `wait_until` and `timeout`.
+- `extract`: `page.py:70`, reaching `backend.py:516`, passing `instruction` and `schema` (a pydantic model, which is why `pydantic` is pinned).
+
+**Prove it.** Diff the changed param modules and compare declared names on both sides: none of the keys the call sites pass was removed or renamed. Report per call site with file and line. A changed bundled binary is a non-finding once you name why it can't be reached (`supports_stagehand` is false on the local backend, and every call goes to the hosted API). `patchright` is pinned `<1.57.0` for the local browser, so its bumps are dropped, not vetted.
+
+Run `test/transports/browser_test.py`.
+
+### boto3
+
+**Used by** `utils/boto.py` and a few integrations. Dependabot ignores its patch releases, so only minors and majors arrive.
+
+**Can break.** DynamoDB, S3 and Secrets Manager calls, and how boto serializes DynamoDB types. A changed default (retry mode, checksums, endpoint resolution) changes what reaches AWS with no local signature change.
+
+**Prove it.** Read the changelog for changed defaults, not new services, and check each against the calls in `utils/boto.py`. Run `yarn test utils` and `yarn test lambda`.
+
+### paramiko
+
+**Used by** `transports/sftp_client.py` and `test/integrations/base_test.py`.
+
+**Can break.** Host-key and key-exchange algorithm negotiation. Dropping an old algorithm breaks connections to older vendor SFTP servers at crawl time, and nothing in CI talks to those servers.
+
+**Prove it.** Read the release for algorithms disabled or removed by default, not features added. If any were dropped, name the SFTP-based integrations and say the risk is not checked in CI; don't imply it was covered.
+
+### serverless-wsgi
+
+**Used by** `lambda_handlers/api.py`.
+
+**Can break.** It turns the Lambda event into a WSGI request. A change to header casing, body decoding or binary handling changes every API response in Lambda. Local `yarn serve` runs gunicorn instead, so it never shows up locally.
+
+**Prove it.** Diff how the event becomes a WSGI request: headers, query string and body. Run `yarn test api` and `yarn test lambda`.
+
+### psycopg, psycopg-pool and psycopg-binary
+
+**Used by** `utils/sql.py`.
+
+**Can break.** Connection pooling and type adaptation. The pyproject comment notes the psycopg packages often differ between linux and mac, so a bump that works locally can still behave differently in the image.
+
+**Prove it.** Keep the three versions in step. Run `yarn test nonints`, and read the pool's changelog for changed timeout and reconnect defaults.
+
+### urllib3
+
+**Used by** `utils/utils.py` (`from urllib3.util.retry import Retry`) and, underneath, every `requests` call in the repo.
+
+**Can break.** Retry behavior and TLS defaults. If a `Retry` field changes meaning, vendor throttling is handled differently with no error.
+
+**Prove it.** Confirm the `Retry` fields the code sets keep their meaning, and check the release for a change to the minimum TLS version.
+
+### pyjwt
+
+**Used by** `utils/boto.py` (`jwt.encode`/`jwt.decode` for org secrets, and RS256 verification of the Clerk header), `lambda_handlers/billing_export.py`, and the NetSuite and ShipBob integrations.
+
+**Can break.** Verification defaults. If a version starts requiring an explicit audience or rejects an algorithm, valid tokens fail to decode and it looks like an auth outage.
+
+**Prove it.** Round-trip both the HS256 and RS256 paths under the new version, and run `yarn test api`.
+
+### celery
+
+**Used by** `celery_tasks/` and `scripts/crawl.py`. Pinned `5.5.3` with a comment: 5.6.3 fails with `ImportError: The curl client requires the pycurl library`.
+
+**Prove it.** Drop a 5.6.x bump and quote the comment. For any other bump, run `yarn test celery`.
+
+### redis and flask-limiter
+
+**Used by** `api.py:400`, where `Limiter` takes `storage_uri=LIMITER_URI` (`config.py:457`, `REDIS_URI` outside local). `redis` has no direct import.
+
+**Can break.** Rate limiting fails open or closed. If a storage-client change breaks the fixed-window strategy, limiting either stops or starts rejecting valid traffic.
+
+**Prove it.** Confirm `api.py`'s `Limiter` kwargs are still accepted, run the limiter against a local `redis-server`, and run `yarn test api`.
+
+### flask-cors
+
+**Used by** `api.py`, `utils/middleware.py` and `utils/api.py`.
+
+**Can break.** Which origins get a response. A changed default for credentials or origin matching changes security behavior with no local call site change.
+
+**Prove it.** Read the release for changed defaults in origin matching and credential handling, and check each against how the middleware is configured. Run `yarn test api`.
+
+### pycountry
+
+**Used by** `utils/utils.py` (`from pycountry import countries, subdivisions`).
+
+**Can break.** It ships data, not just code. A renamed country or subdivision changes normalized values in customer-visible fields, and the lookup is already sensitive to whitespace.
+
+**Prove it.** Diff the country and subdivision tables for renames and removals, not just additions, and name any code whose normalized value changed.
+
+---
+
+## Infrastructure
+
+### aws-cdk-lib
+
+**Used by** every module in `templates/`. Dependabot ignores its patch releases.
+
+**Can break.** Template drift: changed logical IDs or a resource marked for replacement. Both show up at deploy, not at merge.
+
+**Prove it.** Run the synth diff in the Infrastructure section of [workflows/vet.md](../workflows/vet.md), including its rule for when the synth may be skipped. Also watch the lockfile for packages that drop out of the aws-cdk entries; before calling that harmless, confirm each one still arrives through another package.
+
+### datadog-cdk-constructs-v2
+
+**Used by** `templates/cluster.py` (`from datadog_cdk_constructs_v2 import DatadogLambda`).
+
+**Can break.** The construct decides how Datadog attaches to every Lambda: layer versions, env vars, and the handler wrapper. A major bump can change its props or defaults, which changes the synthesized templates for all of them.
+
+**Prove it.** The same synth-and-diff as `aws-cdk-lib`, plus a read of the construct's props against how `templates/cluster.py` builds it. Confirm the layer version it pins still exists.
+
+### awslambdaric
+
+**Used by** the image: `templates/lambda_services.py:125` sets the entrypoint to `python -m awslambdaric`.
+
+**Can break.** Container startup for every Lambda, at deploy.
+
+**Prove it.** Confirm the new version still runs as `python -m awslambdaric`, and read the release for changes to the runtime API contract.
+
+---
+
+## Leaves
+
+Test, tooling, or local-only code. Evidence is an import check plus `yarn test nonints`.
+
+| Package | Why it is a leaf |
+|---|---|
+| `faker` | Shipped, but only in the sandbox integrations (`integrations/{wms,cart,carrier}/sandbox/integration.py`). **Check every method those three call**, not just the import: they are integrations, not tests |
+| `gunicorn` | Local `yarn serve` only (`scripts/serve.py`). The API runs on Lambda through `lambda_handlers/api.py` and serverless-wsgi; ECS runs celery workers |
+| `curlify` | Local request logging in `utils/utils.py` |
+| `dictdiffer` | Change detection for webhook payloads in `utils/svix_util.py`. Confirm `diff` keeps its output tuple shape |
+| `orjson` | `utils/boto.py` serialization; round-trip it |
+| `markdown-it-py` | Renders docs strings in `api.py` |
+| `openpyxl`, `xmltodict` | Parsing inside individual integrations; a break shows up in that integration's own test |
+| `pytz` | Timezone data, used mostly by tests |
+| `datadog-api-client` | `utils/datadog.py`, read-only queries |
+| `flask-migrate` | Migration CLI, not a request path |
+| `openapi-spec-validator`, `pytest-mock`, `pytest-order`, `pytest-timeout`, `pytest-xdist`, `ruff` | Dev group. A `pytest-xdist` bump changes how the suite runs in parallel, so run `yarn test nonints` and confirm the worker split still behaves |
+| `openapi-to-postmanv2` (npm) | Backs the `/postman.json` endpoint. With no npm lockfile, the bump changes nothing that ships; see "npm rows" in [workflows/inventory.md](../workflows/inventory.md) |

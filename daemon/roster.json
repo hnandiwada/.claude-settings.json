@@ -1,0 +1,64 @@
+{
+  "proto": 1,
+  "supervisorPid": 51910,
+  "updatedAt": 1791436213213,
+  "workers": {
+    "473ba94a": {
+      "pid": 59909,
+      "procStart": "Tue Aug 11 20:28:46 2026",
+      "sessionId": "473ba94a-3701-4fdf-bf43-88463d8a7257",
+      "rendezvousSock": "/tmp/cc-daemon-501/d553f273/rv/473ba94a.sock",
+      "ptySock": "/tmp/cc-daemon-501/d553f273/spare/a247f1d8.pty.sock",
+      "cliVersion": "2.1.228",
+      "startedAt": 1786502949473,
+      "attempt": 1,
+      "cwd": "/Users/harshanandiwada/workspace/pokedex",
+      "dispatch": {
+        "proto": 1,
+        "short": "473ba94a",
+        "nonce": "15678974",
+        "sessionId": "473ba94a-3701-4fdf-bf43-88463d8a7257",
+        "createdAt": 1786502949466,
+        "source": "fleet",
+        "cwd": "/Users/harshanandiwada/workspace/pokedex",
+        "launch": {
+          "mode": "prompt",
+          "args": [
+            "--session-id",
+            "473ba94a-3701-4fdf-bf43-88463d8a7257",
+            "--agent",
+            "claude",
+            "--",
+            "follow up to the last commit (deposco persist new product stuff in additional fields) - in get_inventory, we'd like to stop calling get_product_and_kit_maps (and remove the is_internal thing) and instead call dynamo (Product(self).get_all_resources()) to get the same data, now that it's in additional fields. let's properly use the dynamo-formatted stuff in the get_inventory call"
+          ],
+          "restoresTranscript": false
+        },
+        "env": {},
+        "isolation": "none",
+        "respawnFlags": [
+          "--agent",
+          "claude"
+        ],
+        "agent": "claude",
+        "seed": {
+          "intent": "follow up to the last commit (deposco persist new product stuff in additional fields) - in get_inventory, we'd like to stop calling get_product_and_kit_maps (and remove the is_internal thing) and instead call dynamo (Product(self).get_all_resources()) to get the same data, now that it's in additional fields. let's properly use the dynamo-formatted stuff in the get_inventory call"
+        },
+        "cols": 141,
+        "rows": 35
+      },
+      "decModes": [
+        1000,
+        1002,
+        1003,
+        1006,
+        2004,
+        1004,
+        2031
+      ],
+      "rvAuth": "41fc779d8393234d513caaf8afd9ca90",
+      "ptyAuth": "3a221f0705541d9f9fa49bcd4e4cdc44",
+      "replPid": 59915,
+      "replProcStart": "Tue Aug 11 20:28:47 2026"
+    }
+  }
+}

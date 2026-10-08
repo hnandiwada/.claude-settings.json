@@ -1,0 +1,49 @@
+Child getters that make no vendor call now return `api_call_made: False`, and the live integration tests check the flag on child responses too. Fixes [TRA-2409](https://linear.app/trackstar-hq/issue/TRA-2409/no-op-child-crawls-delete-the-invalid-credentials-connection-error).
+
+The crawler reads a child response with no `api_call_made` key as a successful vendor call, and a successful call clears the connection's invalid-credentials error. The shared `get_inbound_shipment_suppliers` and `get_order_channels` only regroup records the parent already fetched. So on a dead connection (three Luminous Flexport connections), every inbound crawl deleted the "reconnect" error within the hour. The tests missed it because they only checked the parent response.
+
+- `test/integrations/base_test.py`: counts the requests each child getter makes and runs the same `api_call_made` check on the child's response. The parent check no longer counts requests the children made.
+- `WMSIntegration` defaults, plus the not-first-loop and hardcoded exits in 16 integrations, return `api_call_made: False`. Picqer's fallback drops it, because its refused suppliers call did reach Picqer.
+- The child response schema accepts `api_call_made`.
+
+Verified: before the fix, the new check failed Flexport inbounds and Deposco orders. After it, the `--gets` tests pass for flexport, deposco, ongoing and shiphero inbounds, and for picqer, gobolt, star and infoplus orders; `yarn test celery` passes (101).
+
+test override: `yarn test`
+
+<!-- ship-on-merge -->
+### Ship on merge
+
+Nothing ships unless a stage and at least one service are ticked. Ticking both stages ships to each of them.
+
+Stage:
+- [ ] dev
+- [ ] prod
+
+Services (`all` cannot be combined with individual services):
+- [ ] all
+- [ ] api
+- [ ] scheduler
+- [ ] submitter
+- [ ] crawler
+
+<details>
+<summary>other services</summary>
+
+- [ ] webhook
+- [ ] linked-refresh
+- [ ] stale-schedule-marker
+- [ ] free-trial-expiry
+- [ ] billing-export
+- [ ] permission-validator
+- [ ] sync-job-scheduler
+- [ ] event-intake
+- [ ] lambda-crawler
+- [ ] proxy <!-- prod-only -->
+- [ ] crawler-protected
+
+</details>
+<!-- /ship-on-merge -->
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_01EhN7UNmwMS3Lm6sRPM3VwS

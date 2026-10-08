@@ -1,0 +1,77 @@
+(Pdb) pprint(receipt_line_items)
+[
+  {
+    "inventory_item_id": "600021",
+    "sku": "600021",
+    "quantity": 1439,
+    "lot_id": null,
+    "expiration_date": null
+  },
+  {
+    "inventory_item_id": "600028",
+    "sku": "600028",
+    "quantity": 1920,
+    "lot_id": "26A018",
+    "expiration_date": "2028-08-30T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600018",
+    "sku": "600018",
+    "quantity": 1920,
+    "lot_id": "26B020",
+    "expiration_date": "2028-09-30T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600008",
+    "sku": "600008",
+    "quantity": 1152,
+    "lot_id": "26A017",
+    "expiration_date": "2028-08-30T00:00:00Z"
+  }
+]
+pprint(previous_receipts)
+new_received_by_key
+new_received_by_inv_id
+raise_li_exceptions
+(Pdb) pprint(previous_receipts)
+[
+  {
+    "id": "20-1777458494-1",
+    "arrived_date": "2026-05-14T23:06:32Z",
+    "line_items": [
+      {
+        "sku": "26A018",
+        "inventory_item_id": "26A018",
+        "quantity": 1920,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26B020",
+        "inventory_item_id": "26B020",
+        "quantity": 1920,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26A017",
+        "inventory_item_id": "26A017",
+        "quantity": 1152,
+        "lot_id": null,
+        "expiration_date": null
+      }
+    ]
+  }
+]
+new_received_by_key
+new_received_by_inv_id
+raise_li_exceptions
+(Pdb) new_received_by_key
+defaultdict(<class 'int'>, {('600021', None, None): 1439, ('600028', '26A018', '2028-08-30T00:00:00Z'): 1920, ('600018', '26B020', '2028-09-30T00:00:00Z'): 1920, ('600008', '26A017', '2028-08-30T00:00:00Z'): 1152})
+new_received_by_inv_id
+raise_li_exceptions
+(Pdb) new_received_by_inv_id
+defaultdict(<class 'int'>, {'600021': 1439, '600028': 1920, '600018': 1920, '600008': 1152})
+raise_li_exceptions
+(Pdb) raise_li_exceptions
+[]

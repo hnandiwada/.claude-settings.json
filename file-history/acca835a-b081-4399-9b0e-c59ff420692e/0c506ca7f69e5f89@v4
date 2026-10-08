@@ -1,0 +1,3282 @@
+from collections import OrderedDict
+from copy import deepcopy
+from datetime import timedelta
+from unittest.mock import call
+
+import pytest
+from celery.app.task import Context
+
+import integrations.wms.fba.integration
+import integrations.wms.ongoing.integration
+from celery_tasks import crawler
+from config import (
+    HEARTBEAT_TIMEOUT,
+    SUBMIT_DRAIN_POLL,
+    SUBMIT_DRAIN_TIMEOUT,
+)
+from resources import (
+    Bill,
+    ConnectionsError,
+    InventoryItem,
+    OrderChannel,
+    Warehouse,
+    WarehouseCustomer,
+    WarehouseLocation,
+)
+from utils.boto import get_org_private_key, org_encrypt
+from utils.celery import NotificationService, handle_perm_cred_err
+from utils.exceptions import (
+    DependencyFirstCrawlIncompleteException,
+    InvalidCredentialsException,
+    PermissionsException,
+    PokedexException,
+    RetryException,
+    ThrottleException,
+)
+from utils.schema import IntegrationNotImplemented
+from utils.utils import (
+    EPOCH,
+    dt_to_str,
+    filter_out_not_updated_connection_errors,
+    now,
+    str_to_dt,
+)
+
+
+@pytest.fixture(autouse=True)
+def mock_record_event(mocker):
+    # keep event logging out of these unit tests (no real event-log writes)
+    return mocker.patch("integrations.BaseIntegration.BaseIntegration.record_event")
+
+
+@pytest.fixture
+def integration(mocker, org_id):
+    integration = integrations.wms.ongoing.integration.Integration(
+        connection_id="test-connection-id",
+        org_id=org_id,
+        integration_secret="test-secret",
+    )
+    wh_mock = mocker.patch.object(integration, "get_warehouses")
+    wh_mock.__name__ = "get_warehouses"
+    return integration
+
+
+@pytest.fixture
+def resource(integration):
+    return Warehouse(integration)
+
+
+@pytest.fixture
+def store_crawl_params_integration(mocker, org_id):
+    integration = integrations.wms.fba.integration.Integration(
+        connection_id="test-connection-id",
+        org_id=org_id,
+        integration_secret="test-secret",
+    )
+    return integration
+
+
+@pytest.fixture
+def store_crawl_params_resource(store_crawl_params_integration):
+    return Bill(store_crawl_params_integration)
+
+
+@pytest.fixture(autouse=True)
+def thread_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.threading")
+    return mock
+
+
+@pytest.fixture
+def connection_row(org_id, integration):
+    raw_integration_secret = integration.integration_secret
+    org_pk = get_org_private_key(org_id)
+    encrypted_integration_secret = org_encrypt(raw_integration_secret, org_pk)
+    created_at = dt_to_str(now())
+
+    connection_row = {
+        "id": "test-connection-id",
+        "integration_secret": encrypted_integration_secret,
+        "integration_name": "ongoing",
+        "org_id": org_id,
+        "created_at": created_at,
+        "crawl_frequencies": {},
+        "additional_fields": {},
+        "historical_sync_completed": {},
+        "integration_type": "wms",
+        "customer_id": "test-customer-id",
+    }
+    return connection_row
+
+
+@pytest.fixture
+def store_crawl_params_connection_row(org_id, integration):
+    raw_integration_secret = integration.integration_secret
+    org_pk = get_org_private_key(org_id)
+    encrypted_integration_secret = org_encrypt(raw_integration_secret, org_pk)
+    created_at = dt_to_str(now())
+
+    connection_row = {
+        "id": "test-connection-id",
+        "integration_secret": encrypted_integration_secret,
+        "integration_name": "fba",
+        "org_id": org_id,
+        "created_at": created_at,
+        "crawl_frequencies": {},
+        "historical_sync_completed": {},
+        "additional_fields": {},
+        "integration_type": "wms",
+        "customer_id": "test-customer-id",
+    }
+    return connection_row
+
+
+@pytest.fixture(autouse=True)
+def org_row(org_id):
+    return {
+        "id": org_id,
+        "crawl_frequencies": {
+            "get_orders": 60 * 10,
+            "get_warehouses": 60 * 60 * 24,
+        },
+        "name": "test-org",
+        "first_crawl_lookback_settings": {
+            "wms": 30,
+            "freight": 30,
+            "cart": 30,
+            "carrier": 30,
+            "erp": 30,
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def now_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.now")
+    mock.return_value = str_to_dt("2020-01-01T00:00:00Z")
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def crawl_started_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.crawl_started")
+    mock.return_value = True
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def crawl_due_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.crawl_due")
+    mock.return_value = True
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def crawl_heartbeat_active_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.crawl_heartbeat_active")
+    mock.return_value = False
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def update_crawl_items_mock(mocker):
+    # dynamo returns the whole row on ALL_NEW, so carry earlier writes forward: the
+    # latest_data a page arms has to still be there when a later call reads it back
+    row = {"submit": {"tasks_started": {""}, "tasks_finished": {""}}}
+
+    def side_effect(
+        conn_id,
+        function_name,
+        update_dict,
+        force_replace_submit=False,
+        condition_expression=None,
+        submit_delete=None,
+        submit_remove=None,
+    ):
+        if "submit" not in update_dict:
+            update_dict["submit"] = {"tasks_started": {""}, "tasks_finished": {""}}
+        for key, value in update_dict.items():
+            if key != "submit":
+                row[key] = deepcopy(value)
+                continue
+            if force_replace_submit:
+                row["submit"] = deepcopy(value)
+                continue
+            for submit_key, submit_value in value.items():
+                if isinstance(submit_value, set):
+                    # dynamo ADDs to the task sets rather than replacing them
+                    existing = row["submit"].get(submit_key, set())
+                    row["submit"][submit_key] = existing | submit_value
+                else:
+                    row["submit"][submit_key] = submit_value
+        for submit_key, values in (submit_delete or {}).items():
+            # dynamo DELETEs only the named members
+            row["submit"][submit_key] = row["submit"].get(submit_key, set()) - values
+        for submit_key in submit_remove or []:
+            row["submit"].pop(submit_key, None)
+        return {"Attributes": deepcopy(row)}
+
+    mock = mocker.patch(
+        "celery_tasks.crawler.update_crawl_items", side_effect=side_effect
+    )
+    # the crawler hands the latest_data write to the submitter, which resolves
+    # update_crawl_items in its own namespace
+    mocker.patch(
+        "lambda_handlers.submitter.update_crawl_items", side_effect=side_effect
+    )
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def get_resource_implemented_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.get_resource_implemented")
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def store_resource_implemented_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.store_resource_implemented")
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def store_connection_error_mock(mocker):
+    mock = mocker.patch("utils.celery.store_connection_error")
+
+    def side_effect(
+        org_id,
+        connection_id,
+        integration_name,
+        failed_url,
+        message,
+        affected_endpoint,
+        preventing_sync,
+    ):
+        return [
+            {
+                "action": "stored",
+                "item": {
+                    "org_id": org_id,
+                    "connection_id": connection_id,
+                    "integration_name": integration_name,
+                    "failed_url": failed_url,
+                    "message": message,
+                    "affected_endpoint": affected_endpoint,
+                    "preventing_sync": preventing_sync,
+                },
+                "old_fields_and_values": None,
+            }
+        ]
+
+    mock.side_effect = side_effect
+
+    return mock
+
+
+@pytest.fixture
+def get_all_resources_mock(mocker):
+    mock = mocker.patch("utils.celery.get_all_resources")
+    return mock
+
+
+@pytest.fixture
+def clear_connection_error_mock(mocker):
+    mock = mocker.patch("utils.celery.clear_connection_error")
+
+    def side_effect(connection_id, url):
+        return {"Attributes": {"connection_id": connection_id, "failed_url": url}}
+
+    mock.side_effect = side_effect
+    return mock
+
+
+@pytest.fixture
+def get_and_submit_mock(mocker):
+    mock = mocker.patch("celery_tasks.crawler.get_and_submit")
+
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        if first_loop:
+            next_token = 1
+            submit_task_ids = {"submit_task_id_1"}
+        else:
+            next_token = None
+            submit_task_ids = {"submit_task_id_2"}
+        return {"next_token": next_token, "data": []}, {}, submit_task_ids
+
+    mock.side_effect = side_effect
+    return mock
+
+
+@pytest.fixture(autouse=True)
+def pickle_mock(mocker):
+    mock = mocker.patch("utils.celery.pickle")
+    mock.dumps.return_value = "test-pickled-data"
+    return mock
+
+
+def assert_resources_equal(resource, resource2):
+    assert resource.name() == resource2.name()
+    for elem in ["org_id", "connection_id", "integration_name", "integration_secret"]:
+        assert getattr(resource.integration, elem) == getattr(
+            resource2.integration, elem
+        )
+
+
+def test_first_crawl(
+    store_crawl_params_connection_row,
+    org_row,
+    get_and_submit_mock,
+    store_crawl_params_resource,
+    now_mock,
+    update_crawl_items_mock,
+):
+    function_name = "get_bills"
+    start_time_str = None
+    end_time_str = None
+    page_token = None
+    crawler.crawl_task(
+        store_crawl_params_connection_row,
+        org_row,
+        function_name,
+        True,
+        start_time_str,
+        end_time_str,
+        page_token,
+    )
+    assert get_and_submit_mock.call_count == 2
+    first_call_args = get_and_submit_mock.call_args_list[0][0]
+    assert_resources_equal(first_call_args[0], store_crawl_params_resource)
+    integration = store_crawl_params_resource.integration
+    created_at = str_to_dt(store_crawl_params_connection_row["created_at"])
+    expected_start = created_at - timedelta(
+        days=30, minutes=integration.crawl_start_overlap_minutes
+    )
+    assert first_call_args[1] == expected_start
+    assert first_call_args[2] == now_mock.return_value
+    assert first_call_args[3] == True
+    assert first_call_args[4] == True
+    assert first_call_args[5] == "default"
+    second_call_args = get_and_submit_mock.call_args_list[1][0]
+    assert second_call_args[3] == True
+    assert second_call_args[4] == False
+    assert second_call_args[5] == 1
+    assert update_crawl_items_mock.call_count == 4
+    now_str = dt_to_str(now_mock.return_value)
+    call_args_list = update_crawl_items_mock.call_args_list
+    non_heartbeat_calls = []
+    call_elem = None
+    for call_elem in call_args_list:
+        # independently check heartbeat call
+        if call_elem[0][2].get("latest_heartbeat"):
+            assert call_elem == call(
+                store_crawl_params_connection_row["id"],
+                function_name,
+                {
+                    "latest_heartbeat": now_str,
+                    "submit": {"tasks_started": {""}, "tasks_finished": {""}},
+                },
+            )
+            continue
+        non_heartbeat_calls.append(call_elem)
+    assert call_elem
+    expected = [
+        call(
+            store_crawl_params_connection_row["id"],
+            function_name,
+            {
+                "org_id": store_crawl_params_connection_row["org_id"],
+                "last_crawl_start": now_str,
+                "submit": {"tasks_started": {""}, "tasks_finished": {""}},
+                "stale": False,
+                "integration_type": "wms",
+                "paused": False,
+            },
+            force_replace_submit=True,
+        ),
+        call(
+            store_crawl_params_connection_row["id"],
+            function_name,
+            {
+                "submit": {"tasks_started": {"submit_task_id_1"}},
+                "latest_page_token": 1,
+                "last_page_token_update": now_str,
+                "deferred": False,
+                # the start the first page was fetched from, so a resume lands there
+                "current_crawl_start": dt_to_str(
+                    str_to_dt(store_crawl_params_connection_row["created_at"])
+                    - timedelta(days=30)
+                    - timedelta(
+                        minutes=store_crawl_params_resource.integration.crawl_start_overlap_minutes
+                    )
+                ),
+                "current_crawl_end": dt_to_str(now_mock.return_value),
+            },
+        ),
+        call(
+            store_crawl_params_connection_row["id"],
+            function_name,
+            {
+                "latest_page_token": None,
+                "last_page_token_update": now_str,
+                "deferred": False,
+                "submit": {
+                    "tasks_started": {"submit_task_id_2"},
+                    "set_latest_data": now_str,
+                    "mark_complete": True,
+                },
+            },
+        ),
+        call(
+            store_crawl_params_connection_row["id"],
+            function_name,
+            {
+                "last_crawl_end": now_str,
+                "submit": {"tasks_started": {""}, "tasks_finished": {""}},
+            },
+        ),
+    ]
+    assert len(non_heartbeat_calls) == len(expected)
+    for i in range(len(expected)):
+        assert non_heartbeat_calls[i] == expected[i]
+
+
+def test_forced_crawl_in_worker_proceeds_without_input(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    crawl_heartbeat_active_mock,
+    mocker,
+):
+    # forced crawl overlapping a running one, in a worker with no stdin. the old code
+    # called input() here and died with EOFError; it must now proceed silently.
+    crawl_heartbeat_active_mock.return_value = True
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+    non_tty_stdin = mocker.Mock()
+    non_tty_stdin.isatty.return_value = False
+    mocker.patch("celery_tasks.crawler.sys.stdin", non_tty_stdin)
+    input_mock = mocker.patch("builtins.input")
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+        force=True,
+    )
+    input_mock.assert_not_called()
+    assert get_and_submit_mock.call_count >= 1
+
+
+def test_forced_crawl_at_tty_prompts_and_aborts_on_no(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    crawl_heartbeat_active_mock,
+    mocker,
+):
+    # at a real terminal the confirmation prompt is preserved, and answering no aborts.
+    crawl_heartbeat_active_mock.return_value = True
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+    tty_stdin = mocker.Mock()
+    tty_stdin.isatty.return_value = True
+    mocker.patch("celery_tasks.crawler.sys.stdin", tty_stdin)
+    input_mock = mocker.patch("builtins.input", return_value="n")
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+        force=True,
+    )
+    input_mock.assert_called_once()
+    get_and_submit_mock.assert_not_called()
+
+
+def test_forced_crawl_sends_completion_webhook(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    mocker,
+):
+    # a forced crawl from a worker (no tty) fires connection.force-sync-completed
+    mocker.patch("celery_tasks.crawler.should_update_latest_data", return_value=True)
+    mocker.patch("lambda_handlers.submitter.conclude_investigation")
+    non_tty_stdin = mocker.Mock()
+    non_tty_stdin.isatty.return_value = False
+    mocker.patch("celery_tasks.crawler.sys.stdin", non_tty_stdin)
+    webhook_mock = mocker.patch(
+        "celery_tasks.crawler.send_force_sync_completed_webhook"
+    )
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+        force=True,
+    )
+    webhook_mock.assert_called_once()
+
+
+def test_forced_crawl_at_tty_skips_completion_webhook(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    mocker,
+):
+    # internal local runs (yarn crawl-hard -f, at a tty) don't notify the customer
+    mocker.patch("celery_tasks.crawler.should_update_latest_data", return_value=True)
+    mocker.patch("lambda_handlers.submitter.conclude_investigation")
+    tty_stdin = mocker.Mock()
+    tty_stdin.isatty.return_value = True
+    mocker.patch("celery_tasks.crawler.sys.stdin", tty_stdin)
+    webhook_mock = mocker.patch(
+        "celery_tasks.crawler.send_force_sync_completed_webhook"
+    )
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+        force=True,
+    )
+    webhook_mock.assert_not_called()
+
+
+def test_scheduled_crawl_skips_completion_webhook(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    mocker,
+):
+    # scheduled (non-forced) crawls complete without the force-sync webhook
+    mocker.patch("celery_tasks.crawler.should_update_latest_data", return_value=True)
+    mocker.patch("lambda_handlers.submitter.conclude_investigation")
+    non_tty_stdin = mocker.Mock()
+    non_tty_stdin.isatty.return_value = False
+    mocker.patch("celery_tasks.crawler.sys.stdin", non_tty_stdin)
+    webhook_mock = mocker.patch(
+        "celery_tasks.crawler.send_force_sync_completed_webhook"
+    )
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+    )
+    webhook_mock.assert_not_called()
+
+
+def test_pending_force_sync_crawls_and_notifies_without_force(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    crawl_due_mock,
+    mocker,
+):
+    # the scheduler re-enqueues a dead force sync as a normal crawl, so the flag on the
+    # schedule row is what makes this run crawl off-schedule and still notify
+    crawl_due_mock.return_value = False
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+    mocker.patch("celery_tasks.crawler.should_update_latest_data", return_value=True)
+    mocker.patch("lambda_handlers.submitter.conclude_investigation")
+    mocker.patch(
+        "celery_tasks.crawler.get_scheduler_row",
+        return_value={
+            "force_sync_pending": True,
+            "last_crawl_end": "2019-12-31T00:00:00Z",
+        },
+    )
+    non_tty_stdin = mocker.Mock()
+    non_tty_stdin.isatty.return_value = False
+    mocker.patch("celery_tasks.crawler.sys.stdin", non_tty_stdin)
+    webhook_mock = mocker.patch(
+        "celery_tasks.crawler.send_force_sync_completed_webhook"
+    )
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+    )
+    assert get_and_submit_mock.call_count >= 1
+    webhook_mock.assert_called_once()
+
+
+def test_second_crawl(connection_row, org_row, get_and_submit_mock, resource, now_mock):
+    function_name = "get_warehouses"
+    start_time_str = "1971-01-01T00:00:00Z"
+    end_time_str = "2000-01-01T00:00:00Z"
+    page_token = None
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        function_name,
+        False,
+        start_time_str,
+        end_time_str,
+        page_token,
+    )
+    assert get_and_submit_mock.call_count == 2
+    first_call_args = get_and_submit_mock.call_args_list[0][0]
+    assert_resources_equal(first_call_args[0], resource)
+    assert first_call_args[1] == str_to_dt(start_time_str) - timedelta(minutes=5)
+    assert first_call_args[2] == str_to_dt(end_time_str)
+    assert first_call_args[3] == False
+    assert first_call_args[4] == True
+    assert first_call_args[5] == "default"
+    second_call_args = get_and_submit_mock.call_args_list[1][0]
+    assert second_call_args[3] == False
+    assert second_call_args[4] == False
+    assert second_call_args[5] == 1
+
+
+def survives_celery_ipc(exc):
+    # celery pickles a task's exception on the way out and rebuilds it in on_failure
+    from celery.utils.serialization import (
+        get_pickleable_exception,
+        get_pickled_exception,
+    )
+
+    from utils.exceptions import parse_pickled_exception
+
+    return parse_pickled_exception(get_pickled_exception(get_pickleable_exception(exc)))
+
+
+def test_throttle_survives_celery_ipc_as_a_throttle():
+    parsed = survives_celery_ipc(ThrottleException("ShipHero", 30))
+    assert isinstance(parsed, ThrottleException)
+    assert parsed.retry_after_seconds == 30
+    assert parsed.status_code == 429
+    assert str(parsed) == "ShipHero rate limit exceeded"
+
+
+def test_retry_survives_celery_ipc_without_becoming_a_throttle():
+    parsed = survives_celery_ipc(RetryException("ShipBob is failing", 5, 502))
+    assert isinstance(parsed, RetryException)
+    assert not isinstance(parsed, ThrottleException)
+    assert parsed.retry_after_seconds == 5
+    assert parsed.status_code == 502
+
+
+def count_last_crawl_end_writes(update_crawl_items_mock):
+    count = 0
+    for call_elem in update_crawl_items_mock.call_args_list:
+        update_dict = call_elem[0][2]
+        if "last_crawl_end" in update_dict:
+            count += 1
+    return count
+
+
+def test_first_crawl_throttle_skips_last_crawl_end_write(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=ThrottleException("Test", 60),
+    )
+    with pytest.raises(ThrottleException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            True,
+            None,
+            None,
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 0
+
+
+def test_first_crawl_retry_exception_skips_last_crawl_end_write(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=RetryException("Test blipped", 60),
+    )
+    with pytest.raises(RetryException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            True,
+            None,
+            None,
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 0
+
+
+def test_first_crawl_non_throttle_exception_writes_last_crawl_end(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=PokedexException("boom", 500, origin="integration"),
+    )
+    with pytest.raises(PokedexException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            True,
+            None,
+            None,
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 1
+
+
+def test_subsequent_crawl_throttle_writes_last_crawl_end(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=ThrottleException("Test", 60),
+    )
+    with pytest.raises(ThrottleException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            False,
+            "2000-01-01T00:00:00Z",
+            "2000-01-02T00:00:00Z",
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 1
+
+
+def test_first_crawl_dependency_not_ready_skips_last_crawl_end_write(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=DependencyFirstCrawlIncompleteException("Inventory"),
+    )
+    with pytest.raises(DependencyFirstCrawlIncompleteException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            True,
+            None,
+            None,
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 0
+
+
+def test_subsequent_crawl_dependency_not_ready_writes_last_crawl_end(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=DependencyFirstCrawlIncompleteException("Inventory"),
+    )
+    with pytest.raises(DependencyFirstCrawlIncompleteException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            False,
+            "2000-01-01T00:00:00Z",
+            "2000-01-02T00:00:00Z",
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 1
+
+
+def test_first_crawl_throttle_with_long_retry_after_writes_last_crawl_end(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=ThrottleException("Test", HEARTBEAT_TIMEOUT + 1),
+    )
+    with pytest.raises(ThrottleException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            True,
+            None,
+            None,
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 1
+
+
+def test_first_crawl_throttle_with_short_crawl_frequency_writes_last_crawl_end(
+    mocker,
+    store_crawl_params_connection_row,
+    org_row,
+    update_crawl_items_mock,
+):
+    org_row["crawl_frequencies"]["get_bills"] = HEARTBEAT_TIMEOUT
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit",
+        side_effect=ThrottleException("Test", 60),
+    )
+    with pytest.raises(ThrottleException):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            True,
+            None,
+            None,
+            None,
+        )
+    assert count_last_crawl_end_writes(update_crawl_items_mock) == 1
+
+
+@pytest.mark.parametrize(
+    "first_crawl, page_token",
+    [(False, "default"), (True, "next_token")],
+)
+def test_get_and_submit_regular(
+    mocker,
+    first_crawl,
+    page_token,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+    get_resource_implemented_mock,
+    store_resource_implemented_mock,
+):
+    random_mock = mocker.patch("celery_tasks.crawler.random.random", return_value=0)
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+    if first_crawl:
+        end_time_dt = str_to_dt("2000-01-31T00:00:00Z")
+    get_all_resources_mock.return_value = []
+    address = {
+        "address1": "test-address1",
+        "address2": "test-address2",
+        "address3": "test-address3",
+        "city": "test-city",
+        "state": "test-state",
+        "postal_code": "test-zip",
+        "country": "test-country",
+    }
+    warehouse = {
+        "id": "test-id",
+        "name": "test-name",
+        "code": None,
+        "address": address,
+        "additional_fields": {},
+    }
+    resource.integration.get_warehouses.return_value = {
+        "data": [warehouse],
+        "next_token": "returned_next_token",
+    }
+    resource.validate_crawl = mocker.Mock()
+    return_value = crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, first_crawl, True, page_token, False
+    )
+
+    resource.integration.get_warehouses.assert_called_once()
+    call_args = resource.integration.get_warehouses.call_args_list[0][0]
+    assert call_args[0] == start_time_dt
+    assert call_args[1] == end_time_dt
+    if page_token == "default":
+        assert len(call_args) == 4
+    else:
+        assert len(call_args) == 5
+        assert call_args[4] == "next_token"
+
+    sorted_item = OrderedDict()
+    sorted_item["id"] = "test-id"
+    sorted_item["created_date"] = EPOCH
+    sorted_item["updated_date"] = EPOCH
+    sorted_item["name"] = "test-name"
+    sorted_item["code"] = None
+    sorted_item["address"] = address
+    sorted_item["trackstar_tags"] = None
+    sorted_item["additional_fields"] = {}
+    sorted_item["connection_id"] = "test-connection-id"
+    sorted_item["trackstar_created_date"] = "2020-01-01T00:00:00Z"
+    sorted_item["trackstar_updated_date"] = "2020-01-01T00:00:00Z"
+    sorted_data = [sorted_item]
+    transformed_rsp = {"data": sorted_data, "next_token": "returned_next_token"}
+
+    get_all_resources_mock.assert_called_once()
+    clear_connection_error_mock.assert_not_called()
+    store_connection_error_mock.assert_not_called()
+    resource.validate_crawl.assert_called_once_with(transformed_rsp)
+    s3_write_mock.assert_called_once()
+    call_args = s3_write_mock.call_args_list[0][0]
+    assert call_args[0] == "submitter"
+    payload = call_args[1]
+    assert payload["resource"].name() == resource.name()
+    assert payload["first_crawl"] == first_crawl
+    assert payload["start"] == dt_to_str(start_time_dt)
+    assert payload["data"] == transformed_rsp["data"]
+
+    if not first_crawl:
+        get_resource_implemented_mock.assert_called_once()
+        store_resource_implemented_mock.assert_called_once()
+    else:
+        get_resource_implemented_mock.assert_not_called()
+        store_resource_implemented_mock.assert_called_once()
+
+
+def test_get_and_submit_offloads_big_fields_before_pickling(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+    get_resource_implemented_mock,
+    store_resource_implemented_mock,
+):
+    mocker.patch("celery_tasks.crawler.random.random", return_value=1)
+    # between the address (~160 bytes) and the additional_fields (~620 bytes)
+    mocker.patch("utils.boto.LARGE_FIELD_THRESHOLD", 300)
+    get_all_resources_mock.return_value = []
+    additional_fields = {f"key-{i}": "x" * 50 for i in range(10)}
+    warehouse = {
+        "id": "test-id",
+        "name": "test-name",
+        "code": None,
+        "address": {
+            "address1": "test-address1",
+            "address2": None,
+            "address3": None,
+            "city": "test-city",
+            "state": "test-state",
+            "postal_code": "test-zip",
+            "country": "test-country",
+        },
+        "additional_fields": additional_fields,
+    }
+    resource.integration.get_warehouses.return_value = {
+        "data": [warehouse],
+        "next_token": None,
+    }
+    resource.validate_crawl = mocker.Mock()
+
+    crawler.get_and_submit(
+        resource,
+        str_to_dt("2000-01-01T00:00:00Z"),
+        str_to_dt("2000-01-02T00:00:00Z"),
+        False,
+        True,
+        "default",
+        False,
+    )
+
+    submitted = s3_write_mock.get_calls("submitter")
+    assert len(submitted) == 1
+    pickled_row = submitted[0]["payload"]["data"][0]
+    # the submitter gets a pointer, s3 has the content
+    assert pickled_row["additional_fields"] == {}
+    ref = pickled_row["refs"]["additional_fields"]
+    assert ref["key"] == "warehouses/test-connection-id/test-id/additional_fields.json"
+    assert ref["key"] in s3_write_mock.get_large_field_files()
+    # the crawl itself still saw the full row
+    validated = resource.validate_crawl.call_args[0][0]["data"][0]
+    assert validated["additional_fields"] == additional_fields
+
+
+def test_get_and_submit_raised_permissions(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2001-01-01T00:00:00Z")
+    integration = resource.integration
+    integration.get_warehouses.side_effect = integration.create_permissions_exception(
+        "url"
+    )
+    resource.validate_crawl = mocker.Mock()
+    with pytest.raises(PermissionsException) as e:
+        return_value = crawler.get_and_submit(
+            resource, start_time_dt, end_time_dt, True, True, "next_token", False
+        )
+
+    resource.integration.get_warehouses.assert_called_once()
+    msg = "Missing Ongoing WMS permissions for URL: url."
+    store_connection_error_mock.assert_called_once_with(
+        "test-org-id",
+        "test-connection-id",
+        "ongoing",
+        "url",
+        msg,
+        "GET /wms/warehouses",
+        True,
+    )
+    assert e.value.url == "url"
+    get_all_resources_mock.assert_not_called()
+    clear_connection_error_mock.assert_not_called()
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 0
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 1
+    resource.validate_crawl.assert_not_called()
+
+
+def test_get_and_submit_raised_same_permissions(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2001-01-01T00:00:00Z")
+    integration = resource.integration
+    integration.get_warehouses.side_effect = integration.create_permissions_exception(
+        "url"
+    )
+    resource.validate_crawl = mocker.Mock()
+    with pytest.raises(PermissionsException) as e:
+        return_value = crawler.get_and_submit(
+            resource, start_time_dt, end_time_dt, True, True, "next_token", False
+        )
+
+    resource.integration.get_warehouses.assert_called_once()
+    msg = "Missing Ongoing WMS permissions for URL: url."
+    store_connection_error_mock.assert_called_once_with(
+        "test-org-id",
+        "test-connection-id",
+        "ongoing",
+        "url",
+        msg,
+        "GET /wms/warehouses",
+        True,
+    )
+    store_connection_error_mock.return_value = [
+        {
+            "action": "updated",
+            "table": "connection-errors-dev",
+            "item": {
+                "org_id": "test-org-id",
+                "connection_id": "test-connection-id",
+                "failed_url": "GET /warehouses",
+                "affected_endpoints": ["GET /wms/warehouses"],
+                "integration_name": "ongoing",
+                "error_message": "Missing Ongoing WMS permissions for URL: GET /warehouses.",
+                "created_date": "2000-01-01T00:01:00Z",
+                "updated_date": "2000-01-01T00:01:00Z",
+                "last_seen": "2000-01-01T00:01:00Z",
+                "preventing_sync": True,
+            },
+            "old_fields_and_values": {
+                "error_message": "Missing Ongoing WMS permissions for URL: GET /warehouses.",
+                "created_date": "2000-01-01T00:00:00Z",
+                "integration_name": "ongoing",
+                "affected_endpoints": ["GET /wms/warehouses"],
+                "last_seen": "2000-01-01T00:00:00Z",
+                "updated_date": "2000-01-01T00:00:00Z",
+                "preventing_sync": True,
+            },
+        },  # only last_seen was updated so this should be filtered out
+        {
+            "action": "updated",
+            "table": "connection-errors-dev",
+            "item": {
+                "org_id": "test-org-id",
+                "connection_id": "test-connection-id",
+                "failed_url": "GET /orders",
+                "affected_endpoints": ["GET /wms/orders"],
+                "integration_name": "ongoing",
+                "error_message": "Missing Ongoing WMS permissions for URL: GET /orders.",
+                "created_date": "2000-01-01T00:01:00Z",
+                "updated_date": "2000-01-01T00:01:00Z",
+                "last_seen": "2000-01-01T00:01:00Z",
+                "preventing_sync": True,
+            },
+            "old_fields_and_values": {
+                "error_message": "Missing Ongoing WMS permissions for URL: GET /orders.",
+                "created_date": "2000-01-01T00:00:00Z",
+                "integration_name": "ongoing",
+                "affected_endpoints": ["GET /wms/orders", "GET /wms/returns"],
+                "last_seen": "2000-01-01T00:00:00Z",
+                "updated_date": "2000-01-01T00:00:00Z",
+                "preventing_sync": True,
+            },
+        },  # affected endpoints changed so this should be sent in a webhook
+    ]
+
+    updated_or_created_errors = filter_out_not_updated_connection_errors(
+        store_connection_error_mock.return_value
+    )
+    assert updated_or_created_errors == [
+        {
+            "action": "updated",
+            "table": "connection-errors-dev",
+            "item": {
+                "org_id": "test-org-id",
+                "connection_id": "test-connection-id",
+                "failed_url": "GET /orders",
+                "affected_endpoints": ["GET /wms/orders"],
+                "integration_name": "ongoing",
+                "error_message": "Missing Ongoing WMS permissions for URL: GET /orders.",
+                "created_date": "2000-01-01T00:01:00Z",
+                "updated_date": "2000-01-01T00:01:00Z",
+                "last_seen": "2000-01-01T00:01:00Z",
+                "preventing_sync": True,
+            },
+            "old_fields_and_values": {
+                "error_message": "Missing Ongoing WMS permissions for URL: GET /orders.",
+                "created_date": "2000-01-01T00:00:00Z",
+                "integration_name": "ongoing",
+                "affected_endpoints": ["GET /wms/orders", "GET /wms/returns"],
+                "last_seen": "2000-01-01T00:00:00Z",
+                "updated_date": "2000-01-01T00:00:00Z",
+                "preventing_sync": True,
+            },
+        }
+    ]
+
+    assert e.value.url == "url"
+    get_all_resources_mock.assert_not_called()
+    clear_connection_error_mock.assert_not_called()
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 0
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 1
+    resource.validate_crawl.assert_not_called()
+
+
+def test_get_and_submit_raised_credentials(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2001-01-01T00:00:00Z")
+    resource.integration.get_warehouses.side_effect = (
+        resource.integration.create_invalid_credentials_exception()
+    )
+    resource.validate_crawl = mocker.Mock()
+    with pytest.raises(InvalidCredentialsException) as e:
+        return_value = crawler.get_and_submit(
+            resource, start_time_dt, end_time_dt, True, True, "next_token", False
+        )
+
+    resource.integration.get_warehouses.assert_called_once()
+    msg = "Invalid Ongoing WMS credentials"
+    store_connection_error_mock.assert_called_once_with(
+        "test-org-id",
+        "test-connection-id",
+        "ongoing",
+        "-",
+        msg,
+        "GET /wms/warehouses",
+        True,
+    )
+    get_all_resources_mock.assert_not_called()
+    clear_connection_error_mock.assert_not_called()
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 0
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 1
+    resource.validate_crawl.assert_not_called()
+
+
+def test_get_and_submit_child_permissions(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+    get_resource_implemented_mock,
+    store_resource_implemented_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-31T00:00:00Z")
+    get_all_resources_mock.return_value = []
+    address = {
+        "address1": "test-address1",
+        "address2": "test-address2",
+        "address3": "test-address3",
+        "city": "test-city",
+        "state": "test-state",
+        "postal_code": "test-zip",
+        "country": "test-country",
+    }
+    warehouse = {
+        "id": "test-id",
+        "name": "test-name",
+        "code": None,
+        "address": address,
+        "additional_fields": {},
+        "channel_object": None,
+    }
+    integration = resource.integration
+    integration.get_warehouses.return_value = {
+        "data": [warehouse],
+        "next_token": None,
+    }
+    resource.validate_crawl = mocker.Mock()
+    passthrough_schema = mocker.Mock()
+    passthrough_schema.load.side_effect = lambda x: x
+    mocker.patch.object(resource, "crawl_schema", return_value=passthrough_schema)
+
+    perms_exc = integration.create_permissions_exception("fake-path")
+
+    def child_side_effect(first_loop, raw_data):
+        integration.api_call_errors["fake-path"] = perms_exc
+        raise perms_exc
+
+    child_mock = mocker.patch.object(
+        integration, "get_order_channels", side_effect=child_side_effect
+    )
+    child_mock.__name__ = "get_order_channels"
+
+    mocker.patch.object(
+        resource,
+        "child_resources_to_get",
+        return_value=[(OrderChannel, "channel_object")],
+    )
+
+    crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "default", False
+    )
+
+    # override raised but fallback hit the WMSIntegration base impl, which
+    # derives from raw_data without an api call and returns {"data": []}
+    child_mock.assert_called_once()
+
+    # handle_api_call_errors picked the error off integration.api_call_errors
+    # and recorded it against the child resource's endpoint
+    store_connection_error_mock.assert_called_once_with(
+        "test-org-id",
+        "test-connection-id",
+        "ongoing",
+        "fake-path",
+        perms_exc.message,
+        "GET /wms/orders/channels",
+        False,
+    )
+
+    # parent crawl still submitted normally
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 1
+    resource.validate_crawl.assert_called_once()
+
+
+def test_get_and_submit_returned_with_perm_errors(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+    get_all_resources_mock.return_value = [
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": True}
+            ],
+            "failed_url": "/warehouses",
+        },  # should stay
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": False}
+            ],
+            "failed_url": "/warehouses-2",
+        },  # should be cleared - called with no err
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": True}
+            ],
+            "failed_url": "/warehouses-3",
+        },  # should stay - not called
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": True}
+            ],
+            "failed_url": "-",
+            "error_message": "Invalid Ongoing WMS credentials: bad token",
+        },  # should be cleared - InvalidCredentialsException
+    ]
+    integration = resource.integration
+    address = {
+        "address1": "test-address1",
+        "address2": "test-address2",
+        "address3": "test-address3",
+        "city": "test-city",
+        "state": "test-state",
+        "postal_code": "test-postal-code",
+        "country": "test-country",
+    }
+    data = [
+        {
+            "id": "test-id",
+            "name": "test-name",
+            "code": None,
+            "address": address,
+            "additional_fields": {},
+        }
+    ]
+    api_call_errors = {
+        "/warehouses": integration.create_permissions_exception("/warehouses"),
+        "/warehouses-2": None,
+    }
+    integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+    }
+    integration.api_call_errors = api_call_errors
+    resource.validate_crawl = mocker.Mock()
+    return_value = crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    get_all_resources_mock.assert_called_once()
+    assert clear_connection_error_mock.call_count == 2
+    first_clear_call = clear_connection_error_mock.call_args_list[0][0]
+    assert len(first_clear_call) == 2
+    assert first_clear_call[0] == "test-connection-id"
+    assert first_clear_call[1] == "-"
+    second_clear_call = clear_connection_error_mock.call_args_list[1][0]
+    assert len(second_clear_call) == 2
+    assert second_clear_call[0] == "test-connection-id"
+    assert second_clear_call[1] == "/warehouses-2"
+
+    store_connection_error_mock.assert_called_once()
+    store_call = store_connection_error_mock.call_args_list[0][0]
+    assert len(store_call) == 7
+    assert store_call[0] == "test-org-id"
+    assert store_call[1] == "test-connection-id"
+    assert store_call[2] == "ongoing"
+    assert store_call[3] == "/warehouses"
+    assert store_call[4] == "Missing Ongoing WMS permissions for URL: /warehouses."
+    assert store_call[5] == "GET /wms/warehouses"
+    assert store_call[6] == False
+
+    sorted_item = OrderedDict()
+    sorted_item["id"] = "test-id"
+    sorted_item["created_date"] = EPOCH
+    sorted_item["updated_date"] = EPOCH
+    sorted_item["name"] = "test-name"
+    sorted_item["code"] = None
+    sorted_item["address"] = address
+    sorted_item["trackstar_tags"] = None
+    sorted_item["additional_fields"] = {}
+    sorted_item["connection_id"] = "test-connection-id"
+    sorted_item["trackstar_created_date"] = "2020-01-01T00:00:00Z"
+    sorted_item["trackstar_updated_date"] = "2020-01-01T00:00:00Z"
+    transformed_rsp = OrderedDict()
+    transformed_rsp["data"] = [sorted_item]
+    transformed_rsp["next_token"] = "returned_next_token"
+    resource.validate_crawl.assert_called_once_with(transformed_rsp)
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 1
+    payload = submitter_calls[0][0][1]
+    assert payload["resource"].name() == resource.name()
+    assert payload["first_crawl"] == True
+    assert payload["start"] == dt_to_str(start_time_dt)
+    assert payload["data"] == transformed_rsp["data"]
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 3
+    first_webhook = webhook_calls[0][0][1]
+    error_resource = ConnectionsError(resource.integration)
+    assert first_webhook["resource"].name() == error_resource.name()
+    assert len(first_webhook["data"]) == 1
+    assert first_webhook["data"][0]["item"]["failed_url"] == "-"
+    assert first_webhook["data"][0]["action"] == "deleted"
+    second_webhook = webhook_calls[1][0][1]
+    assert len(second_webhook["data"]) == 1
+    assert second_webhook["data"][0]["item"]["failed_url"] == "/warehouses-2"
+    assert second_webhook["data"][0]["action"] == "deleted"
+    third_webhook = webhook_calls[2][0][1]
+    assert len(third_webhook["data"]) == 1
+    assert third_webhook["data"][0]["item"]["failed_url"] == "/warehouses"
+    assert third_webhook["data"][0]["action"] == "stored"
+
+
+def test_get_and_submit_does_not_restore_cleared_inherited_error(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+    integration = resource.integration
+    get_all_resources_mock.return_value = [
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": True},
+                {"endpoint": "GET /wms/inventory", "preventing_sync": False},
+            ],
+            "failed_url": "/warehouse-details",
+        },
+    ]
+    address = {
+        "address1": "test-address1",
+        "address2": "test-address2",
+        "address3": "test-address3",
+        "city": "test-city",
+        "state": "test-state",
+        "postal_code": "test-postal-code",
+        "country": "test-country",
+    }
+    data = [
+        {
+            "id": "test-id",
+            "name": "test-name",
+            "code": None,
+            "address": address,
+            "additional_fields": {},
+        }
+    ]
+    integration.api_call_errors = {"/warehouse-details": None}
+    integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+    }
+    integration.resources_queried.add(InventoryItem)
+    resource.validate_crawl = mocker.Mock()
+    crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    clear_connection_error_mock.assert_called_once()
+    assert clear_connection_error_mock.call_args_list[0][0][1] == "/warehouse-details"
+    store_connection_error_mock.assert_not_called()
+
+
+def test_get_and_submit_inherits_stored_credentials_message(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+    integration = resource.integration
+    get_all_resources_mock.return_value = [
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/inventory", "preventing_sync": True}
+            ],
+            "failed_url": "-",
+            "error_message": "Invalid Ongoing WMS credentials: Incorrect ID or secret",
+        },
+    ]
+    address = {
+        "address1": "test-address1",
+        "address2": "test-address2",
+        "address3": "test-address3",
+        "city": "test-city",
+        "state": "test-state",
+        "postal_code": "test-postal-code",
+        "country": "test-country",
+    }
+    data = [
+        {
+            "id": "test-id",
+            "name": "test-name",
+            "code": None,
+            "address": address,
+            "additional_fields": {},
+        }
+    ]
+    integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+        "api_call_made": False,
+    }
+    integration.resources_queried.add(InventoryItem)
+    resource.validate_crawl = mocker.Mock()
+    crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    clear_connection_error_mock.assert_not_called()
+    store_connection_error_mock.assert_called_once()
+    store_call = store_connection_error_mock.call_args_list[0][0]
+    assert store_call[3] == "-"
+    assert store_call[4].endswith(": Incorrect ID or secret")
+    assert store_call[6] == True
+
+
+def test_get_and_submit_inherit(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+    integration = resource.integration
+    get_all_resources_mock.return_value = [
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/inventory", "preventing_sync": True}
+            ],
+            "failed_url": "/inventory",
+        },
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": True}
+            ],
+            "failed_url": "/warehouse-details",
+        },
+    ]
+    address = {
+        "address1": "test-address1",
+        "address2": "test-address2",
+        "address3": "test-address3",
+        "city": "test-city",
+        "state": "test-state",
+        "postal_code": "test-postal-code",
+        "country": "test-country",
+    }
+    data = [
+        {
+            "id": "test-id",
+            "name": "test-name",
+            "code": None,
+            "address": address,
+            "additional_fields": {},
+        }
+    ]
+    integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+        "api_call_made": False,
+    }
+    integration.resources_queried.add(InventoryItem)
+    resource.validate_crawl = mocker.Mock()
+    # test that warehouses inherits the inventory error
+    return_value = crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    get_all_resources_mock.assert_called_once()
+    clear_connection_error_mock.assert_not_called()
+    # no api calls made, so don't clear the warehouse-details error
+    store_connection_error_mock.assert_called_once()
+    store_call = store_connection_error_mock.call_args_list[0][0]
+    assert len(store_call) == 7
+    assert store_call[0] == "test-org-id"
+    assert store_call[1] == "test-connection-id"
+    assert store_call[2] == "ongoing"
+    assert store_call[3] == "/inventory"
+    assert store_call[4] == "Missing Ongoing WMS permissions for URL: /inventory."
+    assert store_call[5] == "GET /wms/warehouses"
+    assert store_call[6] == False
+
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 1
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 1
+    store_webhook = webhook_calls[0][0][1]
+    error_resource = ConnectionsError(integration)
+    assert store_webhook["resource"].name() == error_resource.name()
+    assert len(store_webhook["data"]) == 1
+    assert store_webhook["data"][0]["item"]["failed_url"] == "/inventory"
+    assert store_webhook["data"][0]["action"] == "stored"
+
+    get_all_resources_mock.reset_mock()
+    clear_connection_error_mock.reset_mock()
+    store_connection_error_mock.reset_mock()
+    s3_write_mock.reset_mock()
+
+    # test that one that makes api calls also inherits the error
+    integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+    }
+    integration.api_call_errors = {
+        "/warehouse-details": integration.create_permissions_exception(
+            "/warehouse-details"
+        )
+    }
+    integration.resources_queried.add(InventoryItem)
+    return_value = crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    get_all_resources_mock.assert_called_once()
+    clear_connection_error_mock.assert_not_called()
+    assert store_connection_error_mock.call_count == 2
+    inv_used = warehouse_used = False
+    for full_store_call in store_connection_error_mock.call_args_list:
+        store_call = full_store_call[0]
+        assert len(store_call) == 7
+        assert store_call[0] == "test-org-id"
+        assert store_call[1] == "test-connection-id"
+        assert store_call[2] == "ongoing"
+        if store_call[3] == "/inventory":
+            assert (
+                store_call[4] == "Missing Ongoing WMS permissions for URL: /inventory."
+            )
+            inv_used = True
+        else:
+            assert store_call[3] == "/warehouse-details"
+            assert (
+                store_call[4]
+                == "Missing Ongoing WMS permissions for URL: /warehouse-details."
+            )
+            warehouse_used = True
+        assert store_call[5] == "GET /wms/warehouses"
+        assert store_call[6] == False
+    assert inv_used
+    assert warehouse_used
+
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 1
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 2
+    inv_used = warehouse_used = False
+    for webhook_call in webhook_calls:
+        webhook = webhook_call[0][1]
+        assert webhook["resource"].name() == error_resource.name()
+        assert len(webhook["data"]) == 1
+        if webhook["data"][0]["item"]["failed_url"] == "/inventory":
+            inv_used = True
+        else:
+            assert webhook["data"][0]["item"]["failed_url"] == "/warehouse-details"
+            warehouse_used = True
+        assert webhook["data"][0]["action"] == "stored"
+    assert inv_used
+    assert warehouse_used
+
+    get_all_resources_mock.reset_mock()
+    clear_connection_error_mock.reset_mock()
+    store_connection_error_mock.reset_mock()
+    s3_write_mock.reset_mock()
+
+    # test that it makes api calls successfully and clears one error while inheriting the other
+    resource.integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+    }
+    resource.integration.api_call_errors = {"/warehouse-details": None}
+    resource.integration.resources_queried.add(InventoryItem)
+    return_value = crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    get_all_resources_mock.assert_called_once()
+    clear_connection_error_mock.assert_called_once()
+    clear_call = clear_connection_error_mock.call_args_list[0][0]
+    assert len(clear_call) == 2
+    assert clear_call[0] == "test-connection-id"
+    assert clear_call[1] == "/warehouse-details"
+    store_connection_error_mock.assert_called_once()
+    store_call = store_connection_error_mock.call_args_list[0][0]
+    assert len(store_call) == 7
+    assert store_call[0] == "test-org-id"
+    assert store_call[1] == "test-connection-id"
+    assert store_call[2] == "ongoing"
+    assert store_call[3] == "/inventory"
+    assert store_call[4] == "Missing Ongoing WMS permissions for URL: /inventory."
+    assert store_call[5] == "GET /wms/warehouses"
+    assert store_call[6] == False
+
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 1
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 2
+    clear_webhook = webhook_calls[0][0][1]
+    error_resource = ConnectionsError(resource.integration)
+    assert clear_webhook["resource"].name() == error_resource.name()
+    assert len(clear_webhook["data"]) == 1
+    assert clear_webhook["data"][0]["item"]["failed_url"] == "/warehouse-details"
+    assert clear_webhook["data"][0]["action"] == "deleted"
+    store_webhook = webhook_calls[1][0][1]
+    error_resource = ConnectionsError(resource.integration)
+    assert store_webhook["resource"].name() == error_resource.name()
+    assert len(store_webhook["data"]) == 1
+    assert store_webhook["data"][0]["item"]["failed_url"] == "/inventory"
+    assert store_webhook["data"][0]["action"] == "stored"
+
+    get_all_resources_mock.reset_mock()
+    clear_connection_error_mock.reset_mock()
+    store_connection_error_mock.reset_mock()
+    s3_write_mock.reset_mock()
+    integration.api_call_errors.clear()
+
+    # test that it doesn't clear an InvalidCredentialsException
+    get_all_resources_mock.return_value = [
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/inbound-shipments", "preventing_sync": True}
+            ],
+            "failed_url": "-",
+            "error_message": "Invalid Ongoing WMS credentials: bad token",
+        }
+    ]
+    resource.integration.get_warehouses.return_value = {
+        "data": data,
+        "next_token": "returned_next_token",
+        "api_call_made": False,
+    }
+
+    return_value = crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    get_all_resources_mock.assert_called_once()
+    clear_connection_error_mock.assert_not_called()
+    store_connection_error_mock.assert_not_called()
+    submitter_calls = [
+        c for c in s3_write_mock.call_args_list if c[0][0] == "submitter"
+    ]
+    assert len(submitter_calls) == 1
+    webhook_calls = [c for c in s3_write_mock.call_args_list if c[0][0] == "webhook"]
+    assert len(webhook_calls) == 0
+
+
+def test_implemented_dict():
+    test_rsp_1 = {
+        "id": "id",
+        "name": "name",
+        "nested": {"id": "nested-id", "name": "nested-name"},
+        "lst": [{"id": "lst-id", "name": "lst-name"}],
+        "stringlist": ["lst2-id", "lst2-name"],
+        "inventory_by_warehouse_id": {
+            "id1": {"id": "id1", "name": "name1"},
+            "id2": {"id": "id2", "name": "name2"},
+        },
+    }
+    implemented_dict_1 = {}
+    crawler.create_implemented_dict(test_rsp_1, implemented_dict_1)
+    assert implemented_dict_1 == {
+        "id": True,
+        "name": True,
+        "nested": {"id": True, "name": True},
+        "lst": [{"id": True, "name": True}],
+        "stringlist": [True],
+        "inventory_by_warehouse_id": {"key": {"id": True, "name": True}},
+    }
+
+    test_rsp_2 = {
+        "id": "id",
+        "name": IntegrationNotImplemented,
+        "nested": IntegrationNotImplemented,
+        "lst": IntegrationNotImplemented,
+    }
+    implemented_dict_2 = {}
+    crawler.create_implemented_dict(test_rsp_2, implemented_dict_2)
+    assert implemented_dict_2 == {
+        "id": True,
+        "name": False,
+        "nested": False,
+        "lst": False,
+    }
+
+    test_rsp_3 = {
+        "id": "id",
+        "name": "name",
+        "nested": {"id": "nested-id", "name": IntegrationNotImplemented},
+        "lst": [{"id": "lst-id", "name": IntegrationNotImplemented}],
+    }
+    implemented_dict_3 = {}
+    crawler.create_implemented_dict(test_rsp_3, implemented_dict_3)
+    assert implemented_dict_3 == {
+        "id": True,
+        "name": True,
+        "nested": {"id": True, "name": False},
+        "lst": [{"id": True, "name": False}],
+    }
+
+    test_rsp_4 = {"lst": []}
+    test_rsp_5 = {"lst": [{"id": "lst-id", "name": "lst-name"}]}
+    implemented_dict_4 = {}
+    crawler.create_implemented_dict(test_rsp_4, implemented_dict_4)
+    assert implemented_dict_4 == {"lst": []}
+    crawler.create_implemented_dict(test_rsp_5, implemented_dict_4)
+    assert implemented_dict_4 == {
+        "lst": [{"id": True, "name": True}],
+    }
+    implemented_dict_5 = {}
+    for rsp in [test_rsp_5, test_rsp_4]:
+        crawler.create_implemented_dict(rsp, implemented_dict_5)
+    assert implemented_dict_5 == {
+        "lst": [{"id": True, "name": True}],
+    }
+
+
+def test_merge_implemented_dicts():
+    old = {
+        "id": True,
+        "name": False,
+        "ignore": True,
+    }
+    new = {
+        "id": False,
+        "name": True,
+        "something": True,
+    }
+    merged = crawler.merge_implemented_dicts(old, new)
+    assert merged == {
+        "id": False,
+        "name": True,
+        "something": True,
+    }
+
+    old = {
+        "list": [{"id": True, "name": False}],
+        "dict": {"id": True, "name": False},
+    }
+    new = {
+        "list": [],
+        "dict": {},
+    }
+    merged = crawler.merge_implemented_dicts(old, new)
+    assert merged == {
+        "list": [{"id": True, "name": False}],
+        "dict": {"id": True, "name": False},
+    }
+
+    old = {
+        "list": [{"id": True, "name": False}],
+        "dict": {"id": True, "name": False},
+    }
+    new = {
+        "list": [{"id": True, "name": True}],
+        "dict": {"id": True, "name": True},
+    }
+    merged = crawler.merge_implemented_dicts(old, new)
+    assert merged == {
+        "list": [{"id": True, "name": True}],
+        "dict": {"id": True, "name": True},
+    }
+
+    old = {
+        "nested": {"key": {"id": True, "name": False}},
+    }
+    new = {
+        "nested": {"key": {"id": True, "name": True}},
+    }
+    merged = crawler.merge_implemented_dicts(old, new)
+    assert merged == {
+        "nested": {"key": {"id": True, "name": True}},
+    }
+
+
+def test_crawl_task_protected_enables_ecs_protection(
+    mocker,
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+):
+    ecs_protection_mock = mocker.patch(
+        "celery_tasks.crawler.ecs_task_protection_request"
+    )
+    function_name = "get_warehouses"
+    start_time_str = None
+    end_time_str = None
+    page_token = None
+    crawler.crawl_task_protected(
+        connection_row,
+        org_row,
+        function_name,
+        True,
+        start_time_str,
+        end_time_str,
+        page_token,
+    )
+    assert ecs_protection_mock.call_count == 2
+    first_call = ecs_protection_mock.call_args_list[0]
+    assert first_call[0] == (True, connection_row, function_name)
+    second_call = ecs_protection_mock.call_args_list[1]
+    assert second_call[0] == (False, connection_row, function_name)
+
+
+def test_crawl_task_regular_skips_ecs_protection(
+    mocker,
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+):
+    ecs_protection_mock = mocker.patch(
+        "celery_tasks.crawler.ecs_task_protection_request"
+    )
+    function_name = "get_warehouses"
+    start_time_str = "1971-01-01T00:00:00Z"
+    end_time_str = "1972-01-01T00:00:00Z"
+    page_token = None
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        function_name,
+        True,
+        start_time_str,
+        end_time_str,
+        page_token,
+    )
+    assert ecs_protection_mock.call_count == 0
+
+
+def test_enqueue_crawl_task_passes_connection_errors(mocker, connection_row, org_row):
+    mock_should_use_protected = mocker.patch(
+        "celery_tasks.crawler.should_use_protected_queue", return_value=False
+    )
+    mock_crawl_task = mocker.patch("celery_tasks.crawler.crawl_task")
+    mock_crawl_task.delay = mocker.Mock()
+
+    connection_errors = [
+        {"affected_endpoints": [{"endpoint": "GET /products", "preventing_sync": True}]}
+    ]
+
+    crawler.enqueue_crawl_task(
+        connection_row,
+        org_row,
+        "get_products",
+        False,
+        "start",
+        None,
+        None,
+        connection_errors=connection_errors,
+    )
+
+    mock_should_use_protected.assert_called_once_with(
+        connection_row, "get_products", "start", connection_errors
+    )
+
+
+def test_enqueue_crawl_task_without_connection_errors(mocker, connection_row, org_row):
+    mock_should_use_protected = mocker.patch(
+        "celery_tasks.crawler.should_use_protected_queue", return_value=False
+    )
+    mock_crawl_task = mocker.patch("celery_tasks.crawler.crawl_task")
+    mock_crawl_task.delay = mocker.Mock()
+
+    crawler.enqueue_crawl_task(
+        connection_row, org_row, "get_products", False, "start", None, None
+    )
+
+    mock_should_use_protected.assert_called_once_with(
+        connection_row, "get_products", "start", None
+    )
+
+
+@pytest.mark.parametrize(
+    "resource_class,resource_name",
+    [
+        (WarehouseCustomer, "warehouse_customers"),
+        (WarehouseLocation, "warehouse_locations"),
+    ],
+)
+def test_warehouse_resources_skip_notification(
+    resource_class, resource_name, mocker, integration
+):
+    """
+    verify warehouse_customers and warehouse_locations:
+    - send webhook
+    - do NOT send notification
+    - raise the exception
+    """
+    mock_webhook = mocker.patch("utils.celery.write_pickle_to_s3")
+    mock_notification = mocker.patch(
+        "utils.celery.NotificationService.send_notification"
+    )
+    mock_filter = mocker.patch("utils.celery.filter_out_not_updated_connection_errors")
+    mock_filter.return_value = [{"old_fields_and_values": None}]
+
+    # create resource with existing integration fixture
+    test_resource = resource_class(integration)
+
+    # create exception
+    exc = InvalidCredentialsException("Invalid API key", override=True)
+
+    # execute
+    with pytest.raises(InvalidCredentialsException):
+        handle_perm_cred_err(exc, test_resource, "GET")
+
+    # assert webhook was called
+    assert mock_webhook.called
+
+    # assert notification was NOT called
+    assert not mock_notification.called
+
+
+def test_updated_errors_skip_notification(mocker, resource):
+    """
+    verify that errors with old_fields_and_values (updated, not created):
+    - send webhook
+    - do NOT send notification (existing behavior)
+    """
+    mock_webhook = mocker.patch("utils.celery.write_pickle_to_s3")
+    mock_notification = mocker.patch(
+        "utils.celery.NotificationService.send_notification"
+    )
+    mock_filter = mocker.patch("utils.celery.filter_out_not_updated_connection_errors")
+
+    # old_fields_and_values present = this is an update, not a new error
+    mock_filter.return_value = [{"old_fields_and_values": {"some": "data"}}]
+
+    exc = InvalidCredentialsException("Invalid API key", override=True)
+
+    with pytest.raises(InvalidCredentialsException):
+        handle_perm_cred_err(exc, resource, "GET")
+
+    assert mock_webhook.called
+    assert not mock_notification.called
+
+
+def test_normal_resources_send_notification(mocker, resource):
+    """
+    verify normal resources (not warehouse_customers/warehouse_locations):
+    - send webhook
+    - DO send notification for new errors
+    """
+
+    mock_webhook = mocker.patch("utils.celery.write_pickle_to_s3")
+    mock_notification = mocker.spy(NotificationService, "send_notification")
+    mock_filter = mocker.patch("utils.celery.filter_out_not_updated_connection_errors")
+    mock_manifest = mocker.patch(
+        "builtins.open",
+        mocker.mock_open(
+            read_data='{"display_name": "Ongoing WMS", "installation_guide_url": "https://guide.example.com"}'
+        ),
+    )
+    mock_send_email_via_resend = mocker.patch(
+        "utils.celery.NotificationService._send_email_via_resend"
+    )
+    mock_get_active_subscribers = mocker.patch(
+        "utils.notifications.get_active_subscribers", return_value=["test@example.com"]
+    )
+
+    # new error (no old_fields_and_values)
+    mock_filter.return_value = [{"old_fields_and_values": None}]
+
+    exc = InvalidCredentialsException("Invalid API key", override=True)
+
+    with pytest.raises(InvalidCredentialsException):
+        handle_perm_cred_err(exc, resource, "GET")
+
+    # assert webhook was called
+    assert mock_webhook.called
+
+    # assert notification WAS called
+    assert mock_notification.called
+    call_args = mock_notification.call_args
+    assert call_args[0][0] == "test-org-id"  # org_id
+    assert mock_send_email_via_resend.called
+
+
+def test_notification_with_no_subscribers(mocker, resource):
+    """
+    verify notification sending handles no subscribers gracefully
+    """
+    mock_webhook = mocker.patch("utils.celery.write_pickle_to_s3")
+    mock_notification = mocker.spy(NotificationService, "send_notification")
+    mock_send_email_via_resend = mocker.patch(
+        "utils.celery.NotificationService._send_email_via_resend"
+    )
+    mock_filter = mocker.patch("utils.celery.filter_out_not_updated_connection_errors")
+    mocker.patch(
+        "builtins.open",
+        mocker.mock_open(
+            read_data='{"display_name": "Ongoing WMS", "installation_guide_url": "https://guide.example.com"}'
+        ),
+    )
+
+    # new error
+    mock_filter.return_value = [{"old_fields_and_values": None}]
+
+    # mock get_active_subscribers to return empty list
+    mocker.patch("utils.notifications.get_active_subscribers", return_value=[])
+
+    exc = InvalidCredentialsException("Invalid API key", override=True)
+
+    with pytest.raises(InvalidCredentialsException):
+        handle_perm_cred_err(exc, resource, "GET")
+
+    # assert webhook was called
+    assert mock_webhook.called
+
+    # assert notification was attempted but no emails sent (no subscribers)
+    assert mock_notification.called
+    assert not mock_send_email_via_resend.called
+
+
+def test_crawl_with_sync_job(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    mocker,
+    update_crawl_items_mock,
+):
+    """Test crawl with sync_job_id updates sync job table, not scheduler."""
+    sync_job_id = "sync-job-123"
+
+    mocker.patch("celery_tasks.crawler.get_sync_job").return_value = {
+        "id": sync_job_id,
+        "status": "open",
+    }
+
+    update_sync_job_mock = mocker.patch("celery_tasks.crawler.update_sync_job")
+    update_sync_job_mock.return_value = {
+        "Attributes": {
+            "submit": {"tasks_started": set(), "tasks_finished": set()},
+            "requested_start_time": "2024-01-01T00:00:00Z",
+            "requested_end_time": "2024-01-15T00:00:00Z",
+        }
+    }
+    mocker.patch("celery_tasks.crawler.should_sync_job_complete", return_value=False)
+
+    crawler.crawl_task_synced(
+        sync_job_id,
+        connection_row,
+        org_row,
+        "get_warehouses",
+        "2024-01-01T00:00:00Z",
+        "2024-01-15T00:00:00Z",
+        no_heartbeat=True,
+    )
+
+    # sync job table should be updated
+    assert update_sync_job_mock.call_count >= 1
+    call_args_list = [call[0] for call in update_sync_job_mock.call_args_list]
+    sync_job_ids_updated = [args[0] for args in call_args_list]
+    assert sync_job_id in sync_job_ids_updated
+
+    # scheduler table should NOT be updated for start/end times
+    update_crawl_items_mock.assert_not_called
+
+
+def test_crawl_sync_job_cancelled(connection_row, org_row, mocker, get_and_submit_mock):
+    """Test crawl exits early if sync job is cancelled."""
+    sync_job_id = "sync-job-cancelled"
+
+    mocker.patch("celery_tasks.crawler.get_sync_job").return_value = {
+        "id": sync_job_id,
+        "status": "cancelled",
+    }
+
+    update_sync_job_mock = mocker.patch("celery_tasks.crawler.update_sync_job")
+
+    crawler.crawl_task_synced(
+        sync_job_id,
+        connection_row,
+        org_row,
+        "get_warehouses",
+        "2024-01-01T00:00:00Z",
+        "2024-01-15T00:00:00Z",
+        no_heartbeat=True,
+    )
+
+    # should not proceed with crawl
+    get_and_submit_mock.assert_not_called()
+    # should not update sync job (exited early)
+    update_sync_job_mock.assert_not_called()
+
+
+def test_crawl_sync_job_completion(
+    connection_row, org_row, get_and_submit_mock, resource, mocker
+):
+    """Test sync job marked completed when should_sync_job_complete returns True."""
+    sync_job_id = "sync-job-complete"
+
+    mocker.patch("celery_tasks.crawler.get_sync_job").return_value = {
+        "id": sync_job_id,
+        "status": "open",
+    }
+
+    update_sync_job_mock = mocker.patch("celery_tasks.crawler.update_sync_job")
+    update_sync_job_mock.return_value = {
+        "Attributes": {
+            "submit": {
+                "tasks_started": {"task1"},
+                "tasks_finished": {"task1"},
+                "mark_complete": True,
+            },
+            "function_name": "get_warehouses",
+            "requested_start_time": "2024-01-01T00:00:00Z",
+            "requested_end_time": "2024-01-15T00:00:00Z",
+        }
+    }
+    # the completion write itself goes through the submitter, which resolves
+    # update_sync_job in its own namespace
+    complete_mock = mocker.patch("lambda_handlers.submitter.update_sync_job")
+    mocker.patch("celery_tasks.crawler.should_sync_job_complete", return_value=True)
+
+    crawler.crawl_task_synced(
+        sync_job_id,
+        connection_row,
+        org_row,
+        "get_warehouses",
+        "2024-01-01T00:00:00Z",
+        "2024-01-15T00:00:00Z",
+        no_heartbeat=True,
+    )
+
+    # verify status updated to completed
+    status_update_found = False
+    for call in complete_mock.call_args_list:
+        if call[0][0] == sync_job_id:
+            update_dict = call[0][1]
+            if update_dict.get("status") == "completed":
+                status_update_found = True
+                break
+
+    assert status_update_found, "Sync job should be marked as completed"
+
+
+# file archiving tests (unified flow for carrier + wms/sftp)
+
+
+@pytest.fixture
+def carrier_integration(mocker, org_id):
+    import integrations.carrier.fedex.integration
+
+    integration = integrations.carrier.fedex.integration.Integration(
+        connection_id="test-carrier-connection-id",
+        org_id=org_id,
+        integration_secret={"api_key": "test-key"},
+    )
+    invoice_mock = mocker.patch.object(integration, "get_invoice_line_items")
+    invoice_mock.__name__ = "get_invoice_line_items"
+    return integration
+
+
+@pytest.fixture
+def carrier_resource(carrier_integration):
+    from resources import InvoiceLineItem
+
+    return InvoiceLineItem(carrier_integration)
+
+
+def test_carrier_archives_file_per_page(
+    mocker,
+    carrier_resource,
+    get_all_resources_mock,
+    s3_write_mock,
+):
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+    mocker.patch("celery_tasks.crawler.random.random", return_value=1)
+    get_all_resources_mock.return_value = []
+
+    staged_prefix = "fedex/conn-123/staging/2025-01-15/crawl-abc"
+    data = [{"id": "test"}]
+    carrier_resource.integration.get_invoice_line_items.return_value = {
+        "data": data,
+        "next_token": None,
+        "file_to_archive": staged_prefix,
+    }
+    mock_schema = mocker.Mock()
+    mock_schema.load.return_value = {"data": data, "next_token": None}
+    mocker.patch.object(carrier_resource, "crawl_schema", return_value=mock_schema)
+
+    mock_update_crawl = mocker.patch("celery_tasks.crawler.update_crawl_items")
+    mock_archive = mocker.patch.object(
+        carrier_resource.integration, "archive_staged_files"
+    )
+    carrier_resource.validate_crawl = mocker.Mock()
+
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+
+    crawler.get_and_submit(
+        carrier_resource, start_time_dt, end_time_dt, False, True, "default", False
+    )
+
+    # non-empty data archives this page's files now, so an interrupted crawl keeps them
+    mock_archive.assert_called_once_with(staged_prefix)
+    mock_update_crawl.assert_not_called()
+
+
+def test_file_to_archive_not_called_on_dry_run(
+    mocker,
+    carrier_resource,
+    get_all_resources_mock,
+    s3_write_mock,
+):
+    mocker.patch("celery_tasks.crawler.DRY_RUN", True)
+    mocker.patch("celery_tasks.crawler.random.random", return_value=1)
+    get_all_resources_mock.return_value = []
+
+    carrier_resource.integration.get_invoice_line_items.return_value = {
+        "data": [],
+        "next_token": None,
+        "file_to_archive": "fedex/conn-123/staging/2025-01-15/crawl-abc",
+    }
+
+    mock_archive = mocker.patch.object(
+        carrier_resource.integration, "archive_staged_files"
+    )
+    carrier_resource.validate_crawl = mocker.Mock()
+
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+
+    crawler.get_and_submit(
+        carrier_resource, start_time_dt, end_time_dt, False, True, "default", False
+    )
+
+    mock_archive.assert_not_called()
+
+
+def test_carrier_cleanup_staged_on_dry_run(
+    mocker,
+    carrier_resource,
+    get_all_resources_mock,
+    s3_write_mock,
+):
+    mocker.patch("celery_tasks.crawler.DRY_RUN", True)
+    mocker.patch("celery_tasks.crawler.SKIP_FILE_CLEANUP", False)
+    mocker.patch("celery_tasks.crawler.random.random", return_value=1)
+    get_all_resources_mock.return_value = []
+
+    s3_prefix = "fedex/conn-123/staging/2025-01-15/crawl-abc"
+    carrier_resource.integration.get_invoice_line_items.return_value = {
+        "data": [],
+        "next_token": None,
+        "file_to_archive": s3_prefix,
+    }
+
+    mock_cleanup = mocker.patch.object(
+        carrier_resource.integration, "cleanup_staged_files"
+    )
+    mock_archive = mocker.patch.object(
+        carrier_resource.integration, "archive_staged_files"
+    )
+    carrier_resource.validate_crawl = mocker.Mock()
+
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+
+    crawler.get_and_submit(
+        carrier_resource, start_time_dt, end_time_dt, False, True, "default", False
+    )
+
+    # dry run should clean up staged files to prevent reprocessing
+    mock_cleanup.assert_called()
+    mock_archive.assert_not_called()
+
+
+def test_carrier_cleanup_empty_data_with_files(
+    mocker,
+    carrier_resource,
+    get_all_resources_mock,
+    s3_write_mock,
+):
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+    mocker.patch("celery_tasks.crawler.random.random", return_value=1)
+    get_all_resources_mock.return_value = []
+
+    s3_prefix = "fedex/conn-123/staging/2025-01-15/crawl-abc"
+    carrier_resource.integration.get_invoice_line_items.return_value = {
+        "data": [],  # empty data
+        "next_token": None,
+        "file_to_archive": s3_prefix,
+    }
+
+    mock_cleanup = mocker.patch.object(
+        carrier_resource.integration, "cleanup_staged_files"
+    )
+    carrier_resource.validate_crawl = mocker.Mock()
+
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+
+    crawler.get_and_submit(
+        carrier_resource, start_time_dt, end_time_dt, False, True, "default", False
+    )
+
+    # empty data should always trigger cleanup regardless of skip flag
+    mock_cleanup.assert_called()
+
+
+def test_crawl_path_enqueues_linked_refresh(
+    store_crawl_params_connection_row,
+    org_row,
+    store_crawl_params_resource,
+    now_mock,
+    update_crawl_items_mock,
+    mocker,
+):
+    # enqueue-only contract: an incremental child crawl whose pages carry a linked
+    # FK enqueues exactly one linked-refresh with deduped sorted str ids + the
+    # trimmed child. first crawls skip it (see test below).
+    mocker.patch.object(
+        type(store_crawl_params_resource),
+        "linked_resource_key",
+        "sales_order_id",
+        create=True,
+    )
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+
+    def get_and_submit_side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        if first_loop:
+            rows = [{"sales_order_id": "SO2"}, {"sales_order_id": "SO1"}]
+            return {"next_token": 1, "data": rows}, {}, {"t1"}
+        return {"next_token": None, "data": [{"sales_order_id": "SO1"}]}, {}, {"t2"}
+
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit", side_effect=get_and_submit_side_effect
+    )
+    mock_enqueue = mocker.patch("celery_tasks.crawler.write_pickle_to_s3")
+
+    crawler.crawl_task(
+        store_crawl_params_connection_row, org_row, "get_bills", False, None, None, None
+    )
+
+    linked_calls = [
+        c for c in mock_enqueue.call_args_list if c.args[0] == "linked-refresh"
+    ]
+    assert len(linked_calls) == 1
+    _task, payload, source = linked_calls[0].args
+    assert source == "linked_refresh"
+    assert sorted(payload["data"]) == ["SO1", "SO2"]
+    assert payload["resource"].name() == store_crawl_params_resource.name()
+    assert payload["resource"].integration.integration_secret is not None
+    assert set(payload) >= {"resource", "data", "start", "end", "tracking_id"}
+
+
+def test_first_crawl_skips_linked_refresh(
+    store_crawl_params_connection_row,
+    org_row,
+    store_crawl_params_resource,
+    now_mock,
+    update_crawl_items_mock,
+    mocker,
+):
+    # first crawls pull every parent via its own backfill, so a child's linked FKs
+    # must not enqueue the linked-refresh fan-out.
+    mocker.patch.object(
+        type(store_crawl_params_resource),
+        "linked_resource_key",
+        "sales_order_id",
+        create=True,
+    )
+    mocker.patch("celery_tasks.crawler.DRY_RUN", False)
+
+    def get_and_submit_side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        if first_loop:
+            rows = [{"sales_order_id": "SO2"}, {"sales_order_id": "SO1"}]
+            return {"next_token": 1, "data": rows}, {}, {"t1"}
+        return {"next_token": None, "data": [{"sales_order_id": "SO1"}]}, {}, {"t2"}
+
+    mocker.patch(
+        "celery_tasks.crawler.get_and_submit", side_effect=get_and_submit_side_effect
+    )
+    mock_enqueue = mocker.patch("celery_tasks.crawler.write_pickle_to_s3")
+
+    crawler.crawl_task(
+        store_crawl_params_connection_row, org_row, "get_bills", True, None, None, None
+    )
+
+    linked_calls = [
+        c for c in mock_enqueue.call_args_list if c.args[0] == "linked-refresh"
+    ]
+    assert not linked_calls
+
+
+def test_crawl_tail_uses_the_latest_data_override(
+    connection_row,
+    org_row,
+    resource,
+    now_mock,
+    update_crawl_items_mock,
+    mocker,
+):
+    # when the crawler beats the submitter to the last finished task it still has to
+    # write latest_data_override, not the crawl end, or the gap between them is skipped
+    override = "1999-06-01T00:00:00Z"
+
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        if first_loop:
+            return {"next_token": 1, "data": []}, {}, {"submit_task_id_1"}
+        page = {"next_token": None, "data": [], "latest_data_override": override}
+        return page, {}, {"submit_task_id_2"}
+
+    mocker.patch("celery_tasks.crawler.get_and_submit", side_effect=side_effect)
+    mocker.patch("celery_tasks.crawler.should_update_latest_data", return_value=True)
+    mocker.patch("lambda_handlers.submitter.conclude_investigation")
+    advance_mock = mocker.patch("lambda_handlers.submitter.update_crawl_items")
+
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        "1971-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+        None,
+    )
+
+    advance_mock.assert_called_once()
+    assert advance_mock.call_args[0][2]["latest_data"] == override
+
+
+def test_windowed_crawl_advances_start_and_latest_data_each_window(
+    store_crawl_params_connection_row,
+    org_row,
+    store_crawl_params_resource,
+    now_mock,
+    update_crawl_items_mock,
+    mocker,
+):
+    # a window that ends early advances latest_data to its own end and the crawl keeps
+    # going from there, instead of the integration hiding the rest of the range in a token
+    start_time_str = "2019-12-01T00:00:00Z"
+    end_time_str = dt_to_str(now_mock.return_value)
+    next_start = str_to_dt("2019-12-16T00:00:00Z")
+    starts_seen = []
+
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        starts_seen.append(start)
+        if first_loop:
+            page = {"next_token": None, "data": [], "next_start": next_start}
+            return page, {}, {"submit_task_id_1"}
+        return {"next_token": None, "data": []}, {}, {"submit_task_id_2"}
+
+    mocker.patch("celery_tasks.crawler.get_and_submit", side_effect=side_effect)
+    wait_mock = mocker.patch("celery_tasks.crawler.wait_for_submit_drain")
+
+    crawler.crawl_task(
+        store_crawl_params_connection_row,
+        org_row,
+        "get_bills",
+        False,
+        start_time_str,
+        end_time_str,
+        None,
+    )
+
+    integration = store_crawl_params_resource.integration
+    overlap = timedelta(minutes=integration.crawl_start_overlap_minutes)
+    assert starts_seen == [
+        str_to_dt(start_time_str) - overlap,
+        next_start,
+    ]
+    wait_mock.assert_called_once_with(
+        store_crawl_params_connection_row["id"],
+        "get_bills",
+        dt_to_str(next_start),
+        sync_job_id=None,
+    )
+
+    window_calls = []
+    final_calls = []
+    for call_elem in update_crawl_items_mock.call_args_list:
+        submit = call_elem[0][2].get("submit", {})
+        if submit.get("set_latest_data") == dt_to_str(next_start):
+            window_calls.append(call_elem[0][2])
+        elif submit.get("set_latest_data") == end_time_str:
+            final_calls.append(call_elem[0][2])
+
+    assert len(window_calls) == 1
+    window_update = window_calls[0]
+    assert window_update["submit"]["mark_complete"] is False
+    # the end is pinned here, but the start only moves once the rows have landed, so
+    # the crawler must not write it alongside the arm
+    assert "current_crawl_start" not in window_update
+    assert window_update["current_crawl_end"] == end_time_str
+    # the window is fully drained, so there is no in-window token to resume from
+    assert window_update["latest_page_token"] is None
+
+    assert len(final_calls) == 1
+    assert final_calls[0]["submit"]["mark_complete"] is True
+
+
+def test_next_start_inside_the_overlap_moves_the_window_and_latest_data(
+    store_crawl_params_connection_row,
+    org_row,
+    store_crawl_params_resource,
+    now_mock,
+    update_crawl_items_mock,
+    mocker,
+):
+    start_time_str = "2019-12-01T00:00:00Z"
+    end_time_str = dt_to_str(now_mock.return_value)
+    integration = store_crawl_params_resource.integration
+    overlap = timedelta(minutes=integration.crawl_start_overlap_minutes)
+    start_time_dt = str_to_dt(start_time_str) - overlap
+    next_start = start_time_dt + overlap / 2
+    starts_seen = []
+
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        starts_seen.append(start)
+        if first_loop:
+            page = {"next_token": None, "data": [], "next_start": next_start}
+            return page, {}, {"submit_task_id_1"}
+        return {"next_token": None, "data": []}, {}, {"submit_task_id_2"}
+
+    mocker.patch("celery_tasks.crawler.get_and_submit", side_effect=side_effect)
+    wait_mock = mocker.patch("celery_tasks.crawler.wait_for_submit_drain")
+
+    crawler.crawl_task(
+        store_crawl_params_connection_row,
+        org_row,
+        "get_bills",
+        False,
+        start_time_str,
+        end_time_str,
+        None,
+    )
+
+    assert starts_seen == [start_time_dt, next_start]
+    wait_mock.assert_called_once_with(
+        store_crawl_params_connection_row["id"],
+        "get_bills",
+        dt_to_str(next_start),
+        sync_job_id=None,
+    )
+    latest_data_writes = []
+    for call_elem in update_crawl_items_mock.call_args_list:
+        submit = call_elem[0][2].get("submit", {})
+        if "set_latest_data" in submit:
+            latest_data_writes.append(submit["set_latest_data"])
+    # latest_data can step back into the overlap, since that is how far this crawl got
+    assert latest_data_writes == [dt_to_str(next_start), end_time_str]
+
+
+def test_windowed_crawl_rejects_next_start_past_the_crawl_end(
+    store_crawl_params_connection_row,
+    org_row,
+    now_mock,
+    mocker,
+):
+    # a window that claims more than the crawl asked for would skip data
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        page = {
+            "next_token": None,
+            "data": [],
+            "next_start": str_to_dt("2020-06-01T00:00:00Z"),
+        }
+        return page, {}, {"submit_task_id_1"}
+
+    mocker.patch("celery_tasks.crawler.get_and_submit", side_effect=side_effect)
+
+    with pytest.raises(PokedexException, match="not inside the remaining crawl range"):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            False,
+            "2019-12-01T00:00:00Z",
+            dt_to_str(now_mock.return_value),
+            None,
+        )
+
+
+def test_wait_for_submit_drain_advances_when_the_submitter_missed_it(mocker):
+    # the last submitter can finish before latest_data is armed, so the crawler has to
+    # be able to write it itself or the window would never finish
+    next_start = "2019-12-16T00:00:00Z"
+    crawl_item = {
+        "connection_id": "test-connection-id",
+        "function_name": "get_bills",
+        "submit": {
+            "tasks_started": {"submit_task_id_1"},
+            "tasks_finished": {"submit_task_id_1"},
+            "set_latest_data": next_start,
+        },
+    }
+    # one row and a mocked sleep, so a barrier that stops writing fails the test
+    # instead of spinning until CI gives up
+    mocker.patch("celery_tasks.crawler.get_scheduler_row", side_effect=[crawl_item])
+    mocker.patch("celery_tasks.crawler.sleep")
+    advance_mock = mocker.patch("celery_tasks.crawler.advance_latest_data")
+
+    crawler.wait_for_submit_drain("test-connection-id", "get_bills", next_start)
+
+    advance_mock.assert_called_once_with("test-connection-id", "get_bills", crawl_item)
+
+
+def test_wait_for_submit_drain_raises_when_submit_never_drains(mocker, now_mock):
+    next_start = "2019-12-16T00:00:00Z"
+    crawl_item = {
+        "submit": {
+            "tasks_started": {"submit_task_id_1"},
+            "tasks_finished": {""},
+        },
+    }
+    mocker.patch("celery_tasks.crawler.get_scheduler_row", return_value=crawl_item)
+    mocker.patch("celery_tasks.crawler.sleep")
+    start = str_to_dt("2020-01-01T00:00:00Z")
+    now_mock.side_effect = [
+        start,
+        start,
+        start + timedelta(seconds=SUBMIT_DRAIN_TIMEOUT + 1),
+    ]
+
+    with pytest.raises(PokedexException, match="did not drain through"):
+        crawler.wait_for_submit_drain("test-connection-id", "get_bills", next_start)
+
+
+def test_wait_for_submit_drain_returns_once_the_row_drains(mocker, now_mock):
+    # the barrier waits on started == finished flipping as the submitters land, which
+    # is the transition the crawl actually blocks on between windows
+    next_start = "2019-12-16T00:00:00Z"
+    undrained = {
+        "submit": {
+            "tasks_started": {"submit_task_id_1"},
+            "tasks_finished": {""},
+            "set_latest_data": next_start,
+        },
+    }
+    drained = {
+        "submit": {
+            "tasks_started": {"submit_task_id_1"},
+            "tasks_finished": {"submit_task_id_1"},
+            "set_latest_data": next_start,
+        },
+    }
+    row_mock = mocker.patch(
+        "celery_tasks.crawler.get_scheduler_row", side_effect=[undrained, drained]
+    )
+    sleep_mock = mocker.patch("celery_tasks.crawler.sleep")
+    advance_mock = mocker.patch("celery_tasks.crawler.advance_latest_data")
+
+    crawler.wait_for_submit_drain("test-connection-id", "get_bills", next_start)
+
+    assert row_mock.call_count == 2
+    sleep_mock.assert_called_once_with(SUBMIT_DRAIN_POLL)
+    advance_mock.assert_called_once_with("test-connection-id", "get_bills", drained)
+
+
+def test_wait_for_submit_drain_accepts_the_submitters_own_write(mocker, now_mock):
+    # the submitter usually gets there first and resets submit as it writes
+    # latest_data, so the barrier is done as soon as latest_data reaches the window
+    next_start = "2019-12-16T00:00:00Z"
+    already_written = {
+        "latest_data": next_start,
+        "submit": {"tasks_started": {""}, "tasks_finished": {""}},
+    }
+    mocker.patch(
+        "celery_tasks.crawler.get_scheduler_row", side_effect=[already_written]
+    )
+    mocker.patch("celery_tasks.crawler.sleep")
+    advance_mock = mocker.patch("celery_tasks.crawler.advance_latest_data")
+
+    crawler.wait_for_submit_drain("test-connection-id", "get_bills", next_start)
+
+    advance_mock.assert_not_called()
+
+
+def test_resumed_first_crawl_keeps_its_place(
+    store_crawl_params_connection_row,
+    org_row,
+    store_crawl_params_resource,
+    now_mock,
+    get_and_submit_mock,
+    mocker,
+):
+    # a backfill that advanced its start and then died comes back as a first crawl with
+    # a start to resume from. rewinding it to the lookback would redo every finished window
+    resumed_start = "2019-12-16T00:00:00Z"
+
+    crawler.crawl_task(
+        store_crawl_params_connection_row,
+        org_row,
+        "get_bills",
+        True,
+        resumed_start,
+        dt_to_str(now_mock.return_value),
+        None,
+    )
+
+    integration = store_crawl_params_resource.integration
+    overlap = timedelta(minutes=integration.crawl_start_overlap_minutes)
+    first_call_args = get_and_submit_mock.call_args_list[0][0]
+    assert first_call_args[1] == str_to_dt(resumed_start) - overlap
+
+
+def test_fresh_first_crawl_still_starts_at_the_lookback(
+    store_crawl_params_connection_row,
+    org_row,
+    store_crawl_params_resource,
+    now_mock,
+    get_and_submit_mock,
+    mocker,
+):
+    crawler.crawl_task(
+        store_crawl_params_connection_row,
+        org_row,
+        "get_bills",
+        True,
+        None,
+        None,
+        None,
+    )
+
+    integration = store_crawl_params_resource.integration
+    created_at = str_to_dt(store_crawl_params_connection_row["created_at"])
+    expected_start = created_at - timedelta(
+        days=30, minutes=integration.crawl_start_overlap_minutes
+    )
+    first_call_args = get_and_submit_mock.call_args_list[0][0]
+    assert first_call_args[1] == expected_start
+
+
+def test_next_start_on_the_crawl_end_finishes_instead_of_asking_again(
+    store_crawl_params_connection_row,
+    org_row,
+    now_mock,
+    update_crawl_items_mock,
+    mocker,
+):
+    # a window landing exactly on the end has covered the range, so coming back would
+    # only query a zero-width one
+    end_time_str = dt_to_str(now_mock.return_value)
+    calls = []
+
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        calls.append(start)
+        page = {"next_token": None, "data": [], "next_start": now_mock.return_value}
+        return page, {}, {"submit_task_id_1"}
+
+    mocker.patch("celery_tasks.crawler.get_and_submit", side_effect=side_effect)
+    drain_mock = mocker.patch("celery_tasks.crawler.wait_for_submit_drain")
+
+    crawler.crawl_task(
+        store_crawl_params_connection_row,
+        org_row,
+        "get_bills",
+        False,
+        "2019-12-01T00:00:00Z",
+        end_time_str,
+        None,
+    )
+
+    assert len(calls) == 1
+    drain_mock.assert_not_called()
+    final_call = update_crawl_items_mock.call_args_list[-2][0][2]
+    assert final_call["submit"]["set_latest_data"] == end_time_str
+    assert final_call["submit"]["mark_complete"] is True
+
+
+def test_next_start_needs_somewhere_to_record_the_resume_point(integration):
+    # without the crawl params there is nothing on the row saying how far a resumed
+    # crawl got, so it would restart the range every time
+    resource = Warehouse(integration)
+    assert not resource.store_current_crawl_params()
+
+    with pytest.raises(AssertionError, match="store_current_crawl_params"):
+        resource.validate_crawl(
+            {
+                "data": [],
+                "next_token": None,
+                "next_start": str_to_dt("2019-12-16T00:00:00Z"),
+            }
+        )
+
+
+def test_a_repeated_next_start_stops_the_crawl(
+    store_crawl_params_connection_row,
+    org_row,
+    now_mock,
+    mocker,
+):
+    # the same start twice means the integration is not moving, the same way a page
+    # token that does not change means pagination is stuck
+    next_start = str_to_dt("2019-12-16T00:00:00Z")
+
+    def side_effect(
+        resource,
+        start,
+        end,
+        first_crawl,
+        first_loop,
+        page_token,
+        local_submit,
+        sync_job_id=None,
+        notify_force_sync=False,
+    ):
+        page = {"next_token": None, "data": [], "next_start": next_start}
+        return page, {}, {"submit_task_id_1"}
+
+    mocker.patch("celery_tasks.crawler.get_and_submit", side_effect=side_effect)
+    mocker.patch("celery_tasks.crawler.wait_for_submit_drain")
+
+    with pytest.raises(PokedexException, match="next_start did not change"):
+        crawler.crawl_task(
+            store_crawl_params_connection_row,
+            org_row,
+            "get_bills",
+            False,
+            "2019-12-01T00:00:00Z",
+            dt_to_str(now_mock.return_value),
+            None,
+        )
+
+
+def test_next_start_must_be_a_datetime(integration, mocker):
+    # the crawler compares it against the crawl end and stores it as the resume point,
+    # so a string would only fail deeper in
+    resource = Warehouse(integration)
+    mocker.patch.object(type(resource), "store_current_crawl_params", return_value=True)
+
+    with pytest.raises(AssertionError, match="must be a datetime"):
+        resource.validate_crawl(
+            {
+                "data": [],
+                "next_token": None,
+                "next_start": "2019-12-16T00:00:00Z",
+            }
+        )
+
+
+def test_enqueue_stamps_the_message_with_when_it_was_queued(
+    connection_row, org_row, now_mock, mocker
+):
+    mocker.patch("celery_tasks.crawler.should_use_protected_queue", return_value=False)
+    apply_async_mock = mocker.patch.object(crawler.crawl_task, "apply_async")
+    crawler.enqueue_crawl_task(
+        connection_row, org_row, "get_warehouses", False, None, None, None
+    )
+    apply_async_mock.assert_called_once()
+    assert apply_async_mock.call_args.kwargs["headers"] == {
+        "enqueued_at": dt_to_str(now_mock.return_value)
+    }
+
+
+def test_message_enqueued_at_reads_worker_and_eager_requests():
+    assert (
+        crawler.message_enqueued_at(Context({"enqueued_at": "2020-01-01T00:00:00Z"}))
+        == "2020-01-01T00:00:00Z"
+    )
+    assert (
+        crawler.message_enqueued_at(
+            Context({"headers": {"enqueued_at": "2020-01-02T00:00:00Z"}})
+        )
+        == "2020-01-02T00:00:00Z"
+    )
+    assert crawler.message_enqueued_at(Context({})) is None
+
+
+@pytest.mark.parametrize("resuming, overlapped", [(False, True), (True, False)])
+def test_only_a_fresh_crawl_moves_its_start_back_by_the_overlap(
+    connection_row,
+    org_row,
+    get_and_submit_mock,
+    resource,
+    now_mock,
+    resuming,
+    overlapped,
+):
+    # a resume restarts from where the crawl stopped. overlapping it again would push
+    # the start, and latest_data, back one overlap every time the crawl dies
+    start_time_str = "1971-01-01T00:00:00Z"
+    crawler.crawl_task(
+        connection_row,
+        org_row,
+        "get_warehouses",
+        False,
+        start_time_str,
+        "2000-01-01T00:00:00Z",
+        None,
+        resuming=resuming,
+    )
+    expected_start = str_to_dt(start_time_str)
+    if overlapped:
+        expected_start -= timedelta(
+            minutes=resource.integration.crawl_start_overlap_minutes
+        )
+    assert get_and_submit_mock.call_args_list[0][0][1] == expected_start
+
+
+@pytest.mark.parametrize(
+    "row, superseded",
+    [
+        # a crawl started after this copy was queued and finished: nothing left to do
+        (
+            {
+                "last_crawl_start": "2020-01-01T02:00:00Z",
+                "last_crawl_end": "2020-01-01T03:00:00Z",
+            },
+            True,
+        ),
+        # the copy is its own message back after the visibility timeout, and the
+        # crawl started in the same second it was queued
+        (
+            {
+                "last_crawl_start": "2020-01-01T01:00:00Z",
+                "last_crawl_end": "2020-01-01T06:00:00Z",
+            },
+            True,
+        ),
+        # the later crawl is still running: the heartbeat guard owns that case
+        (
+            {
+                "last_crawl_start": "2020-01-01T02:00:00Z",
+                "last_crawl_end": "2020-01-01T00:30:00Z",
+            },
+            False,
+        ),
+        # the last finished crawl predates this copy, so it is the real next run
+        (
+            {
+                "last_crawl_start": "2019-12-31T22:00:00Z",
+                "last_crawl_end": "2019-12-31T23:00:00Z",
+            },
+            False,
+        ),
+        ({"last_crawl_end": "2020-01-01T03:00:00Z"}, False),
+        ({}, False),
+    ],
+)
+def test_crawl_superseded(row, superseded):
+    assert crawler.crawl_superseded("2020-01-01T01:00:00Z", row) is superseded
+
+
+def test_crawl_superseded_without_an_enqueue_time_never_skips():
+    row = {
+        "last_crawl_start": "2020-01-01T02:00:00Z",
+        "last_crawl_end": "2020-01-01T03:00:00Z",
+    }
+    assert crawler.crawl_superseded(None, row) is False
+
+
+def test_redelivered_crawl_skips_once_a_later_crawl_has_finished(
+    connection_row, org_row, get_and_submit_mock, resource, now_mock, mocker
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_scheduler_row",
+        return_value={
+            "last_crawl_start": "2019-12-31T02:00:00Z",
+            "last_crawl_end": "2019-12-31T03:00:00Z",
+        },
+    )
+    crawler.crawl_task.apply(
+        args=[
+            connection_row,
+            org_row,
+            "get_warehouses",
+            False,
+            "1971-01-01T00:00:00Z",
+            "2000-01-01T00:00:00Z",
+            None,
+        ],
+        headers={"enqueued_at": "2019-12-31T01:00:00Z"},
+    )
+    get_and_submit_mock.assert_not_called()
+
+
+def test_redelivered_crawl_runs_when_nothing_ran_since(
+    connection_row, org_row, get_and_submit_mock, resource, now_mock, mocker
+):
+    mocker.patch(
+        "celery_tasks.crawler.get_scheduler_row",
+        return_value={
+            "last_crawl_start": "2019-12-30T02:00:00Z",
+            "last_crawl_end": "2019-12-30T03:00:00Z",
+        },
+    )
+    crawler.crawl_task.apply(
+        args=[
+            connection_row,
+            org_row,
+            "get_warehouses",
+            False,
+            "1971-01-01T00:00:00Z",
+            "2000-01-01T00:00:00Z",
+            None,
+        ],
+        headers={"enqueued_at": "2019-12-31T01:00:00Z"},
+    )
+    assert get_and_submit_mock.call_count >= 1
+
+
+def test_get_and_submit_inherit_keeps_stored_preventing_sync(
+    mocker,
+    resource,
+    get_all_resources_mock,
+    clear_connection_error_mock,
+    store_connection_error_mock,
+    s3_write_mock,
+):
+    # a sibling aborted on /inventory and marked this endpoint blocked; a crawl
+    # that only read inventory never called the url, so it must not clear that
+    start_time_dt = str_to_dt("2000-01-01T00:00:00Z")
+    end_time_dt = str_to_dt("2000-01-02T00:00:00Z")
+    integration = resource.integration
+    get_all_resources_mock.return_value = [
+        {
+            "affected_endpoints": [
+                {"endpoint": "GET /wms/inventory", "preventing_sync": True},
+                {"endpoint": "GET /wms/warehouses", "preventing_sync": True},
+            ],
+            "failed_url": "/inventory",
+        },
+    ]
+    integration.get_warehouses.return_value = {
+        "data": [],
+        "next_token": None,
+        "api_call_made": False,
+    }
+    integration.resources_queried.add(InventoryItem)
+    resource.validate_crawl = mocker.Mock()
+    crawler.get_and_submit(
+        resource, start_time_dt, end_time_dt, True, True, "next_token", False
+    )
+
+    clear_connection_error_mock.assert_not_called()
+    store_connection_error_mock.assert_called_once()
+    store_call = store_connection_error_mock.call_args_list[0][0]
+    assert store_call[3] == "/inventory"
+    assert store_call[5] == "GET /wms/warehouses"
+    assert store_call[6] == True

@@ -1,0 +1,9 @@
+± |claude/practical-maxwell-tff3cy U:1 ✗| → brew upgrade
+==> Downloading Homebrew API data
+✔︎ JSON API packages.arm64_tahoe.jws.json                                                                                                                                                 Downloaded   15.6MB/ 15.6MB
+
+ 2026-10-05 17:06:27 ⌚  Harshas-M4-Air in ~/workspace/snapfulfil
+± |claude/practical-maxwell-tff3cy U:1 ✗| → uv run python3
+dyld[98759]: Library not loaded: /opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Python
+  Referenced from: <B6BDD523-0AF7-38E2-A36A-5EDB41166F76> /Users/harshanandiwada/workspace/snapfulfil/.venv/bin/python3
+  Reason: tried: '/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Python' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Python' (no such file), '/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Python' (no such file)

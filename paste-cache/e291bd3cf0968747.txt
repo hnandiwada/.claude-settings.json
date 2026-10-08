@@ -1,0 +1,33 @@
+get_receipts_from_received_quantity in pokedex utils/utils.py
+reconciles an inbound shipment's received quantities against the
+receipts already stored on it. Receipts written before the WMS
+started reporting lots have lot_id and expiration_date of None,
+so their keys never match the lotted keys coming in now. The
+diff is computed per (inventory_item_id, lot_id,
+expiration_date), so nothing matches and receipt_line_items
+currently re-receives everything ever received on this shipment.
+That's why it stopped here rather than appending it.
+                                                                 
+I'm at a breakpoint right before the raise. Work out, per
+inventory_item_id, which lot the previously received quantity
+belongs to. Then give me commands that backfill lot_id and
+expiration_date on the stored lines and cut receipt_line_items
+down to the genuine delta. Mutate previous_receipts in place,
+since the caller holds that same list object. Plain rebinding
+is fine for everything else. Finish by setting
+new_rli_has_lot_and_inv = False so I can continue past the
+raise.
+                                                                 
+Output the commands bare, with no (Pdb) prefix, so I can paste
+them straight in. Write the mutations as plain assignments in a
+single-line for loop (flatten to a list of line items first if
+you need to), not dict.__setitem__ inside a comprehension.
+                                                                 
+Only give me changes that are provably correct from the data.
+Attribution is safe when an item's stored total already equals
+its new total, or when the item has only one lot in the new
+data. Where an item is split across two or more lots and has
+un-lotted history that doesn't fully cover it, say so and tell
+me what you'd need to settle it: don't guess and don't invent a
+tiebreak rule. Quantities matter more than lot labels, so never
+produce a total that disagrees with new_received_by_key.

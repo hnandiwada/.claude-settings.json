@@ -1,0 +1,175 @@
+# Templates — PR body + mapping comment
+
+[`workflows/create.md`](../workflows/create.md) builds from these templates and [`workflows/refresh.md`](../workflows/refresh.md) parses and patches them. Refresh mode matches the structural anchors below character for character, and open PRs already carry them. Never change an anchor; doing so is a MAJOR version bump (see [CHANGELOG.md](../CHANGELOG.md)).
+
+---
+
+## Pokedex PR body
+
+The title grammar is in [create.md step 7](../workflows/create.md#7-open-the-pr).
+
+### Canonical section order
+
+```markdown
+## Summary
+- Integration: {name} ({type})
+- Source context: {Linear ticket URL / Slack thread / paste — whatever the user provided}
+- Methods implemented: {list}
+- Mode: new-integration | add-function
+- Gotchas: {`included in this PR` if create step 5 staged a commit; `none surfaced` if file clean; omit line entirely otherwise}
+
+## Validation status
+- `yarn test -k {name}`: {N passed / M failed / K skipped}
+- Live `yarn crawl` coverage: {summary — e.g. "100 orders observed, all BLOCKED state; shipped-state path unvalidated"}
+- All APPROVE_WITH_NOTES advisories from per-function reviews are listed below.
+
+## Outstanding questions (please answer before merge)
+*Pull from APPROVE_WITH_NOTES verdicts, function-writer `unresolved` notes, and api-summary.md "Known gotchas / unknowns".*
+- {question 1 — e.g. "Vendor sandbox can't ship orders without contacting support; should we open ticket #N or defer to first customer?"}
+- {question 2}
+
+## Recommendations (next steps after merge)
+*Pull from validation gaps and reviewer advisory notes.*
+- {recommendation 1 — e.g. "Seed the sandbox with 5+ SHIPPED orders to validate format_order's shipped-state path."}
+- {recommendation 2}
+
+## Field-mapping decisions
+*Reference: `.claude/references/{name}/api-summary.md` "Field-mapping decisions" section.*
+{One line per non-obvious mapping (IntegrationNotImplemented choices, .get() with rationale, mappings to non-canonical source fields), each pointing at its api-summary.md entry.}
+
+## Sandbox limitations encountered
+*What you couldn't validate live, and why.*
+- {limitation 1 — e.g. "All sandbox orders in BLOCKED state due to ASN seed-data gap"}
+- {limitation 2}
+
+## Test plan
+- [ ] `yarn test -k {name}` passes locally
+- [ ] Filtered tests for each new method pass
+- [ ] Sandbox-coverage gaps acknowledged in this description
+- [ ] api-summary.md "Field-mapping decisions" section reviewed
+- [ ] Logo uploaded to `s3://trackstarlogosbucket/{name}.png`
+
+<!-- CI: edit args after "yarn test", or use [skip-tests] to skip -->
+test override: `yarn test -k {name}`
+
+{ship block, copied verbatim from between the <!-- ship-on-merge --> markers in
+.github/pull_request_template.md, every box left unticked}
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+```
+
+Keep every section short (the PR description ceiling in `.claude/rules/communications.md`): one line per question, recommendation, mapping decision or limitation, no paragraphs. If a section has nothing to report, keep the heading and write `- none` under it. Never drop a canonical heading.
+
+### Structural anchors (verbatim — refresh mode parses these)
+
+Section headings (case-sensitive, exact match):
+
+- `## Summary`
+- `## Validation status`
+- `## Outstanding questions (please answer before merge)`: match the heading text up to and including `Outstanding questions`. Old PRs may not have the parenthetical.
+- `## Recommendations (next steps after merge)`: same rule for the parenthetical.
+- `## Field-mapping decisions`
+- `## Sandbox limitations encountered`
+- `## Test plan`
+
+CI override block (after `## Test plan`, both lines verbatim):
+
+```
+<!-- CI: edit args after "yarn test", or use [skip-tests] to skip -->
+test override: `yarn test -k {name}`
+```
+
+Pokedex CI reads the `test override:` line; the comment is for the human editing it. Write the `-k {name}` override yourself rather than leaving the template's `yarn test -s`, which only asks CI to pick the args from the diff (`.claude/rules/pull-requests.md` "CI test scope"). Copy the ship block from the repo template and leave every box unticked (`.claude/rules/pull-requests.md` "Ship on merge"). Refresh mode keeps this block verbatim, and appends it if it is missing.
+
+### When source data is sparse (no api-summary.md)
+
+The sections that come from `api-summary.md` (`Validation status`, `Outstanding questions`, `Recommendations`, `Field-mapping decisions`, `Sandbox limitations encountered`) keep their heading and get one placeholder line, so refresh mode can fill them in later:
+
+```markdown
+## Outstanding questions (please answer before merge)
+_No api-summary.md available at PR creation time; populate manually or re-run `/integration-pr <pr>` after creating one._
+```
+
+`## Summary`, `## Test plan` and the CI override block always come from the branch and the template, never from `api-summary.md`.
+
+---
+
+## Mapping comment
+
+Post it as a **separate PR comment**, not in the body, so the body and the comment can be edited independently. Refresh mode finds the comment by its marker line.
+
+### Canonical shape
+
+```markdown
+<!-- trackstar-mapping-comment-v1 -->
+
+## Field mappings — {name}
+
+### get_products  (`format_product`)
+
+<details>
+<summary>Canonical mappings</summary>
+
+| Canonical field | Source path | Notes |
+|---|---|---|
+| `id` | `product.sku` | |
+| `name` | `product.title` | |
+| `created_date` | `IntegrationNotImplemented` | |
+| `updated_date` | `product.lastModifiedAt` | |
+| ... | ... | |
+
+</details>
+
+<details>
+<summary>Sample raw item from /products</summary>
+
+```json
+{ "sku": "SKU-001", "title": "Widget", ... }
+```
+
+</details>
+
+### create_order  (body construction inlined per integration-patterns.md)
+
+<details>
+<summary>Canonical mappings (canonical → vendor payload)</summary>
+
+| Canonical input | Source payload path | Notes |
+|---|---|---|
+| `shipping_address.line1` | `shipTo.street` | |
+| `line_items[].sku` | `lines[].productCode` | |
+| ... | ... | |
+
+</details>
+```
+
+### Structural anchors (verbatim)
+
+- **Marker line**, always the first line of the comment: `<!-- trackstar-mapping-comment-v1 -->`
+- **Heading**: `## Field mappings — {name}`. The dash is an em-dash (U+2014), not a hyphen.
+- **Per-method heading**: `### {method_name}  (\`format_{x}\`)`, with two spaces before the parenthetical.
+- **Read-side mapping `<details>`**: `<summary>Canonical mappings</summary>` (no parenthetical).
+- **Write-side mapping `<details>`**: `<summary>Canonical mappings (canonical → vendor payload)</summary>`. The arrow is `→` (U+2192).
+- **Raw-sample `<details>`**: `<summary>Sample raw item from {endpoint}</summary>`, where endpoint is the path the method calls (e.g. `/products`, `/v1/orders`).
+
+### Notes column conventions
+
+- Empty for plain 1:1 mappings.
+- Required for: `IntegrationNotImplemented` rows (why the field can't be sourced), `.get()` with a default (when the field is missing), unit conversions (e.g. minor units vs whole currency), conditional mappings, and fields taken from a less obvious source than the name suggests.
+- Source: `api-summary.md` "Field-mapping decisions" first, then the code.
+- Each note stands on its own. Don't point at `api-summary.md` or any other file; write the needed context into the note.
+
+### When the sample isn't available
+
+If [`workflows/samples.md`](../workflows/samples.md) ends at its placeholder step for a method, render the raw-sample block as:
+
+```markdown
+<details>
+<summary>Sample raw item from /endpoint</summary>
+
+_Sample not captured — neither api-summary.md, yarn curl, nor yarn crawl could provide. Capture manually and re-run `/integration-pr <pr>`._
+
+</details>
+```
+
+The anchor stays in place so refresh mode can fill it later, and no data is faked.

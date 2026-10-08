@@ -1,0 +1,111 @@
+import re
+import sys
+
+import boto3
+from boto3.dynamodb.conditions import Attr
+
+COMPANY_WORDS = re.compile(
+    r"\b(inc|llc|l\.l\.c|ltd|limited|co|corp|corporation|company|companies|group|"
+    r"holdings|partners|enterprises|industries|international|intl|store|stores|shop|"
+    r"market|markets|foods|farms|supply|services|solutions|distribution|distributors|"
+    r"wholesale|trading|brands|labs|studio|studios|restaurant|cafe|bakery|hotel|club|"
+    r"school|university|church|hospital|clinic|association|foundation|amazon|walmart|"
+    r"target|costco|shopify|faire|plc|gmbh|sa|bv|pty|the)\b|[&@#0-9/]",
+    re.IGNORECASE,
+)
+PERSON_NAME = re.compile(r"^[A-Z][a-z'\-]+( [A-Z]\.?)?( [A-Z][a-z'\-]+){1,2}$")
+CONSUMER_DOMAINS = {
+    "gmail.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "icloud.com",
+    "aol.com",
+    "live.com",
+    "msn.com",
+    "me.com",
+    "comcast.net",
+    "protonmail.com",
+}
+
+
+def mask(value):
+    if not value:
+        return value
+    parts = []
+    for word in str(value).split():
+        parts.append(word[0] + "*" * (len(word) - 1))
+    return " ".join(parts)
+
+
+def email_domain(email):
+    if not isinstance(email, str) or "@" not in email:
+        return None
+    return email.split("@")[1].lower()
+
+
+def address_name(address):
+    if isinstance(address, dict):
+        return address.get("full_name")
+    return None
+
+
+def reasons_for(row):
+    reasons = []
+    name = row.get("name") or ""
+    if PERSON_NAME.match(name) and not COMPANY_WORDS.search(name):
+        reasons.append("name looks like a person")
+    domain = email_domain(row.get("email"))
+    if domain in CONSUMER_DOMAINS:
+        reasons.append(f"consumer email ({domain})")
+    for key in ["shipping_address", "billing_address"]:
+        if name and address_name(row.get(key)) == name:
+            reasons.append(f"{key}.full_name matches name")
+    return reasons
+
+
+def main():
+    max_pages = int(sys.argv[1])
+    table = boto3.resource("dynamodb", region_name="us-east-1").Table(
+        "erp-customers-prod"
+    )
+    kwargs = {
+        "FilterExpression": Attr("is_individual").eq(False),
+        "ProjectionExpression": "connection_id, id, #n, email, shipping_address, billing_address, is_individual",
+        "ExpressionAttributeNames": {"#n": "name"},
+    }
+    scanned = 0
+    business = 0
+    flagged = []
+    connections = {}
+    for page in range(max_pages):
+        rsp = table.scan(**kwargs)
+        scanned += rsp["ScannedCount"]
+        for row in rsp["Items"]:
+            business += 1
+            connections[row["connection_id"]] = connections.get(row["connection_id"], 0) + 1
+            reasons = reasons_for(row)
+            if reasons:
+                flagged.append((row, reasons))
+        if "LastEvaluatedKey" not in rsp:
+            break
+        kwargs["ExclusiveStartKey"] = rsp["LastEvaluatedKey"]
+
+    print(f"scanned {scanned} rows, {business} with is_individual false, across {len(connections)} connections")
+    print(f"{len(flagged)} look suspicious")
+    strong = []
+    weak = []
+    for row, reasons in flagged:
+        if len(reasons) > 1:
+            strong.append((row, reasons))
+        else:
+            weak.append((row, reasons))
+    for row, reasons in strong[:8] + weak[:4]:
+        print(
+            f"- connection {row['connection_id']} id {row['id']}: "
+            f"name '{mask(row.get('name'))}', email domain {email_domain(row.get('email'))}; "
+            + "; ".join(reasons)
+        )
+
+
+main()

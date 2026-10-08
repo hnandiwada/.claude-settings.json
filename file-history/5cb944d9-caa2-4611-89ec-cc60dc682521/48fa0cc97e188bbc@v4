@@ -1,0 +1,2267 @@
+import base64
+import uuid
+from collections import defaultdict
+from datetime import datetime, timedelta
+from time import sleep, time
+from urllib.parse import quote
+
+import pytz
+from config import (
+    ENABLED_SHIPSTATION_V2_PACKAGE_NAME_ORGS,
+    SHIPSTATION_GET_ORDERS_HISTORICAL_CHUNK_SIZE,
+    SHIPSTATION_SKIP_NO_SKU_LINE_ITEMS_ORGS,
+)
+from integrations.wms.WMSIntegration import WMSIntegration
+from resources import Order, Product, ShippingMethod, Warehouse
+from utils.exceptions import PermissionsException, PokedexException, ThrottleException
+from utils.logutil import getLogger
+from utils.schema import (
+    Boolean,
+    Float,
+    Integer,
+    IntegrationNotImplemented,
+    OneOf,
+    Schema,
+    String,
+    TrackstarWriteSchema,
+    get_real_string_value,
+    string_is_empty,
+)
+from utils.utils import (
+    convert_weight_units,
+    dt_to_str,
+    get_request_session,
+    get_state_and_country_codes_from_input,
+    retry,
+    str_to_dt,
+)
+
+logger = getLogger()
+
+
+class Integration(WMSIntegration):
+    def ui(self):
+        return "https://www.shipstation.com"
+
+    def test_account(self):
+        return "Our sandbox"
+
+    def support(self):
+        return {
+            "v1": "apisupport@shipstation.com",
+            "v2": "shippingapisupport@shipstation.com",
+            "fallback": "Ticket in ShipStation Dashboard: https://help.shipstation.com/hc/en-us/requests/new",
+        }
+
+    def docs(self):
+        return {
+            "v1": "https://www.shipstation.com/docs/api/",
+            "v2": "https://docs.shipstation.com/managing-inventory",
+        }
+
+    def get_integration_secret(self, body):
+        return {
+            "access_token": f"{body['api_key']}:{body['api_secret']}",
+            "v2_api_key": body.get("v2_api_key"),
+        }
+
+    def me(self):
+        access_token = self.integration_secret["access_token"]
+        api_key = access_token.split(":")[0]
+        v2_api_key = self.integration_secret.get("v2_api_key")
+        return {
+            "api_key": api_key,
+            "v2_api_key": v2_api_key,
+        }
+
+    def safe_me(self):
+        return None
+
+    def validate_integration_secret(self):
+        self.shipstation_request("orders")
+
+    def base_url(self):
+        return "https://ssapi.shipstation.com"
+
+    def shipstation_request(self, path, method="GET", is_v2=False, **kwargs):
+        if is_v2:
+            url = f"https://api.shipstation.com/v2/{path}"
+            if not self.integration_secret.get("v2_api_key"):
+                error = self.create_permissions_exception(path)
+                self.api_call_errors[path] = error
+                raise error
+            else:
+                self.api_call_errors[path] = None
+            headers = {
+                "api-key": self.integration_secret.get(
+                    "v2_api_key"
+                ),  # for backwards compatibility
+            }
+        else:
+            url = f"{self.base_url()}/{path}"
+            headers = {
+                "Authorization": f"Basic {base64.b64encode(self.integration_secret['access_token'].encode()).decode()}",
+            }
+
+        @retry(3, "ShipStation")
+        def make_request():
+            session = get_request_session()
+            rsp = session.request(method, url, headers=headers, **kwargs)
+            if rsp.status_code == 429:
+                raw_limit_reset = rsp.headers.get("X-Rate-Limit-Reset")
+                if raw_limit_reset:
+                    limit_reset = int(raw_limit_reset)
+                    raise ThrottleException("ShipStation", limit_reset)
+                raise PokedexException(
+                    f"ShipStation request failed: {rsp.text}",
+                    rsp.status_code,
+                    origin="integration",
+                )
+            elif rsp.status_code == 401:
+                if is_v2:
+                    if (
+                        "You must upgrade your billing plan or add required features"
+                        in rsp.text
+                    ):
+                        error = self.create_permissions_exception(path)
+                        self.api_call_errors[path] = error
+                        raise error
+                try:
+                    js = rsp.json()
+                except Exception:
+                    if rsp.text == "401 Unauthorized":
+                        raise self.create_invalid_credentials_exception()
+                    raise PokedexException(
+                        f"ShipStation request failed: {rsp.text}",
+                        rsp.status_code,
+                        origin="integration",
+                    )
+                errors = js["errors"]
+                for error in errors:
+                    if error["message"] == "Access denied.":
+                        err_path = error["path"]
+                        # don't have a good way to test this path rn
+                        err = self.create_permissions_exception(err_path)
+                        self.api_call_errors[path] = err
+                        raise err
+                    raise PokedexException(
+                        f"ShipStation request failed: {rsp.text}",
+                        rsp.status_code,
+                        origin="integration",
+                    )
+                raise self.create_invalid_credentials_exception()
+            elif rsp.status_code == 402:
+                err = self.create_permissions_exception(path)
+                self.api_call_errors[path] = err
+                raise err
+            elif rsp.status_code != 200:
+                try:
+                    js = rsp.json()
+                    exception_message = js.get("ExceptionMessage")
+                    inner_exception = js.get("InnerException")
+                    generic_message = js.get("Message", "ShipStation request failed")
+                    if inner_exception:
+                        exception_message += f": {inner_exception}"
+                    if not exception_message:
+                        exception_message = generic_message
+                    raise PokedexException(
+                        exception_message, rsp.status_code, origin="integration"
+                    )
+                except Exception:
+                    raise PokedexException(
+                        f"ShipStation request failed: {rsp.text}",
+                        rsp.status_code,
+                        origin="integration",
+                    )
+            return rsp
+
+        rsp = make_request()
+        self.api_call_errors[path] = None
+        try:
+            rsp = rsp.json()
+        except Exception:
+            raise PokedexException(
+                f"ShipStation request failed: {rsp.text}",
+                rsp.status_code,
+                origin="integration",
+            )
+
+        return rsp
+
+    def make_request(self, path, method, headers=None, data=None, params=None):
+        # v1 and v2 are separate apis on separate hosts with separate keys, so the
+        # caller picks v2 by keeping the version in the path (e.g. "v2/inventory")
+        if path.startswith("v2/"):
+            if not self.integration_secret.get("v2_api_key"):
+                raise self.create_permissions_exception(path)
+            url = f"https://api.shipstation.com/{path}"
+            request_headers = {"api-key": self.integration_secret["v2_api_key"]}
+        else:
+            url = f"{self.base_url()}/{path}"
+            encoded_access_token = base64.b64encode(
+                self.integration_secret["access_token"].encode()
+            ).decode()
+            request_headers = {"Authorization": f"Basic {encoded_access_token}"}
+        if headers:
+            request_headers.update(headers)
+        session = get_request_session()
+        response = session.request(
+            method, url, headers=request_headers, json=data, params=params
+        )
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+        return {
+            "status_code": response.status_code,
+            "headers": dict(response.headers),
+            "body": body,
+        }
+
+    def get_inventory(self, start, end, first_crawl, first_loop, page_token=1):
+        if first_loop:
+            self.inventory = defaultdict(dict)
+            path = "inventory"
+            try:
+                inv_rsp = self.shipstation_request(path, is_v2=True)
+                inv = inv_rsp["inventory"]
+                next_url = inv_rsp["links"]["next"].get("href")
+                while next_url:
+                    cursor = next_url.split("cursor=")[1]
+                    inv_rsp = self.shipstation_request(
+                        f"inventory?cursor={cursor}", is_v2=True
+                    )
+                    inv.extend(inv_rsp["inventory"])
+                    next_url = inv_rsp["links"]["next"].get("href")
+                for item in inv:
+                    self.inventory[item["sku"]] = item
+            except Exception as e:
+                # Dont want to show a "red" error if the user doesn't have permissions
+                if isinstance(e, PermissionsException):
+                    return {"data": [], "next_token": None}
+                else:
+                    raise e
+
+        page_size = 500
+        if self.in_perm_validator():
+            page_size = 1
+        path = "products"
+        query_params = {
+            "page": page_token,
+            "pageSize": page_size,
+        }
+        products = self.shipstation_request(path, params=query_params)
+        formatted_inventory = []
+        for product in products["products"]:
+            prod_inv = self.inventory.get(product["sku"])
+            if not prod_inv:
+                continue
+            formatted_inventory.append(format_inventory(product, prod_inv))
+
+        next_token = None
+        if products["pages"] > page_token:
+            next_token = page_token + 1
+
+        return {"data": formatted_inventory, "next_token": next_token}
+
+    def get_products(self, start, end, first_crawl, first_loop, page_token=1):
+        path = "products"
+        page_size = 500
+        if self.in_perm_validator():
+            page_size = 1
+        query_params = {
+            "page": page_token,
+            "pageSize": page_size,
+        }
+        products = self.shipstation_request(path, params=query_params)
+        formatted_products = []
+        for product in products["products"]:
+            product_modified_date = (
+                str_to_dt(format_date(product["modifyDate"]))
+                if product["modifyDate"]
+                else None
+            )
+            # if the product was modified before the start date or the product doesn't have a modify date, skip it
+            if not first_crawl:
+                if product_modified_date and product_modified_date < start:
+                    continue
+            formatted_products.append(format_product(product))
+
+        next_token = None
+        if products["pages"] > page_token:
+            next_token = page_token + 1
+
+        return {"data": formatted_products, "next_token": next_token}
+
+    def get_order_metadata(self):
+        self.sm_code_to_name = {}
+        self.carrier_code_to_name = {}
+        self.carrier_name_to_code = {}
+        self.packages = {}
+        self.tag_id_to_name = {}
+        for tag in self.shipstation_request("accounts/listtags") or []:
+            self.tag_id_to_name[tag["tagId"]] = tag["name"]
+        self.store_id_to_channel = {}
+        # inactive stores still own old orders, so include them in the lookup
+        for store in self.shipstation_request("stores?showInactiveStores=true") or []:
+            # marketplaceId names the platform, not the store, so on its own it
+            # collides across stores; suffix the store (our warehouse customer)
+            self.store_id_to_channel[store["storeId"]] = {
+                "channel_id": str(store["marketplaceId"]) + "_" + str(store["storeId"]),
+                "channel_name": store["marketplaceName"],
+            }
+        sms_to_iterate = []
+        scheduler_row = None
+        if not self.in_perm_validator():
+            scheduler_row = ShippingMethod(self).get_scheduler_row()
+        if not scheduler_row or not scheduler_row.get("latest_data"):
+            shipping_method_rsp = self.get_shipping_methods(None, None, None, None)
+            sms_to_iterate: list = shipping_method_rsp["data"]
+        else:
+            sms_to_iterate = ShippingMethod(self).get_all_resources()
+        for sm in sms_to_iterate:
+            self.sm_code_to_name[sm["id"]] = sm["name"]
+            self.carrier_code_to_name[sm["carrier_id"]] = sm["carrier_name"]
+            self.carrier_name_to_code[sm["carrier_name"]] = sm["carrier_id"]
+        for carrier in self.carrier_code_to_name:
+            try:
+                packages = self.shipstation_request(
+                    f"carriers/listpackages?carrierCode={carrier}"
+                )
+                # Error handling for bad carriers
+            except PokedexException as e:
+                if "Invalid Carrier" in e.message:
+                    continue
+                raise e
+            if "Message" in packages:
+                continue
+            for package in packages:
+                self.packages[(carrier.lower(), package["code"].lower())] = package
+
+    def allow_orders_on_demand_sync(self):
+        return True
+
+    def get_orders(
+        self, start, end, first_crawl, first_loop, page_token=None, sync_job_id=None
+    ):
+        if first_loop:
+            self.warehouse_to_address = {}
+            if not self.in_perm_validator():
+                warehouses = Warehouse(self).get_all_resources()
+            else:
+                warehouse_rsp = self.get_warehouses(start, end, first_crawl, first_loop)
+                warehouses = warehouse_rsp["data"]
+            for warehouse in warehouses:
+                self.warehouse_to_address[warehouse["id"]] = warehouse["address"]
+        page_size = 500
+        if self.in_perm_validator():
+            page_size = 1
+        modify_start_dt = start
+        if first_loop:
+            # buffer to catch orders shipstation's api is slow to index
+            modify_start_dt = start - timedelta(hours=2)
+        # bulk edits can stamp more orders with one modifyDate second than fit in a page,
+        # so the second-based cursor stalls; page within it via a {modify_date, page} token.
+        page = 1
+        offset = 0
+        if page_token:
+            modify_start_dt = str_to_dt(format_date(page_token["modify_date"]))
+            page = page_token["page"]
+            offset = page_token["offset"]
+        # modifyDate is account-local (pacific) time, so cursors compare seconds in pacific.
+        # the query uses the same whole second so a token re-reads exactly this page
+        pacific_start = modify_start_dt.astimezone(pytz.timezone("US/Pacific"))
+        modify_start_str = pacific_start.strftime("%Y-%m-%dT%H:%M:%S")
+        query_params = {
+            "modifyDateStart": modify_start_str,
+            # bound orders to end; the shipment window stops at end, so without this a
+            # back-sync with a past end pulls later orders and stores them with no shipment
+            "modifyDateEnd": end,
+            "pageSize": page_size,
+            "page": page,
+            "sortBy": "ModifyDate",
+            "sortDir": "ASC",
+        }
+        orders_rsp = self.shipstation_request("orders", params=query_params)
+        orders = orders_rsp["orders"]
+        page_next_token = None
+        page_next_start = None
+        if len(orders) == page_size:
+            last_second = orders[-1]["modifyDate"].split(".")[0]
+            last_second_dt = str_to_dt(format_date(last_second))
+            # if the whole page falls in one second, re-anchoring there would refetch it,
+            # so walk shipstation's page within that second
+            next_page = 1
+            if last_second == modify_start_str:
+                next_page = page + 1
+            # move the window forward with next_start so latest_data advances during long
+            # backfills. the first loop's buffer can put last_second before start, so that stays a token
+            if next_page == 1 and start < last_second_dt < end:
+                page_next_start = last_second_dt
+            else:
+                page_next_token = {
+                    "modify_date": last_second,
+                    "page": next_page,
+                    "offset": 0,
+                }
+
+        shipment_start_date = dt_to_str(start - timedelta(days=7))
+        # get all shipments 7 days before start on first loop.
+        # get all fulfillments ever since there aren't that many
+        # any order created before 7 days ago get shipments for it individually to ensure we don't miss shipments
+        # there is no shipments info on the order itself so we need to do this to get all the shipment info.
+        # prime candidate for improvement with ETL :)
+        if first_loop and orders:
+            # shipments response cover order shipments with labels generated in ShipStation
+            # fulfillments response cover orders that have been marked as shipped either through the UI or the API
+            self.shipment_map = defaultdict(list)
+            self.fulfilllments_map = defaultdict(list)
+            self.v2_enrich = False
+            self.get_order_metadata()
+            if not self.in_perm_validator():
+                fulfillments_next_page = 1
+                while fulfillments_next_page:
+                    fulfillments_query_params = {
+                        "createDateStart": shipment_start_date,
+                        "page": fulfillments_next_page,
+                        "pageSize": page_size,
+                    }
+                    fulfillments = self.shipstation_request(
+                        "fulfillments", params=fulfillments_query_params
+                    )
+                    for fulfillment in fulfillments["fulfillments"]:
+                        self.fulfilllments_map[fulfillment["orderId"]].append(
+                            fulfillment
+                        )
+
+                    if fulfillments["pages"] > fulfillments_next_page:
+                        fulfillments_next_page += 1
+                    else:
+                        fulfillments_next_page = None
+
+                self.v2_enrich = (
+                    self.integration_secret.get("v2_api_key")
+                    and self.org_id in ENABLED_SHIPSTATION_V2_PACKAGE_NAME_ORGS
+                )
+                v2_package_names = {}
+                if self.v2_enrich:
+                    try:
+                        v2_package_names = self._load_v2_package_names(
+                            start - timedelta(days=7), end
+                        )
+                    except PermissionsException:
+                        # v2 best-effort; fall back to v1 resolution
+                        pass
+                # chunk into 7-day windows — keeps page count low for v1's
+                # 40/min rate limit (v2 has 200/min; fetched once above)
+                window_start = start - timedelta(days=7)
+                seen_shipment_ids = set()
+                while window_start < end:
+                    window_end = min(window_start + timedelta(days=7), end)
+                    shipments_next_page = 1
+                    while shipments_next_page:
+                        shipments_query_params = {
+                            "createDateStart": dt_to_str(window_start),
+                            "createDateEnd": dt_to_str(window_end),
+                            "page": shipments_next_page,
+                            "pageSize": page_size,
+                            "includeShipmentItems": True,
+                        }
+                        shipments = self.shipstation_request(
+                            "shipments", params=shipments_query_params
+                        )
+                        for shipment in shipments["shipments"]:
+                            # shipstation matches createDateStart/End by calendar day,
+                            # so two windows meeting on a date both return that date's
+                            # shipments; keep only the first copy of each
+                            if shipment["shipmentId"] in seen_shipment_ids:
+                                continue
+                            seen_shipment_ids.add(shipment["shipmentId"])
+                            self.shipment_map[shipment["orderId"]].append(shipment)
+                            if self.v2_enrich:
+                                shipment["_v2_package_name"] = v2_package_names.get(
+                                    f"se-{shipment['orderId']}"
+                                )
+                        if shipments_next_page == 1:
+                            logger.info(f"{shipments['pages']}")
+
+                        if shipments["pages"] > shipments_next_page:
+                            shipments_next_page += 1
+                        else:
+                            shipments_next_page = None
+                    window_start = window_end
+
+        # a page full of orders needing the individual lookup above outruns a task, so stop the
+        # slice after a fixed count and carry the offset in the token to keep the progress
+        slice_end = offset
+        historical_in_slice = 0
+        while slice_end < len(orders):
+            order = orders[slice_end]
+            is_historical = (
+                order["createDate"] < shipment_start_date
+                and order["orderStatus"] == "shipped"
+            )
+            if (
+                is_historical
+                and historical_in_slice >= SHIPSTATION_GET_ORDERS_HISTORICAL_CHUNK_SIZE
+            ):
+                break
+            if is_historical:
+                historical_in_slice += 1
+            slice_end += 1
+        work_orders = orders[offset:slice_end]
+        next_start = None
+        if slice_end < len(orders):
+            next_token = {
+                "modify_date": modify_start_str,
+                "page": page,
+                "offset": slice_end,
+            }
+        else:
+            next_token = page_next_token
+            next_start = page_next_start
+
+        formatted_orders = []
+        for order in work_orders:
+            # get shipment info for orders not captured by shipment/fulfillment window
+            if (
+                order["createDate"] < shipment_start_date
+                and order["orderStatus"] == "shipped"
+            ):
+                shipments = self.shipstation_request(
+                    "shipments",
+                    params={
+                        "orderId": order["orderId"],
+                        "includeShipmentItems": True,
+                    },
+                )
+                self.shipment_map[order["orderId"]] = shipments["shipments"]
+                if self.v2_enrich:
+                    v2_package_name = self._fetch_v2_package_name(order["orderId"])
+                    for shipment in shipments["shipments"]:
+                        shipment["_v2_package_name"] = v2_package_name
+                fulfillments = self.shipstation_request(
+                    "fulfillments",
+                    params={"orderId": order["orderId"]},
+                )
+                self.fulfilllments_map[order["orderId"]] = fulfillments["fulfillments"]
+
+            curr_fulfillments = self.fulfilllments_map[order["orderId"]]
+            curr_shipments = self.shipment_map[order["orderId"]]
+            formatted_fullfillments = []
+            for fulfillment in curr_fulfillments:
+                formatted_fulfillment = format_order_fulfillment(
+                    order,
+                    fulfillment,
+                    self.warehouse_to_address,
+                    self.packages,
+                    self.sm_code_to_name,
+                    self.carrier_code_to_name,
+                )
+                warehouse_id = formatted_fulfillment["warehouse_id"]
+                if string_is_empty(warehouse_id):
+                    continue
+                formatted_fullfillments.append(formatted_fulfillment)
+
+            formatted_shipments = []
+            for shipment in curr_shipments:
+                formatted_shipment = format_order_shipment(
+                    order,
+                    shipment,
+                    self.warehouse_to_address,
+                    self.packages,
+                    self.sm_code_to_name,
+                    self.carrier_code_to_name,
+                )
+                if formatted_shipment:
+                    formatted_shipments.append(formatted_shipment)
+
+            formatted_order = format_order(
+                order,
+                self.sm_code_to_name,
+                self.carrier_code_to_name,
+                self.carrier_name_to_code,
+                formatted_shipments
+                + formatted_fullfillments,  # shipments and fulfillments
+                self.org_id in SHIPSTATION_SKIP_NO_SKU_LINE_ITEMS_ORGS,
+                tag_id_to_name=self.tag_id_to_name,
+                store_id_to_channel=self.store_id_to_channel,
+            )
+            formatted_orders.append(formatted_order)
+
+        return {
+            "data": formatted_orders,
+            "next_token": next_token,
+            "next_start": next_start,
+        }
+
+    def validate_financial_info_with_line_items(self):
+        return False
+
+    def create_order_schema(self):
+        class OrderSchema(TrackstarWriteSchema):
+            order_number = Order().order_number(required=False)
+            # shipstation's own order status, not a trackstar one: it decides which
+            # tab the order lands in, and only awaiting_shipment is ready to ship
+            status = String(
+                "The ShipStation status to create the order with. Orders created as `awaiting_payment` sit in the Awaiting Payment tab and have to be moved before they can ship.",
+                "awaiting_shipment",
+                validate=[OneOf(["awaiting_payment", "awaiting_shipment"])],
+                required=False,
+            )
+            required_ship_date = Order().required_ship_date(required=False)
+            shipping_method_id = Order().shipping_method_id(required=False)
+            shipping_method_name = Order().shipping_method_name(required=False)
+            bill_to_address = self.create_address(
+                "CreateBillingAddress",
+                optional=["address2", "company"],
+                nullable=["company", "address2"],
+                required=False,
+            )
+            ship_to_address = self.create_address(
+                "CreateOrderShipToAddress",
+                optional=["address2", "company"],
+                nullable=["company", "address2"],
+            )
+            line_items = Order(self).create_line_items_schema(
+                quantity=Integer("The quantity of the item"),
+                sku=String("The SKU of the item"),
+                unit_price=Float("The unit price of the item", required=False),
+            )
+
+        schema = OrderSchema()
+        return schema
+
+    def update_order_schema(self):
+        class OrderSchema(TrackstarWriteSchema):
+            skip_retrieval = Order().skip_retrieval()
+            order_number = Order().order_number(required=False)
+            required_ship_date = Order().required_ship_date(required=False)
+            shipping_method_id = Order().shipping_method_id(required=False)
+            shipping_method_name = Order().shipping_method_name(required=False)
+            bill_to_address = self.create_address(
+                "UpdateBillingAddress",
+                required=False,
+                optional=["address2", "company"],
+                nullable=["address2"],
+            )
+            ship_to_address = self.create_address(
+                "UpdateOrderShipToAddress",
+                required=False,
+                optional=["address2", "company"],
+                nullable=["address2"],
+            )
+            line_items = Order(self).update_line_items_schema(
+                quantity=Integer("The quantity of the item"),
+                sku=String("The SKU of the item"),
+                unit_price=Float("The price of the product", 10.99, required=False),
+                set_or_update_customs_value=Boolean(
+                    "Set or update customs value", required=False
+                ),
+                country_of_origin=String(
+                    "The product country of origin, required if existing customs item does not exist",
+                    required=False,
+                ),
+                harmonized_tariff_code=String(
+                    "The harmonized tariff code for the item",
+                    required=False,
+                ),
+                customs_description=String(
+                    "The customs description for the item",
+                    required=False,
+                ),
+                required=False,
+            )
+
+        schema = OrderSchema()
+        return schema
+
+    def create_order(self, body):
+        wanted_skus = set()
+        for li in body["line_items"]:
+            wanted_skus.add(li["sku"])
+        # create only needs each product's name (set on the items list below), so
+        # read the synced products from our own store rather than querying shipstation
+        # once per sku. v1 throttles at 40 requests/min, so a large order (100+ lines)
+        # times out under the per-sku lookups before the order is even sent.
+        product_map = {}
+        for product in Product(self).get_all_resources(
+            {"sku": {"in": list(wanted_skus)}}
+        ):
+            product_map[product["sku"]] = product
+
+        missing_skus = []
+        for sku in wanted_skus:
+            if sku in product_map:
+                continue
+            # a product added in shipstation since the last sync isn't in our store
+            # yet, so look those up live. shipstation's sku filter is non-exact (a
+            # variant sku also returns its shopify parent), so keep the exact match
+            # rather than taking [0], which can be the parent (pylon 4410).
+            products = self.shipstation_request("products", params={"sku": sku})
+            matched_product = None
+            for product in products["products"]:
+                if product["sku"] == sku:
+                    matched_product = product
+                    break
+            if matched_product:
+                product_map[sku] = matched_product
+            else:
+                missing_skus.append(sku)
+        if missing_skus:
+            raise PokedexException(
+                f"Products with SKUs {', '.join(missing_skus)} not found",
+                400,
+                origin="trackstar",
+            )
+
+        path = "orders/createorder"
+        ship_to = body["ship_to_address"]
+        ship_country = ship_to["country"]
+        try:
+            _, ship_country = get_state_and_country_codes_from_input(
+                ship_to["state"], ship_country, should_fail=False
+            )
+        except PokedexException:
+            # send an unrecognized country through as the customer wrote it
+            pass
+
+        ship_to_address = {
+            "name": body["ship_to_address"]["full_name"],
+            "company": body["ship_to_address"].get("company", None),
+            "street1": body["ship_to_address"]["address1"],
+            "street2": body["ship_to_address"].get("address2", None),
+            "street3": None,
+            "city": body["ship_to_address"]["city"],
+            "state": body["ship_to_address"]["state"],
+            "postalCode": body["ship_to_address"]["postal_code"],
+            "country": ship_country,
+        }
+        bill_to_address = {}
+        if "bill_to_address" in body:
+            bill_to = body["bill_to_address"]
+            bill_country = bill_to["country"]
+            try:
+                _, bill_country = get_state_and_country_codes_from_input(
+                    bill_to["state"], bill_country, should_fail=False
+                )
+            except PokedexException:
+                # send an unrecognized country through as the customer wrote it
+                pass
+            bill_to_address = {
+                "name": body["bill_to_address"]["full_name"],
+                "company": body["bill_to_address"].get("company", None),
+                "street1": body["bill_to_address"]["address1"],
+                "street2": body["bill_to_address"].get("address2", None),
+                "street3": None,
+                "city": body["bill_to_address"]["city"],
+                "state": body["bill_to_address"]["state"],
+                "postalCode": body["bill_to_address"]["postal_code"],
+                "country": bill_country,
+            }
+        else:
+            bill_to_address = ship_to_address
+        req_body = {
+            "orderDate": datetime.now().isoformat().split(".")[0],
+            "orderNumber": body.get("order_number", str(uuid.uuid4())),
+            "orderStatus": body.get("status", "awaiting_payment"),
+            "billTo": bill_to_address,
+            "shipTo": ship_to_address,
+            "items": [
+                {
+                    "quantity": li["quantity"],
+                    "sku": li["sku"],
+                    "name": product_map[li["sku"]]["name"],
+                    "unitPrice": li.get("unit_price", 0),
+                }
+                for li in body["line_items"]
+            ],
+        }
+        if "required_ship_date" in body:
+            req_body["shipByDate"] = body["required_ship_date"]
+
+        sm_id = body.get("shipping_method_id")
+        if sm_id:
+            sm_obj = ShippingMethod(self).get_resource(sm_id)
+            carrier_id = sm_obj.get("carrier_id") or sm_obj.get("carrier")
+            req_body["serviceCode"] = sm_obj["id"]
+            req_body["carrierCode"] = carrier_id
+        elif "shipping_method_name" in body:
+            shipping_method = self.get_shipping_method_by_name_and_carrier(
+                body["shipping_method_name"], carrier_required_for_name=False
+            )
+            req_body["serviceCode"] = shipping_method["id"]
+            req_body["carrierCode"] = shipping_method["carrier"]
+
+        rsp = self.shipstation_request(
+            path, method="POST", json=req_body, should_log_body=True
+        )
+        self.get_order_metadata()
+        formatted_order = format_order(
+            rsp,
+            self.sm_code_to_name,
+            self.carrier_code_to_name,
+            self.carrier_name_to_code,
+            [],
+            tag_id_to_name=self.tag_id_to_name,
+            store_id_to_channel=self.store_id_to_channel,
+        )
+        return {"data": formatted_order}
+
+    def write_order_custom_validation(self):
+        # customs-flagged lines carry the customs value/quantity, not the order
+        # line's — comparing those against response lines is a false mismatch
+        return {
+            # the request carries a shipstation status, the response the trackstar one
+            # it maps to, so compare against raw_status instead
+            "status": validate_order_status,
+            "quantity": lambda req, rsp: validate_non_customs_line_field(
+                "quantity", req, rsp
+            ),
+            "unit_price": lambda req, rsp: validate_non_customs_line_field(
+                "unit_price", req, rsp
+            ),
+        }
+
+    def update_order(self, request_body, item_id):
+        path = f"orders/{item_id}"
+        try:
+            order = self.shipstation_request(path)
+        except PokedexException as e:
+            if e.status_code == 404:
+                raise PokedexException(
+                    f"Order {item_id} not found", 404, origin="integration"
+                )
+            raise e
+
+        skus = [li["sku"] for li in request_body.get("line_items", [])]
+        # shipstation only supports single SKU lookups, query each individually
+        product_map = {}
+        missing_skus = []
+        for sku in skus:
+            products = self.shipstation_request("products", params={"sku": sku})
+            # shipstation's sku filter is non-exact — querying a variant sku also
+            # returns its shopify PARENT- product. taking [0] can pick the parent,
+            # whose null customsDescription / different name breaks customs
+            # matching and forces the "add new item" path (pylon 4410).
+            matched_product = None
+            for product in products["products"]:
+                if product["sku"] == sku:
+                    matched_product = product
+                    break
+            if matched_product:
+                product_map[sku] = matched_product
+            else:
+                missing_skus.append(sku)
+        if missing_skus:
+            raise PokedexException(
+                f"Products with SKUs {', '.join(missing_skus)} not found",
+                400,
+                origin="trackstar",
+            )
+        # built here (not below) so the customs-match loop can reuse it.
+        # one sku can span several line items, so hold every match (pylon 4765)
+        existing_line_items = order["items"]
+        existing_items_by_sku = {}
+        for eli in existing_line_items:
+            if eli["sku"] not in existing_items_by_sku:
+                existing_items_by_sku[eli["sku"]] = []
+            existing_items_by_sku[eli["sku"]].append(eli)
+
+        customs_name_to_update_map = {}
+        for li in request_body.get("line_items", []):
+            if li.get("set_or_update_customs_value"):
+                if "unit_price" not in li:
+                    raise PokedexException(
+                        "Unit price is required for customs value update",
+                        400,
+                        origin="trackstar",
+                    )
+                # shipstation builds customsItems[].description from the product
+                # template's customsDescription; when that's unset it falls back
+                # to the ORDER line-item name, not the product name (shopify
+                # variant suffixes like "- Default Title" make those diverge).
+                # match the same source shipstation used (pylon 4410).
+                product = product_map[li["sku"]]
+                name = product["customsDescription"]
+                if not name:
+                    # .get: request may set customs on a sku not yet on the order
+                    order_items = existing_items_by_sku.get(li["sku"])
+                    if order_items:
+                        # a repeated sku gets one customs-name fallback; last wins
+                        name = order_items[-1]["name"]
+                    else:
+                        name = product["name"]
+                customs_name_to_update_map[name] = li
+
+        # per support email advancedOptions doesn't get overwritten if not provided
+        # can cause issues when included, so remove it :)
+        # but include storeId to ensure it's an update and not a new order create call
+        req_advanced_options = {
+            "advancedOptions": {"storeId": order["advancedOptions"]["storeId"]}
+        }
+        del order["advancedOptions"]
+        # v1 GET always returns units:"inches" even when account is set to cm
+        # (known shipstation bug: ticket 9713716). echoing that back via the
+        # spread persists the wrong unit on the order. update_order has no
+        # input surface for dimensions, so dropping preserves the account default.
+        order.pop("dimensions", None)
+        req_body = {
+            **order,
+            **req_advanced_options,
+        }
+        if "order_number" in request_body:
+            req_body["orderNumber"] = request_body["order_number"]
+
+        if "bill_to_address" in request_body:
+            request_bill_to_address = request_body["bill_to_address"]
+            if "full_name" in request_bill_to_address:
+                req_body["billTo"]["name"] = request_bill_to_address["full_name"]
+            if "company" in request_bill_to_address:
+                req_body["billTo"]["company"] = request_bill_to_address["company"]
+            if "address1" in request_bill_to_address:
+                req_body["billTo"]["street1"] = request_bill_to_address["address1"]
+            if "address2" in request_bill_to_address:
+                req_body["billTo"]["street2"] = request_bill_to_address["address2"]
+            if "city" in request_bill_to_address:
+                req_body["billTo"]["city"] = request_bill_to_address["city"]
+            if "state" in request_bill_to_address:
+                req_body["billTo"]["state"] = request_bill_to_address["state"]
+            if "postal_code" in request_bill_to_address:
+                req_body["billTo"]["postalCode"] = request_bill_to_address[
+                    "postal_code"
+                ]
+            if "country" in request_bill_to_address:
+                bill_country = request_bill_to_address.get("country")
+                if bill_country:
+                    try:
+                        _, bill_country = get_state_and_country_codes_from_input(
+                            request_bill_to_address.get("state", ""),
+                            bill_country,
+                            should_fail=False,
+                        )
+                    except PokedexException:
+                        # send an unrecognized country through as the customer wrote it
+                        pass
+                req_body["billTo"]["country"] = bill_country
+
+        if "ship_to_address" in request_body:
+            request_ship_to_address = request_body["ship_to_address"]
+            if "full_name" in request_ship_to_address:
+                req_body["shipTo"]["name"] = request_ship_to_address["full_name"]
+            if "company" in request_ship_to_address:
+                req_body["shipTo"]["company"] = request_ship_to_address["company"]
+            if "address1" in request_ship_to_address:
+                req_body["shipTo"]["street1"] = request_ship_to_address["address1"]
+            if "address2" in request_ship_to_address:
+                req_body["shipTo"]["street2"] = request_ship_to_address["address2"]
+            if "city" in request_ship_to_address:
+                req_body["shipTo"]["city"] = request_ship_to_address["city"]
+            if "state" in request_ship_to_address:
+                req_body["shipTo"]["state"] = request_ship_to_address["state"]
+            if "postal_code" in request_ship_to_address:
+                req_body["shipTo"]["postalCode"] = request_ship_to_address[
+                    "postal_code"
+                ]
+            if "country" in request_ship_to_address:
+                ship_country = request_ship_to_address.get("country")
+                if ship_country:
+                    try:
+                        _, ship_country = get_state_and_country_codes_from_input(
+                            request_ship_to_address.get("state", ""),
+                            ship_country,
+                            should_fail=False,
+                        )
+                    except PokedexException:
+                        # send an unrecognized country through as the customer wrote it
+                        pass
+                req_body["shipTo"]["country"] = ship_country
+
+        # ShipStation createorder is a full-resource upsert: the items array we send
+        # replaces the order's line items wholesale. it also reassigns a line item's
+        # read-only orderItemId whenever its lineItemKey/sku/unitPrice/options
+        # changes — passing the original orderItemId back does not prevent this. a
+        # regenerated orderItemId breaks ShipStation's fulfillment push to the sales
+        # channel: Shopify rejects it as "unrecognised items" (pylon 4434; confirmed
+        # by ShipStation support, ticket 9695738).
+        #
+        # set_or_update_customs_value is a per-line-item flag: that line carries the
+        # customs value in unit_price and only needs internationalOptions.customsItems
+        # (set further below) — its order line item must not change at all. so build
+        # the items array per line item: echo a customs-flagged item back from the
+        # order unchanged (no trigger field moves, orderItemId preserved); rebuild
+        # only a genuine line-item edit from the request. Swap sends the customs value
+        # as line_item.unit_price, so rebuilding a customs item would overwrite the
+        # real sale price and trip the orderItemId reassignment described above.
+        request_line_items = request_body.get("line_items", [])
+        req_body["items"] = []
+        consumed_order_item_ids = set()
+        for li in request_line_items:
+            existing_matches = existing_items_by_sku.get(li["sku"], [])
+            if li.get("set_or_update_customs_value") and existing_matches:
+                # echo every line item with this sku unchanged — any duplicate
+                # omitted from the payload is deleted by the upsert (pylon 4765)
+                for existing in existing_matches:
+                    if existing["orderItemId"] in consumed_order_item_ids:
+                        continue
+                    req_body["items"].append(existing)
+                    consumed_order_item_ids.add(existing["orderItemId"])
+                continue
+            existing = None
+            for candidate in existing_matches:
+                if candidate["orderItemId"] not in consumed_order_item_ids:
+                    existing = candidate
+                    break
+            item = {
+                "quantity": li["quantity"],
+                "sku": li["sku"],
+                "name": product_map[li["sku"]]["name"],
+                "unitPrice": li.get("unit_price", 0),
+            }
+            # preserve lineItemKey/orderItemId/options on existing line items so ShipStation can map items back to the sales channel
+            if existing:
+                if existing.get("lineItemKey"):
+                    item["lineItemKey"] = existing["lineItemKey"]
+                if existing.get("orderItemId"):
+                    item["orderItemId"] = existing["orderItemId"]
+                if existing.get("options"):
+                    item["options"] = existing["options"]
+                consumed_order_item_ids.add(existing["orderItemId"])
+            req_body["items"].append(item)
+
+        # createorder replaces the items array wholesale — any existing line item
+        # omitted from the payload is deleted (per ShipStation support, ticket
+        # 9695738). re-add every item the request didn't consume, tracked per
+        # orderItemId since sku membership misses duplicate skus (pylon 4765)
+        for eli in existing_line_items:
+            if eli["orderItemId"] in consumed_order_item_ids:
+                continue
+            item = {
+                "quantity": eli["quantity"],
+                "sku": eli["sku"],
+                "name": eli["name"],
+                "unitPrice": eli["unitPrice"],
+            }
+            if eli.get("lineItemKey"):
+                item["lineItemKey"] = eli["lineItemKey"]
+            if eli.get("orderItemId"):
+                item["orderItemId"] = eli["orderItemId"]
+            if eli.get("options"):
+                item["options"] = eli["options"]
+            req_body["items"].append(item)
+        if "required_ship_date" in request_body:
+            req_body["shipByDate"] = request_body["required_ship_date"]
+        sm_id = request_body.get("shipping_method_id")
+        if sm_id:
+            sm_obj = ShippingMethod(self).get_resource(sm_id)
+            carrier_id = sm_obj.get("carrier_id") or sm_obj.get("carrier")
+            req_body["serviceCode"] = sm_obj["id"]
+            req_body["carrierCode"] = carrier_id
+        elif "shipping_method_name" in request_body:
+            shipping_method = self.get_shipping_method_by_name_and_carrier(
+                request_body["shipping_method_name"], carrier_required_for_name=False
+            )
+            req_body["serviceCode"] = shipping_method["id"]
+            req_body["carrierCode"] = shipping_method["carrier"]
+        else:
+            # carrierCode and serviceCode were copied into req_body by the
+            # `**order` spread above. caller didn't ask to change shipping,
+            # so drop them — per support email these fields won't overwrite shipstation values if not provided.
+            # needed because some merchants' shopify auto-rules
+            # leave carrierCode set with serviceCode null on the order, and
+            # v1 api 400s when we echo that combo back.
+            req_body.pop("carrierCode", None)
+            req_body.pop("serviceCode", None)
+
+        if customs_name_to_update_map:
+            existing_international_options = req_body.get("internationalOptions", {})
+            customs_items = existing_international_options.get("customsItems", []) or []
+            for name, li in customs_name_to_update_map.items():
+                existing_custom_item = next(
+                    (item for item in customs_items if item["description"] == name),
+                    None,
+                )
+                if existing_custom_item:
+                    existing_custom_item["value"] = li["unit_price"]
+                    existing_custom_item["quantity"] = li["quantity"]
+                    if "harmonized_tariff_code" in li:
+                        existing_custom_item["harmonizedTariffCode"] = li[
+                            "harmonized_tariff_code"
+                        ]
+                    if "country_of_origin" in li:
+                        existing_custom_item["countryOfOrigin"] = li[
+                            "country_of_origin"
+                        ]
+                    if "customs_description" in li:
+                        existing_custom_item["description"] = li["customs_description"]
+                else:
+                    if "country_of_origin" not in li:
+                        raise PokedexException(
+                            "Country of origin is required to add a new customs item",
+                            400,
+                            origin="trackstar",
+                        )
+                    if "quantity" not in li:
+                        raise PokedexException(
+                            "Quantity is required to add a new customs item",
+                            400,
+                            origin="trackstar",
+                        )
+                    customs_description = li.get("customs_description", name)
+                    new_customs_item = {
+                        "description": customs_description,
+                        "value": li["unit_price"],
+                        "quantity": li["quantity"],
+                        "countryOfOrigin": li["country_of_origin"],
+                    }
+                    if "harmonized_tariff_code" in li:
+                        new_customs_item["harmonizedTariffCode"] = li[
+                            "harmonized_tariff_code"
+                        ]
+                    customs_items.append(new_customs_item)
+            req_body["internationalOptions"]["customsItems"] = customs_items
+
+        path = "orders/createorder"
+        rsp = self.shipstation_request(
+            path, method="POST", json=req_body, should_log_body=True
+        )
+        # filling in the full response takes several more shipstation calls, enough
+        # to hit their rate limit and leave us waiting; return once the write lands
+        if request_body["skip_retrieval"]:
+            return {"data": {"success": True, "id": item_id}}
+        self.get_order_metadata()
+        formatted_order = format_order(
+            rsp,
+            self.sm_code_to_name,
+            self.carrier_code_to_name,
+            self.carrier_name_to_code,
+            tag_id_to_name=self.tag_id_to_name,
+            store_id_to_channel=self.store_id_to_channel,
+        )
+        return {"data": formatted_order}
+
+    def cancel_order(self, item_id):
+        path = f"orders/{item_id}"
+        try:
+            order = self.shipstation_request(path)
+        except PokedexException as e:
+            if e.status_code == 404:
+                raise PokedexException(
+                    f"Order {item_id} not found", 404, origin="integration"
+                )
+            raise e
+
+        # include storeId to ensure it's an update and not a new order create call
+        req_advanced_options = {
+            "advancedOptions": {"storeId": order["advancedOptions"]["storeId"]}
+        }
+        del order["advancedOptions"]
+        req_body = {
+            **order,
+            **req_advanced_options,
+            "orderStatus": "cancelled",
+        }
+        path = "orders/createorder"
+        rsp = self.shipstation_request(
+            path, method="POST", json=req_body, should_log_body=True
+        )
+        self.get_order_metadata()
+        formatted_order = format_order(
+            rsp,
+            self.sm_code_to_name,
+            self.carrier_code_to_name,
+            self.carrier_name_to_code,
+            tag_id_to_name=self.tag_id_to_name,
+            store_id_to_channel=self.store_id_to_channel,
+        )
+        return {"data": formatted_order}
+
+    def create_order_shipment_schema(self):
+        class OrderShipmentSchema(Schema):
+            carrier_id = Order().carrier_id()
+            shipped_date = Order().shipped_date(required=False)
+            tracking_number = Order().tracking_number(required=False)
+            notify_customer = Boolean(
+                "Specifies whether the customer should be notified of the shipment",
+                True,
+                required=False,
+            )
+            notify_sales_channel = Boolean(
+                "Specifies whether the sales channel should be notified of the shipment",
+                True,
+                required=False,
+            )
+            skip_retrieval = Order().skip_retrieval(obj="shipment")
+
+        schema = OrderShipmentSchema()
+        return schema
+
+    def create_order_shipment(self, request_body, item_id):
+        path = "orders/markasshipped"
+        carrier = request_body["carrier_id"]
+        req_body = {"orderId": int(item_id), "carrierCode": carrier}
+        if "shipped_date" in request_body:
+            req_body["shipDate"] = request_body["shipped_date"]
+        if "tracking_number" in request_body:
+            req_body["trackingNumber"] = request_body["tracking_number"]
+        if "notify_customer" in request_body:
+            req_body["notifyCustomer"] = request_body["notify_customer"]
+        if "notify_sales_channel" in request_body:
+            req_body["notifySalesChannel"] = request_body["notify_sales_channel"]
+
+        # shipstation silently no-ops markasshipped when tracking already exists
+        if "tracking_number" in request_body:
+            tracking_number = request_body["tracking_number"]
+            existing = self.shipstation_request(f"fulfillments?orderId={item_id}")
+            for fulfillment in existing["fulfillments"]:
+                if fulfillment["trackingNumber"] != tracking_number:
+                    continue
+                if fulfillment["voided"]:
+                    raise PokedexException(
+                        f"Tracking number {tracking_number} already exists on order "
+                        f"{item_id} as a voided shipment. ShipStation's API cannot "
+                        f"restore voided shipments — please use the Restore Shipment "
+                        f"action in the ShipStation UI instead of re-pushing tracking "
+                        f"via the API.",
+                        422,
+                        origin="integration",
+                    )
+                raise PokedexException(
+                    f"Tracking number {tracking_number} is already associated with "
+                    f"an active shipment on order {item_id}. The order is already "
+                    f"marked as shipped with this tracking — no further action is "
+                    f"needed. If you intended to replace it with a different tracking, "
+                    f"void the existing shipment in ShipStation first.",
+                    422,
+                    origin="integration",
+                )
+        self.shipstation_request(
+            path, method="POST", json=req_body, should_log_body=True
+        )
+        # enriching the response below polls up to 20s for markasshipped's async status
+        # flip; skip_retrieval returns as soon as the write lands for timeout-sensitive callers
+        if request_body["skip_retrieval"]:
+            return {"data": {"success": True, "id": item_id}}
+        # get the order + shipments since response only returns the shipment and tracking number
+        order = self.shipstation_request(f"orders/{item_id}")
+        start = time()
+        current_time = start
+        while not order["orderStatus"] == "shipped" and current_time - start < 20:
+            sleep(2)
+            order = self.shipstation_request(f"orders/{item_id}")
+            current_time = time()
+
+        if order["orderStatus"] != "shipped":
+            raise PokedexException("Order timed out", 504, origin="trackstar")
+
+        shipments = self.shipstation_request(f"fulfillments?orderId={item_id}")
+        warehouse_to_address = {}
+        warehouses = self.get_warehouses(None, None, None, None)
+        for warehouse in warehouses["data"]:
+            warehouse_to_address[warehouse["id"]] = warehouse["address"]
+
+        self.get_order_metadata()
+
+        formatted_shipments = []
+        for shipment in shipments["fulfillments"]:
+            formatted_shipment = format_order_fulfillment(
+                order,
+                shipment,
+                warehouse_to_address,
+                packages=self.packages,
+                sm_code_to_name=self.sm_code_to_name,
+                carrier_code_to_name=self.carrier_code_to_name,
+                carrier_name_to_code=self.carrier_name_to_code,
+            )
+            formatted_shipments.append(formatted_shipment)
+        formatted_order = format_order(
+            order,
+            self.sm_code_to_name,
+            self.carrier_code_to_name,
+            self.carrier_name_to_code,
+            formatted_shipments,
+            tag_id_to_name=self.tag_id_to_name,
+            store_id_to_channel=self.store_id_to_channel,
+        )
+        return {"data": formatted_order}
+
+    def get_warehouses(self, start, end, first_crawl, first_loop, page_token=1):
+        path = "warehouses"
+        warehouses = self.shipstation_request(path)
+        formatted_warehouses = []
+        for warehouse in warehouses:
+            warehouse_address = warehouse["originAddress"]
+            address = {
+                "address1": warehouse_address["street1"],
+                "address2": warehouse_address["street2"],
+                "address3": warehouse_address["street3"],
+                "city": warehouse_address["city"],
+                "state": warehouse_address["state"],
+                "postal_code": warehouse_address["postalCode"],
+                "country": warehouse_address["country"],
+            }
+            formatted_warehouse = {
+                "id": str(warehouse["warehouseId"]),
+                "created_date": format_date(warehouse["createDate"]),
+                "name": get_real_string_value(warehouse["warehouseName"])
+                or str(warehouse["warehouseId"]),
+                "code": IntegrationNotImplemented,
+                "address": address,
+                "additional_fields": {},
+            }
+            formatted_warehouses.append(formatted_warehouse)
+
+        return {"data": formatted_warehouses, "next_token": None}
+
+    def get_shipping_methods(self, start, end, first_crawl, first_loop, page_token=1):
+        path = "carriers"
+        carriers = self.shipstation_request(path)
+        formatted_shipping_methods = {}
+        for carrier in carriers:
+            carrier_code = carrier["code"]
+            carrier_name = carrier["name"]
+            services = self.shipstation_request(
+                f"carriers/listservices?carrierCode={carrier_code}"
+            )
+            for service in services:
+                shipping_method_id = service["code"]
+                if shipping_method_id not in formatted_shipping_methods:
+                    formatted_shipping_methods[shipping_method_id] = {
+                        "id": shipping_method_id,
+                        "name": service["name"],
+                        "carrier_id": carrier_code,
+                        "carrier_name": carrier_name,
+                        "scac": IntegrationNotImplemented,
+                        "additional_fields": {},
+                    }
+        return {"data": list(formatted_shipping_methods.values()), "next_token": None}
+
+    def get_warehouse_customers(
+        self, start, end, first_crawl, first_loop, page_token=None
+    ):
+        path = "stores"
+        stores = self.shipstation_request(path)
+        formatted_warehouse_customers = []
+        for store in stores:
+            created_date = format_date(store["createDate"])
+            updated_date = format_date(store["modifyDate"])
+            # shipstation can stamp a store's create a second after its modify;
+            # clamp so the created-before-updated validator doesn't abort the crawl
+            if (
+                created_date
+                and updated_date
+                and str_to_dt(created_date) > str_to_dt(updated_date)
+            ):
+                updated_date = created_date
+            formatted = {
+                "id": str(store["storeId"]),
+                "created_date": created_date,
+                "name": store["companyName"] or store["storeName"] or None,
+                "email": store["email"] or None,
+                "additional_fields": {},
+            }
+            if updated_date:
+                formatted["updated_date"] = updated_date
+            formatted_warehouse_customers.append(formatted)
+        return {"data": formatted_warehouse_customers, "next_token": None}
+
+    def get_order_packs(self, order_id):
+        try:
+            order = self.shipstation_request(f"orders/{order_id}")
+        except PokedexException as e:
+            if e.status_code == 404:
+                raise PokedexException(
+                    f"Order {order_id} not found in ShipStation",
+                    404,
+                    origin="integration",
+                )
+            raise e
+        order_carrier = order["carrierCode"]
+        shipping_method_code_to_name = {}
+
+        # direct lookup carrier info if there
+        if order_carrier:
+            carrier_rsp = self.shipstation_request(
+                "carriers/getcarrier", params={"carrierCode": order_carrier}
+            )
+            carrier_name = carrier_rsp["name"]
+            carrier_id = str(carrier_rsp["shippingProviderId"])
+            carrier_shipping_methods = self.shipstation_request(
+                "carriers/listservices",
+                params={"carrierCode": order_carrier},
+            )
+            # get shipping methods for carrier
+            for shipping_method in carrier_shipping_methods:
+                shipping_method_code_to_name[shipping_method["code"]] = shipping_method[
+                    "name"
+                ]
+        else:
+            carrier_name = None
+            carrier_id = None
+        shipment = None
+        if self.integration_secret.get("v2_api_key"):
+            shipment = self.shipstation_request(f"shipments/se-{order_id}", is_v2=True)
+            shipment_carrier = shipment["carrier_id"]
+            if shipment_carrier:
+                formatted_shipment_carrier = shipment_carrier.split("se-")[1]
+                # unlikely but in case where shipment carrier is different from order carrier
+                if formatted_shipment_carrier != carrier_id:
+                    carrier_id = formatted_shipment_carrier
+                    v2_carrier = self.shipstation_request(
+                        f"carriers/{shipment_carrier}",
+                        is_v2=True,
+                    )
+                    carrier_name = v2_carrier["carrier_code"]
+        return {
+            "data": format_order_packs(
+                order,
+                shipping_method_code_to_name,
+                carrier_name,
+                carrier_id,
+                shipment,
+                self.org_id in SHIPSTATION_SKIP_NO_SKU_LINE_ITEMS_ORGS,
+            )
+        }
+
+    def _fetch_v2_package_name(self, order_id):
+        try:
+            shipment = self.shipstation_request(f"shipments/se-{order_id}", is_v2=True)
+        except PermissionsException:
+            return None
+        for package in shipment.get("packages") or []:
+            if package.get("package_name"):
+                return package["package_name"]
+        return None
+
+    def _load_v2_package_names(self, window_start, window_end, page_size=500):
+        """Bulk fetch v2 shipments in window, keyed by shipment_id
+        (= "se-{v1.orderId}"). Maps to package_name from the first non-null
+        packages[].package_name, or None.
+
+        We key on shipment_id rather than external_shipment_id because
+        external_shipment_id (= v1.orderKey) can repeat across split-shipped
+        Shopify orders (multiple v1 records share one orderKey), which would
+        cause last-record-wins overwrites. shipment_id is strictly 1:1 with
+        v1.orderId.
+
+        Filters on modified_at (not created_at): v2.created_at tracks when v2
+        ingested the record (may lag v1.createDate by hours); v2.modified_at
+        bumps on label creation and matches v1.createDate closely.
+        """
+        out = {}
+        # the v2 shipments endpoint caps pagination at offset 10000 with no cursor, so
+        # re-anchor modified_at_start to the last shipment once a window fills that budget
+        max_page = 10000 // page_size
+        window_end_str = dt_to_str(window_end)
+        cursor_start = dt_to_str(window_start)
+        done = False
+        while not done:
+            page = 1
+            last_modified = None
+            covered_window = False
+            while page <= max_page:
+                rsp = self.shipstation_request(
+                    "shipments",
+                    params={
+                        "modified_at_start": cursor_start,
+                        "modified_at_end": window_end_str,
+                        "page": page,
+                        "page_size": page_size,
+                        "sort_by": "modified_at",
+                        "sort_dir": "asc",
+                    },
+                    is_v2=True,
+                )
+                for shipment in rsp.get("shipments") or []:
+                    key = shipment.get("shipment_id")
+                    if not key:
+                        continue
+                    name = None
+                    for package in shipment.get("packages") or []:
+                        if package.get("package_name"):
+                            name = package["package_name"]
+                            break
+                    out[key] = name
+                    # modified_at is the filter and sort key, so it is on every row
+                    last_modified = shipment["modified_at"]
+                if rsp.get("pages", 1) <= page:
+                    covered_window = True
+                    break
+                page += 1
+            # stop once the window is fully paged, or when the anchor can't advance
+            # because more than 10000 shipments share one modified_at value (can't
+            # narrow further). re-anchor is inclusive so the boundary shipment
+            # repeats, but the map is keyed by shipment_id so that's harmless.
+            if covered_window or not last_modified or last_modified == cursor_start:
+                done = True
+            else:
+                cursor_start = last_modified
+        return out
+
+
+def validate_order_status(request_body, response_data):
+    req_status = request_body["status"]
+    rsp_status = response_data["raw_status"]
+    assert rsp_status == req_status, (
+        f"key status has value {req_status} in request body and {rsp_status} in response"
+    )
+
+
+def validate_non_customs_line_field(key, request_body, response_data):
+    req_values = set()
+    # .get: line_items is optional on updates (address/shipping-only requests)
+    for li in request_body.get("line_items", []):
+        if li.get("set_or_update_customs_value"):
+            continue
+        if key in li:
+            req_values.add(li[key])
+    rsp_values = set()
+    for li in response_data["line_items"]:
+        if li[key] is not None:
+            rsp_values.add(li[key])
+    assert req_values.issubset(rsp_values), (
+        f"key {key} has value {req_values} in request body and not in the response: {rsp_values}"
+    )
+
+
+def format_inventory(product, inventory):
+    id = str(product["productId"])
+    created_date = format_date(product["createDate"])
+    updated_date = format_date(product["modifyDate"])
+    if (
+        created_date
+        and updated_date
+        and str_to_dt(created_date) > str_to_dt(updated_date)
+    ):
+        updated_date = created_date
+    sku = product["sku"]
+    sku = get_real_string_value(sku)
+    name = product["name"]
+    if string_is_empty(name):
+        name = sku or id
+    unit_cost = product["customsValue"]
+    active = product["active"]
+    awaiting = 0
+    onhand = inventory.get("on_hand", 0)
+    committed = inventory.get("allocated", 0)
+    fulfillable = inventory.get("available", 0)
+    unfulfillable = onhand - fulfillable
+    sellable = inventory.get("available", 0)
+    measurements = {
+        "length": product["length"],
+        "width": product["width"],
+        "height": product["height"],
+        "unit": IntegrationNotImplemented,
+        "weight": product["weightOz"],
+        "weight_unit": "oz",
+    }
+    to_return = {
+        "id": id,
+        "warehouse_customer_id": IntegrationNotImplemented,
+        "created_date": created_date,
+        "name": name,
+        "sku": sku,
+        "unit_cost": unit_cost,
+        "active": active,
+        "awaiting": awaiting,
+        "onhand": onhand,
+        "committed": committed,
+        "unfulfillable": unfulfillable,
+        "fulfillable": fulfillable,
+        "sellable": sellable,
+        "substitute_skus": IntegrationNotImplemented,
+        "inventory_by_warehouse_id": IntegrationNotImplemented,
+        "lots": IntegrationNotImplemented,
+        "measurements": measurements,
+        "locations": IntegrationNotImplemented,
+        "external_system_url": IntegrationNotImplemented,
+        "additional_fields": {},
+    }
+    if updated_date:
+        to_return["updated_date"] = updated_date
+    return to_return
+
+
+def format_product(product):
+    product_id = str(product["productId"])
+    created_date = format_date(product["createDate"])
+    updated_date = format_date(product["modifyDate"])
+    if (
+        created_date
+        and updated_date
+        and str_to_dt(created_date) > str_to_dt(updated_date)
+    ):
+        updated_date = created_date
+    sku = product["sku"]
+    sku = get_real_string_value(sku)
+    name = product["name"] or sku or product_id
+    if string_is_empty(name):
+        name = sku or product_id
+    inventory_items = [
+        {"inventory_item_id": product_id, "sku": sku, "unit_quantity": 1}
+    ]
+    is_kit = False
+    active = product["active"]
+    gtin = product["upc"]
+    harmonized_code = product["customsTariffNo"]
+
+    # shipstation returns a whitespace-only thumbnailUrl for products with no image,
+    # which is not a real url, so treat it as absent
+    thumbnail_url = get_real_string_value(product.get("thumbnailUrl"))
+    images = [thumbnail_url] if thumbnail_url else []
+
+    product_category = product.get("productCategory")
+    categories = (
+        [product_category["name"]]
+        if product_category and product_category.get("name")
+        else []
+    )
+
+    to_return = {
+        "id": product_id,
+        "warehouse_customer_id": IntegrationNotImplemented,
+        "created_date": created_date,
+        "unit_price": product["price"],
+        "name": name,
+        "sku": sku,
+        "gtin": gtin,
+        "inventory_items": inventory_items,
+        "is_kit": is_kit,
+        "active": active,
+        "supplier_object": IntegrationNotImplemented,
+        "country_of_origin": product["customsCountryCode"] or None,
+        "harmonized_code": harmonized_code,
+        "supplier_products": IntegrationNotImplemented,
+        "categories": categories,
+        "image_urls": images,
+        "external_system_url": IntegrationNotImplemented,
+        "additional_fields": {},
+    }
+    if updated_date:
+        to_return["updated_date"] = updated_date
+    return to_return
+
+
+def format_order(
+    order,
+    sm_code_to_name,
+    carrier_code_to_name,
+    carrier_name_to_code,
+    shipments=[],
+    skip_no_sku_line_items=False,
+    tag_id_to_name={},
+    store_id_to_channel={},
+):
+    order_id = str(order["orderId"])
+    warehouse_customer_id = str(order["advancedOptions"]["storeId"])
+    # the store's marketplace (Shopify, Amazon, "ShipStation" for manual orders) is
+    # the sales channel; a store deleted after the order leaves the channel unknown
+    channel_object = store_id_to_channel.get(order["advancedOptions"]["storeId"])
+    created_date = format_date(order["createDate"])
+    updated_date = format_date(order["modifyDate"])
+    if str_to_dt(created_date) > str_to_dt(updated_date):
+        updated_date = created_date
+
+    reference_id = order_id
+    order_number = order["orderNumber"]
+    raw_status = order["orderStatus"]
+    if raw_status in ["awaiting_payment", "awaiting_shipment"]:
+        status = "open"
+    elif raw_status == "pending_fulfillment":
+        status = "packed"
+    elif raw_status == "shipped":
+        status = "fulfilled"
+    elif raw_status in ["on_hold", "rejected_fullfillment"]:
+        status = "exception"
+    else:
+        status = "cancelled"
+    service_level = order["requestedShippingService"] or None
+    if not service_level or service_level.lower() == "none":
+        service_level = None
+    shipping_method_id = order["serviceCode"]
+    shipping_method_name = None
+    if shipping_method_id:
+        shipping_method_id = shipping_method_id.lower()
+        shipping_method_name = sm_code_to_name.get(shipping_method_id)
+    carrier = order["carrierCode"]
+    if carrier in carrier_code_to_name:
+        carrier_id = carrier
+        carrier_name = carrier_code_to_name[carrier]
+    else:
+        carrier_id = carrier_name_to_code.get(carrier)
+        carrier_name = carrier
+
+    invoice_currency_code = "USD"
+    total_price = order["amountPaid"] or order["orderTotal"]
+    total_tax = order["taxAmount"]
+    total_shipping = order["shippingAmount"]
+    total_discount = total_tax + total_shipping - total_price
+    if total_discount < 0:
+        total_discount = None
+    ship_to = order["shipTo"]
+    ship_to_address = {
+        "full_name": ship_to["name"],
+        "company": ship_to["company"],
+        "address1": ship_to["street1"],
+        "address2": ship_to["street2"],
+        "address3": ship_to["street3"],
+        "city": ship_to["city"],
+        "state": ship_to["state"],
+        "postal_code": ship_to["postalCode"],
+        "country": ship_to["country"],
+        "phone_number": ship_to["phone"],
+        "email_address": order["customerEmail"],
+    }
+    line_items = {}
+    for li in order["items"]:
+        product_id = li["productId"] and str(li["productId"]) or li["name"]
+        # a manual line can carry a placeholder like "none" that validates as empty; skip it
+        if not get_real_string_value(product_id):
+            continue
+        product_id = product_id.strip()
+        sku = li["sku"]
+        if skip_no_sku_line_items and string_is_empty(sku):
+            continue
+        line_item = {
+            "product_id": product_id,
+            "sku": sku,
+            "quantity": li["quantity"],
+            "unit_price": li["unitPrice"],
+            "discount_amount": IntegrationNotImplemented,
+        }
+        if product_id in line_items:
+            line_items[product_id]["quantity"] += li["quantity"]
+        else:
+            line_items[product_id] = line_item
+    line_items = list(line_items.values())
+    required_ship_date = format_date(order["shipByDate"])
+    # a direct order link needs a ui uuid and the account's shipNN host, neither of
+    # which the api returns, so search the order number on the shared host instead
+    order_external_system_url = None
+    if not string_is_empty(order_number):
+        order_external_system_url = f"https://ship.shipstation.com/orders/all-orders-search-result?quickSearch={quote(str(order_number))}"
+    is_third_party_freight = False
+    third_party_freight_account_number = (
+        order["advancedOptions"]["billToAccount"] or None
+    )
+    first_party_freight_account_number = (
+        order["advancedOptions"]["billToAccount"] or None
+    )
+    if order["advancedOptions"]["billToParty"] == "third_party":
+        is_third_party_freight = True
+    if order["advancedOptions"]["billToParty"] == "my_other_account":
+        first_party_freight_account_number = (
+            order["advancedOptions"]["billToMyOtherAccount"] or None
+        )
+        third_party_freight_account_number = (
+            order["advancedOptions"]["billToMyOtherAccount"] or None
+        )
+    if first_party_freight_account_number:
+        first_party_freight_account_number = str(first_party_freight_account_number)
+    if third_party_freight_account_number:
+        third_party_freight_account_number = str(third_party_freight_account_number)
+    order_warehouse_id = order["advancedOptions"]["warehouseId"] or None
+    if order_warehouse_id:
+        order_warehouse_id = str(order_warehouse_id)
+    saturday_delivery = order["advancedOptions"]["saturdayDelivery"]
+    additional_fields = {}
+    if "customField1" in order["advancedOptions"]:
+        additional_fields["custom_field_1"] = order["advancedOptions"]["customField1"]
+    if "customField2" in order["advancedOptions"]:
+        additional_fields["custom_field_2"] = order["advancedOptions"]["customField2"]
+    if "customField3" in order["advancedOptions"]:
+        additional_fields["custom_field_3"] = order["advancedOptions"]["customField3"]
+    # shipstation keeps two separate notes on an order: the one the buyer typed at
+    # checkout, and the one warehouse staff added inside shipstation
+    additional_fields["customer_notes"] = order["customerNotes"]
+    additional_fields["internal_notes"] = order["internalNotes"]
+
+    tags = []
+    residential_delivery = ship_to.get("residential", False)
+    tags.append(f"residential_delivery:{residential_delivery}")
+    for tag_id in order.get("tagIds") or []:
+        # a tag deleted in shipstation stays on already-tagged orders but drops out
+        # of accounts/listtags, so there's no name to resolve — skip it instead of
+        # failing the whole crawl over one order's orphaned tag reference
+        if tag_id not in tag_id_to_name:
+            continue
+        tags.append(tag_id_to_name[tag_id])
+    return {
+        "id": order_id,
+        "warehouse_customer_id": warehouse_customer_id,
+        "created_date": created_date,
+        "updated_date": updated_date,
+        "reference_id": reference_id,
+        "order_number": order_number,
+        "warehouse_id": order_warehouse_id,
+        "status": status,
+        "raw_status": raw_status,
+        "channel_object": channel_object,
+        "trading_partner": IntegrationNotImplemented,
+        "type": IntegrationNotImplemented,
+        "service_level": service_level,
+        "shipping_method_id": shipping_method_id,
+        "shipping_method_name": shipping_method_name,
+        "carrier_id": carrier_id,
+        "carrier_name": carrier_name,
+        "scac": IntegrationNotImplemented,
+        "invoice_currency_code": invoice_currency_code,
+        "total_price": total_price,
+        "total_tax": total_tax,
+        "total_shipping": total_shipping,
+        "total_discount": total_discount,
+        "ship_to_address": ship_to_address,
+        "line_items": line_items,
+        "required_ship_date": required_ship_date,
+        "is_third_party_freight": is_third_party_freight,
+        "third_party_freight_account_number": third_party_freight_account_number,
+        "first_party_freight_account_number": first_party_freight_account_number,
+        "saturday_delivery": saturday_delivery,
+        "signature_required": IntegrationNotImplemented,
+        "international_duty_paid_by": IntegrationNotImplemented,
+        "shipments": shipments,
+        "external_system_url": order_external_system_url,
+        "tags": tags,
+        "additional_fields": additional_fields,
+    }
+
+
+def format_order_shipment(
+    order,
+    shipment,
+    warehouse_to_address={},
+    packages={},
+    sm_code_to_name={},
+    carrier_code_to_name={},
+):
+    shipment_line_items = {}
+    package_line_items = []
+    shipment_items = shipment.get("shipmentItems") or []
+    for li in shipment_items:
+        inv_item_id = li["productId"] and str(li["productId"]) or li["name"]
+        # a manual line can carry a placeholder like "none" that validates as empty; skip it
+        if not get_real_string_value(inv_item_id):
+            continue
+        inv_item_id = inv_item_id.strip()
+        sku = li["sku"]
+        line_item = {
+            "inventory_item_id": inv_item_id,
+            "sku": sku,
+            "quantity": li["quantity"],
+            "parent_product_id": IntegrationNotImplemented,
+        }
+        if inv_item_id in shipment_line_items:
+            shipment_line_items[inv_item_id]["quantity"] += li["quantity"]
+        else:
+            shipment_line_items[inv_item_id] = line_item
+
+    shipment_line_items = list(shipment_line_items.values())
+    for sli in shipment_line_items:
+        package_line_items.append(
+            {
+                **sli,
+                "lot_id": IntegrationNotImplemented,
+                "expiration_date": IntegrationNotImplemented,
+            }
+        )
+
+    ship_to = shipment["shipTo"]
+    warehouse_id = shipment["warehouseId"]
+    if not warehouse_id:
+        warehouse_id = order["advancedOptions"]["warehouseId"]
+    warehouse_id = str(warehouse_id)
+    ship_from_address = warehouse_to_address.get(
+        warehouse_id,
+        {
+            "address1": None,
+            "address2": None,
+            "address3": None,
+            "city": None,
+            "state": None,
+            "postal_code": None,
+            "country": None,
+        },
+    )
+    ship_to_address = {
+        "full_name": ship_to["name"],
+        "company": ship_to["company"],
+        "address1": ship_to["street1"],
+        "address2": ship_to["street2"],
+        "address3": ship_to["street3"],
+        "city": ship_to["city"],
+        "state": ship_to["state"],
+        "postal_code": ship_to["postalCode"],
+        "country": ship_to["country"],
+        "phone_number": ship_to["phone"],
+        "email_address": None,
+    }
+    weight_unit = shipment["weight"]["units"]
+    weight = shipment["weight"]["value"]
+    if weight_unit == "pounds":
+        weight_unit = "lb"
+    elif weight_unit == "ounces":
+        weight_unit = "oz"
+    elif weight_unit == "grams":
+        weight_unit = "kg"
+        weight = convert_weight_units(weight, "g", "kg")
+    # welp, saw this randomly...
+    if weight_unit in ["centimeters", "inches"]:
+        weight_unit = None
+    height = None
+    length = None
+    width = None
+    unit = None
+    dimensions = shipment["dimensions"]
+    if dimensions:
+        height = dimensions["height"]
+        length = dimensions["length"]
+        width = dimensions["width"]
+        unit = dimensions["units"]
+        if unit == "inches":
+            unit = "in"
+        elif unit == "centimeters":
+            unit = "cm"
+    shipment_status = "shipped"
+    if shipment["voided"]:
+        shipment_status = "cancelled"
+
+    carrier_id = shipment["carrierCode"]
+    carrier_name = None
+    if carrier_id:
+        carrier_id = carrier_id.lower()
+        carrier_name = carrier_code_to_name.get(carrier_id)
+    shipping_method_id = shipment["serviceCode"]
+    shipping_method_name = None
+    if shipping_method_id:
+        shipping_method_id = shipping_method_id.lower()
+        shipping_method_name = sm_code_to_name.get(shipping_method_id)
+    package_code = order["packageCode"]
+    package_name = None
+    if carrier_id and package_code:
+        package = packages.get((carrier_id.lower(), package_code.lower()))
+        if package:
+            package_name = package["name"]
+    v2_package_name = shipment.get("_v2_package_name")
+    if v2_package_name:
+        package_name = v2_package_name
+    tracking_number = shipment["trackingNumber"]
+    formatted_shipment = {
+        "shipment_id": str(shipment["shipmentId"]),
+        "warehouse_id": warehouse_id,
+        "raw_status": IntegrationNotImplemented,
+        "status": shipment_status,
+        "shipped_date": format_date(shipment["createDate"]),
+        "ship_to_address": ship_to_address,
+        "ship_from_address": ship_from_address,
+        "line_items": shipment_line_items,
+        "packages": [
+            {
+                "package_id": str(shipment["shipmentId"]),
+                "package_name": package_name,
+                "tracking_url": IntegrationNotImplemented,
+                "tracking_number": tracking_number,
+                "shipping_method_id": shipping_method_id,
+                "shipping_method_name": shipping_method_name,
+                "carrier_id": carrier_id,
+                "carrier_name": carrier_name,
+                "scac": IntegrationNotImplemented,
+                "bill_of_lading": IntegrationNotImplemented,
+                "sscc": IntegrationNotImplemented,
+                "pro_number": IntegrationNotImplemented,
+                "shipping_cost": shipment["shipmentCost"],
+                "line_items": package_line_items,
+                "measurements": {  # dimensions?
+                    "length": length,
+                    "width": width,
+                    "height": height,
+                    "weight": weight,
+                    "unit": unit,
+                    "weight_unit": weight_unit,
+                },
+            }
+        ],
+    }
+    return formatted_shipment
+
+
+def format_order_fulfillment(
+    order,
+    fulfillment,
+    warehouse_to_address={},
+    packages={},
+    sm_code_to_name={},
+    carrier_code_to_name={},
+    carrier_name_to_code={},
+):
+    shipping_method_id = order["serviceCode"]
+    shipping_method_name = None
+    if shipping_method_id:
+        shipping_method_id = shipping_method_id.lower()
+        shipping_method_name = sm_code_to_name.get(shipping_method_id)
+    shipment_line_items = {}
+    package_line_items = []
+    for li in order["items"]:
+        inventory_item_id = li["productId"] and str(li["productId"]) or li["name"]
+        # a manual line can carry a placeholder like "none" that validates as empty; skip it
+        if not get_real_string_value(inventory_item_id):
+            continue
+        inventory_item_id = inventory_item_id.strip()
+        sku = li["sku"]
+        sku = get_real_string_value(sku)
+        line_item = {
+            "inventory_item_id": inventory_item_id,
+            "sku": sku,
+            "quantity": li["quantity"],
+            "parent_product_id": IntegrationNotImplemented,
+        }
+        if inventory_item_id in shipment_line_items:
+            shipment_line_items[inventory_item_id]["quantity"] += li["quantity"]
+        else:
+            shipment_line_items[inventory_item_id] = line_item
+
+    shipment_line_items = list(shipment_line_items.values())
+    for sli in shipment_line_items:
+        package_line_items.append(
+            {
+                **sli,
+                "lot_id": IntegrationNotImplemented,
+                "expiration_date": IntegrationNotImplemented,
+            }
+        )
+
+    ship_to = fulfillment["shipTo"]
+    warehouse_id = str(order["advancedOptions"]["warehouseId"])
+    ship_from_address = warehouse_to_address.get(
+        warehouse_id,
+        {
+            "address1": None,
+            "address2": None,
+            "address3": None,
+            "city": None,
+            "state": None,
+            "postal_code": None,
+            "country": None,
+        },
+    )
+    ship_to_address = {
+        "full_name": ship_to["name"],
+        "company": ship_to["company"],
+        "address1": ship_to["street1"],
+        "address2": ship_to["street2"],
+        "address3": ship_to["street3"],
+        "city": ship_to["city"],
+        "state": ship_to["state"],
+        "postal_code": ship_to["postalCode"],
+        "country": ship_to["country"],
+        "phone_number": ship_to["phone"],
+        "email_address": None,
+    }
+    shipment_status = "shipped"
+    if fulfillment["voided"]:
+        shipment_status = "cancelled"
+
+    # Could be name or ID, so try both
+    carrier = fulfillment["carrierCode"]
+    if carrier in carrier_code_to_name:
+        carrier_id = carrier
+        carrier_name = carrier_code_to_name.get(carrier_id)
+    else:
+        carrier_id = carrier_name_to_code.get(carrier)
+        carrier_name = carrier
+    package_code = order["packageCode"]
+    package_name = None
+    if carrier_id and package_code:
+        package = packages.get((carrier_id.lower(), package_code.lower()))
+        if package:
+            package_name = package["name"]
+    weight = None
+    weight_unit = None
+    if order["weight"]:
+        weight_unit = order["weight"]["units"]
+        weight = order["weight"]["value"]
+    if weight_unit == "pounds":
+        weight_unit = "lb"
+    elif weight_unit == "ounces":
+        weight_unit = "oz"
+    elif weight_unit == "grams":
+        weight_unit = "kg"
+        weight = convert_weight_units(weight, "g", "kg")
+    # welp, saw this randomly...
+    if weight_unit in ["centimeters", "inches"]:
+        weight_unit = None
+    height = None
+    length = None
+    width = None
+    unit = None
+    dimensions = order["dimensions"]
+    if dimensions:
+        height = dimensions["height"]
+        length = dimensions["length"]
+        width = dimensions["width"]
+        unit = dimensions["units"]
+        if unit == "inches":
+            unit = "in"
+        elif unit == "centimeters":
+            unit = "cm"
+    shipped_date = format_date(fulfillment["shipDate"])
+    if not shipped_date:
+        if shipment_status == "cancelled":
+            shipped_date = format_date(fulfillment["voidDate"])
+        else:
+            shipped_date = format_date(fulfillment["createDate"])
+    tracking_number = fulfillment["trackingNumber"]
+    shipment = {
+        "shipment_id": str(fulfillment["fulfillmentId"]),
+        "warehouse_id": warehouse_id,
+        "raw_status": IntegrationNotImplemented,
+        "status": shipment_status,
+        "shipped_date": shipped_date,
+        "ship_to_address": ship_to_address,
+        "ship_from_address": ship_from_address,
+        "line_items": shipment_line_items,
+        "packages": [
+            {
+                "package_id": str(fulfillment["fulfillmentId"]),
+                "package_name": package_name,
+                "tracking_url": IntegrationNotImplemented,
+                "tracking_number": tracking_number,
+                "shipping_method_id": shipping_method_id,
+                "shipping_method_name": shipping_method_name,
+                "carrier_id": carrier_id,
+                "carrier_name": carrier_name,
+                "scac": IntegrationNotImplemented,
+                "bill_of_lading": IntegrationNotImplemented,
+                "sscc": IntegrationNotImplemented,
+                "pro_number": IntegrationNotImplemented,
+                "shipping_cost": fulfillment["fulfillmentFee"],
+                "measurements": {
+                    "length": length,
+                    "width": width,
+                    "height": height,
+                    "weight": weight,
+                    "unit": unit,
+                    "weight_unit": weight_unit,
+                },
+                "line_items": package_line_items,
+            }
+        ],
+    }
+    return shipment
+
+
+def format_order_packs(
+    order,
+    sm_code_to_name,
+    carrier_name,
+    carrier_id,
+    v2_shipment=None,
+    skip_no_sku_line_items=False,
+):
+    shipping_method_id = (
+        order["serviceCode"] if not v2_shipment else v2_shipment["service_code"]
+    )
+    shipping_method_name = None
+    if shipping_method_id:
+        shipping_method_id = shipping_method_id.lower()
+        shipping_method_name = sm_code_to_name.get(shipping_method_id)
+    ship_to = order["shipTo"]
+    ship_to_address = {
+        "full_name": ship_to["name"] or None,
+        "company": ship_to["company"] or None,
+        "address1": ship_to["street1"] or None,
+        "address2": ship_to["street2"] or None,
+        "address3": ship_to["street3"] or None,
+        "city": ship_to["city"] or None,
+        "state": ship_to["state"] or None,
+        "postal_code": ship_to["postalCode"] or None,
+        "country": ship_to["country"] or None,
+        "phone_number": ship_to["phone"] or None,
+        "email_address": None,
+    }
+    line_items = {}
+    for li in order["items"]:
+        product_id = li["productId"] and str(li["productId"]) or li["name"]
+        # a manual line can carry a placeholder like "none" that validates as empty; skip it
+        if not get_real_string_value(product_id):
+            continue
+        product_id = product_id.strip()
+        sku = li["sku"]
+        if skip_no_sku_line_items and string_is_empty(sku):
+            continue
+        line_item = {
+            "product_id": product_id,
+            "sku": sku,
+            "quantity": li["quantity"],
+        }
+        if product_id in line_items:
+            line_items[product_id]["quantity"] += li["quantity"]
+        else:
+            line_items[product_id] = line_item
+
+    line_items = list(line_items.values())
+    packs = []
+    if v2_shipment:
+        count = 1
+        for package in v2_shipment["packages"]:
+            unit = package["dimensions"]["unit"]
+            if unit == "inch":
+                unit = "in"
+            elif unit == "centimeter":
+                unit = "cm"
+            weight = package["weight"]["value"]
+            weight_unit = package["weight"]["unit"]
+            if weight_unit == "gram":
+                weight_unit = "kg"
+                weight = convert_weight_units(weight, "g", "kg")
+            elif weight_unit == "kilogram":
+                weight_unit = "kg"
+            elif weight_unit == "ounce":
+                weight_unit = "oz"
+            elif weight_unit == "pound":
+                weight_unit = "lb"
+            # welp, saw this randomly...
+            if weight_unit in ["centimeters", "inches"]:
+                weight_unit = None
+
+            measurements = {
+                "length": package["dimensions"]["length"],
+                "width": package["dimensions"]["width"],
+                "height": package["dimensions"]["height"],
+                "weight": weight,
+                "unit": unit,
+                "weight_unit": weight_unit,
+            }
+            packs.append(
+                {
+                    "pack_id": package["shipment_package_id"]
+                    or f"{v2_shipment['shipment_id']}_{count}",
+                    "measurements": measurements,
+                    "line_items": [],
+                }
+            )
+            count += 1
+    return {
+        "packs": packs,
+        "carrier_id": carrier_id,
+        "carrier_name": carrier_name,
+        "scac": IntegrationNotImplemented,
+        "shipping_method_id": shipping_method_id,
+        "shipping_method_name": shipping_method_name,
+        "ship_to_address": ship_to_address,
+        "order_line_items": line_items,
+        "additional_fields": {},
+    }
+
+
+def format_date(date_str):
+    if not date_str:
+        return None
+    # TIMEZONE is PST/PDT and yyyy-MM-dd HH:mm:ss
+    date_str = date_str.split(".")[0]
+    try:
+        dt_obj = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        dt_obj = datetime.strptime(date_str, "%Y-%m-%d")
+    tz = pytz.timezone("US/Pacific")
+    dt_obj = tz.localize(dt_obj)
+    return dt_to_str(dt_obj)

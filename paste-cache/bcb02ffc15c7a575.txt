@@ -1,0 +1,27 @@
+USER: check whether packiyo's per-package tracking number is filled in on older packages. the sandbox is down
+
+CLAUDE (tool calls):
+1. grep "tracking" in integrations/wms/packiyo/integration.py; ls .claude/references/packiyo/
+2. Read integration.py lines 830-1000 (shipment/package formatting)
+3. Checked run-scripts skill and the uncommitted .claude/settings.json diff (autoMode prod-reads entry)
+4. Checked packiyo auth (lines 84-130): static bearer token, no refresh
+5. Read crawl guide and investigate skill references (dynamo-tables.md)
+6. Read prior scripts .claude/tmp/aa_verify_packages.py, packiyo_pkg_costs.py, packiyo_pkg_costs_summary.py
+
+CLAUDE (status): Packiyo uses a static API token and only GETs on reads, so checking prod is read-only. Next I'm finding a prod Packiyo connection and checking stored orders' package tracking numbers by age.
+
+7. Wrote .claude/tmp/packiyo_conns.py (read-only scan of connections-prod filtered to integration_name=packiyo) and ran it
+   -> DENIED by the auto mode classifier: [Production Reads]
+
+CLAUDE (answer):
+I couldn't check the data. The auto-mode classifier blocked my read of production, so I have no counts yet. Here is what the code says and what I'd run next.
+
+What the code does (integrations/wms/packiyo/integration.py):
+- Shipments created before 2024-09-01 are skipped entirely (lines 839-841, "packiyo shipments before sept 2024 have bugs and are unreliable"). Packages on those shipments never come through, so no tracking number appears for them at all, filled or not.
+- From then on, each package takes its tracking number from the shipment's tracking records, counting only those with type `shipping` (lines 842-848). If the number of those records doesn't match the number of packages, every package gets the first record's number (line 872). If the shipment has none, the package's tracking_number is None (lines 966-979).
+
+So "older packages" in the output starts at September 2024. A missing tracking number on a package after that date means Packiyo returned no shipping-type tracking record for that shipment.
+
+What got blocked: a read-only scan of connections-prod to list the Packiyo connections. Next I'd have run a variant of .claude/tmp/packiyo_pkg_costs.py, which you've run before. For each connection it pulls orders from a few updated_at windows (late 2024, early 2025, mid 2025, last few days) and counts packages with and without a tracking record. Packiyo uses a static bearer token and only makes GET requests here, so nothing is written to the vendor or to Dynamo.
+
+To go ahead, either add a Bash permission rule for these STAGE=prod read scripts under .claude/tmp/, or give me one or two Packiyo connection IDs and approve the run. I haven't tried any other way around the block.

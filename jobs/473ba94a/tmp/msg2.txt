@@ -1,0 +1,18 @@
+deposco: keep the live catalog walk for the auth-time inventory check
+
+test_get_inventory_auth_code failed with "Connection ID is required to get
+connection errors": the auth-time permission check runs get_inventory before the
+connection exists, so there is no stored catalog and no connection to read one
+for.
+
+build_product_and_kit_maps now walks the catalog live on that path (the old
+behavior, extracted as walk_product_catalog) and reads dynamo everywhere else.
+The walked products come from format_product, which already carries unit_cost and
+measurements on additional_fields, so both formatters are unchanged.
+
+Verified with yarn test -k deposco --auth (9 passed, shipping-methods skipped)
+and yarn test -k deposco --inventory --products (3 passed, 2 write tests skipped,
+ledger xfail).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017YUtxG7nJczeAE5nrWdMwu

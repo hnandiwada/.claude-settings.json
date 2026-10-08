@@ -1,0 +1,21 @@
+---
+name: project-crawler-resume-overlap
+description: "paused follow-up to PR #6292 - resumed crawls re-apply crawl_start_overlap to a start that already had it (or never needed it), mismatching stored page tokens"
+metadata:
+  node_type: memory
+  type: project
+  originSessionId: acca835a-b081-4399-9b0e-c59ff420692e
+  modified: 2026-09-30T15:02:40.635Z
+---
+
+Paused 2026-09-30, after PR #6292 (next_start checked against the start the integration was given). User will ask "what still needs to be done" and this is the answer.
+
+**Bug:** celery_tasks/crawler.py always subtracts crawl_start_overlap_minutes from the start it's given. When the scheduler resumes from current_crawl_start (lambda_handlers/scheduler.py ~115-118) after a next_start moved the window, the token came from a query starting at next_start (no overlap), but the resume queries from next_start minus overlap. Offset/opaque cursors then return the wrong page.
+
+**Agreed direction:**
+- current_crawl_start stores the actual query start (overlap applied), not the raw start.
+- A resume from current_crawl_start never re-applies the overlap (it continues an in-progress crawl; in-run windows don't overlap either). Fresh crawls from latest_data keep the overlap.
+- Not "skip overlap whenever a page token exists": token-only resources (returns, inventory ledger, warehouses, carrier invoices) resume from latest_data and rely on the overlap being re-applied. next_start requires store_current_crawl_params, so they're safe as-is.
+- Crawler can't tell where its start came from. Recommended: scheduler passes a `resuming` kwarg when it uses current_crawl_start (old queued messages keep today's behavior). Alt: compare to row_to_check["current_crawl_start"].
+- Sync jobs have the same bug: they resume from max(requested_start, latest_data) with the token (lambda_handlers/sync_job_scheduler.py ~103) and have no current_crawl_start; needs the query start stored on the sync job row.
+- Recommended as a separate PR from #6292 (changes resume for every WMS orders crawl).

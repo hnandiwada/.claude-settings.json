@@ -1,0 +1,766 @@
+===== integrations/wms/WMSIntegration.py:350 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        formatted_order_channels = {}
+        for o in formatted_orders:
+            channel_object = o["channel_object"]
+            if not channel_object:
+                continue
+            channel_id = channel_object["channel_id"]
+            channel_id = get_real_string_value(channel_id)
+            if not channel_id:
+                raise Exception(
+                    f"No channel ID for order {o['id']} - channel {channel_object}"
+                )
+            channel_name = channel_object["channel_name"]
+            channel_name = get_real_string_value(channel_name)
+            if not channel_name:
+                channel_name = None
+            wh_customer_id = o["warehouse_customer_id"]
+            wh_customer_id = get_real_string_value(wh_customer_id)
+            if not wh_customer_id:
+                wh_customer_id = None
+            # assume name is only unique by wh_customer_id
+            if channel_id == channel_name:
+                assert not wh_customer_id, (
+                    f"Channel ID and name are the same for a warehouse customer: {channel_id}"
+                )
+            formatted_order_channel = {
+                "id": channel_id,
+                "name": channel_name,
+                "warehouse_customer_id": wh_customer_id,
+                "additional_fields": {},
+            }
+            if channel_id in formatted_order_channels:
+                existing_channel = formatted_order_channels[channel_id]
+                assert existing_channel == formatted_order_channel, (
+                    f"Channel ID {channel_id} has multiple names {existing_channel} and {formatted_order_channel}"
+                )
+            formatted_order_channels[channel_id] = formatted_order_channel
+        return {"data": list(formatted_order_channels.values())}
+===== integrations/wms/WMSIntegration.py:389 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        formatted_suppliers = {}
+        for o in formatted_inbound_shipments:
+            supplier_object = o["supplier_object"]
+            if not supplier_object:
+                continue
+            supplier_id = supplier_object["supplier_id"]
+            supplier_id = get_real_string_value(supplier_id)
+            if not supplier_id:
+                raise Exception("No supplier ID")
+            supplier_name = supplier_object["supplier_name"]
+            supplier_name = get_real_string_value(supplier_name)
+            wh_customer_id = o["warehouse_customer_id"]
+            wh_customer_id = get_real_string_value(wh_customer_id)
+            # assume name is only unique by wh_customer_id
+            if supplier_id == supplier_name:
+                assert not wh_customer_id, (
+                    f"Supplier ID and name are the same for a warehouse customer: {supplier_id}"
+                )
+            formatted_supplier = {
+                "id": supplier_id,
+                "name": supplier_name,
+                "warehouse_customer_id": wh_customer_id,
+                "additional_fields": {},
+            }
+            if supplier_id in formatted_suppliers:
+                existing_supplier = formatted_suppliers[supplier_id]
+                assert existing_supplier == formatted_supplier, (
+                    "Supplier ID has multiple names"
+                )
+            formatted_suppliers[supplier_id] = formatted_supplier
+
+        return {"data": list(formatted_suppliers.values())}
+===== integrations/wms/extensiv-3pl-central/integration.py:797 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        if not first_loop:
+            if self.order_channel_failed:
+                return super().get_order_channels(first_loop, formatted_orders)
+            return {"data": []}
+        try:
+            wh_customer_data = self.get_warehouse_customers(
+                None, None, first_loop, False
+            )
+        except Exception:
+            self.order_channel_failed = True
+            return super().get_order_channels(first_loop, formatted_orders)
+        next_token = wh_customer_data["next_token"]
+        wh_customers = wh_customer_data["data"]
+        while next_token:
+            wh_customer_data = self.get_warehouse_customers(
+                None, None, False, False, next_token
+            )
+            wh_customers.extend(wh_customer_data["data"])
+            next_token = wh_customer_data["next_token"]
+
+        data = []
+        self.order_channel_failed = False
+        for wh_customer in wh_customers:
+            wh_customer_id = wh_customer["id"]
+            path = f"customers/{wh_customer_id}/channels?resourcetype=Order"
+            try:
+                response, _ = self.extensiv_request(path)
+            except Exception:
+                self.order_channel_failed = True
+                # don't store permission errors for order channels
+                self.api_call_errors[path] = None
+                break
+            # signal success so handle_api_call_errors clears any stale record for this URL
+            self.api_call_errors[path] = None
+            channels = response["ResourceList"]
+            for channel in channels:
+                channel_id = channel["Name"]
+                channel_name = channel["Name"]
+                id_str = f"{channel_id}_{wh_customer_id}"
+                data.append(
+                    {
+                        "id": id_str,
+                        "name": channel_name,
+                        "warehouse_customer_id": wh_customer_id,
+                    }
+                )
+        super_rsp = super().get_order_channels(first_loop, formatted_orders)
+        data.extend(super_rsp["data"])
+        return {"data": data}
+===== integrations/wms/extensiv-3pl-central/integration.py:2475 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        suppliers = []
+        page = 1
+        while page:
+            response, _ = self.extensiv_request(
+                "properties/contacts",
+                params={
+                    "pgsiz": PAGE_SIZE,
+                    "pgnum": page,
+                    "rql": "ContactType==Supplier",
+                },
+            )
+            contacts = response["ResourceList"]
+            for contact in contacts:
+                suppliers.append(
+                    {
+                        "id": str(contact["ContactId"]),
+                        "name": contact.get("CompanyName"),
+                        "warehouse_customer_id": str(
+                            contact.get("CustomerIdentifier", {}).get("Id")
+                        ),
+                        "additional_fields": {},
+                    }
+                )
+            if len(contacts) == PAGE_SIZE:
+                page += 1
+            else:
+                page = None
+        return {"data": suppliers}
+===== integrations/wms/finale/integration.py:454 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        if not first_loop:
+            return {"data": []}
+        path = "partygroup"
+        suppliers = self.finale_request(path)
+        formatted_suppliers = []
+        for supplier in suppliers:
+            role_type_id_list = supplier["roleTypeIdList"] or []
+            if "SUPPLIER" not in role_type_id_list:
+                continue
+            formatted_supplier = {
+                "id": supplier["partyId"],
+                "name": supplier["groupName"] or None,
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+            formatted_suppliers.append(formatted_supplier)
+        return {"data": formatted_suppliers}
+===== integrations/wms/fulfilmentcrowd/integration.py:539 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, shipments):
+        if not first_loop:
+            return {"data": []}
+        path = "suppliers"
+        page_token = 0
+        has_next = True
+        all_data = []
+        while has_next:
+            query_params = {
+                "offset": page_token * PAGE_SIZE,
+                "limit": PAGE_SIZE,
+            }
+            response = self.fc_request(path, params=query_params)
+            data = response["data"]
+            paging_info = response["paging_info"]
+            all_data.extend(data)
+            total = paging_info["total"]
+            if total > PAGE_SIZE * (page_token + 1):
+                page_token += 1
+            else:
+                has_next = False
+
+        suppliers = []
+        for item in all_data:
+            supplier_id = item["id"]
+            supplier_name = item["organisation_name"] + item["contact_name"]
+            # duplicated in get_inbound_shipments
+            supplier = {
+                "id": str(supplier_id),
+                "name": supplier_name,
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+            suppliers.append(supplier)
+
+        return {"data": suppliers}
+===== integrations/wms/gobolt/integration.py:274 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        if not first_loop:
+            return {"data": []}
+        return {
+            "data": [
+                {
+                    "id": c,
+                    "name": c,
+                    "warehouse_customer_id": None,
+                    "additional_fields": {},
+                }
+                for c in GOBOLT_CHANNELS
+            ]
+        }
+===== integrations/wms/helm-wms/integration.py:436 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        path = "suppliers"
+        page = 1
+        params = {
+            "page": page,
+        }
+        response = self.helm_request(path, "GET", params=params)
+        formatted_suppliers = []
+        for supplier in response["data"]:
+            formatted_suppliers.append(
+                {
+                    "id": str(supplier["id"]),
+                    "name": supplier["shipping_name"],
+                    "warehouse_customer_id": str(supplier["fulfilment_client_id"]),
+                    "additional_fields": {},
+                }
+            )
+        while page < response["last_page"]:
+            page += 1
+            params["page"] = page
+            response = self.helm_request(path, "GET", params=params)
+            for supplier in response["data"]:
+                formatted_suppliers.append(
+                    {
+                        "id": str(supplier["id"]),
+                        "name": supplier["shipping_name"],
+                        "warehouse_customer_id": str(supplier["fulfilment_client_id"]),
+                        "additional_fields": {},
+                    }
+                )
+        return {"data": formatted_suppliers}
+===== integrations/wms/infoplus/integration.py:788 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        if not first_loop:
+            return {"data": []}
+        path = "vendor/search"
+        query_params = {"limit": PAGE_SIZE}
+        page_token = 1
+        formatted_suppliers = []
+        seen_ids = set()
+        while page_token:
+            query_params["page"] = page_token
+            try:
+                response = self.infoplus_request(path, params=query_params)
+            except PermissionsException:
+                break
+            for supplier in response:
+                warehouse_customer_id = str(supplier["lobId"])
+                supplier_id = str(supplier["id"])
+                pairing_str = f"{supplier_id}_{warehouse_customer_id}"
+                # vendor/search page offsets can return the same row on two pages
+                if pairing_str in seen_ids:
+                    continue
+                seen_ids.add(pairing_str)
+                # name = supplier["name"]
+                formatted_suppliers.append(
+                    {
+                        "id": pairing_str,
+                        "name": supplier_id,
+                        "warehouse_customer_id": warehouse_customer_id,
+                        "additional_fields": {},
+                    }
+                )
+            if len(response) == PAGE_SIZE:
+                page_token += 1
+            else:
+                page_token = None
+        return {"data": formatted_suppliers}
+===== integrations/wms/infoplus/integration.py:1288 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        # order_sources_failed + order_sources populated in first loop of get_orders (needed for formatting)
+        if not first_loop:
+            if not self.order_sources_failed:
+                return super().get_order_channels(first_loop, formatted_orders)
+            return {"data": []}
+
+        order_channels = self.order_sources.values()
+        return {"data": order_channels}
+===== integrations/wms/linnworks/integration.py:597 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        path = "Inventory/GetSuppliers"
+        js = self.linnworks_request(path, ignore_log=True)
+        suppliers = []
+        for supplier in js:
+            suppliers.append(
+                {
+                    "id": supplier["pkSupplierID"],
+                    "name": supplier["SupplierName"] or None,
+                    "warehouse_customer_id": IntegrationNotImplemented,
+                    "additional_fields": {},
+                }
+            )
+        return {"data": suppliers}
+===== integrations/wms/logiwa-io/integration.py:789 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        if not first_loop:
+            return {"data": []}
+        page_token = 0
+        page_size = 100
+        has_next_page = True
+        suppliers = []
+        while has_next_page:
+            path = f"Vendor/list/i/{page_token}/s/{page_size}"
+            rsp = self.logiwa_request(path)
+            if rsp["totalCount"] > (page_token + 1) * page_size:
+                page_token += 1
+                has_next_page = True
+            else:
+                has_next_page = False
+            for item in rsp["data"]:
+                supplier = {
+                    "id": item["identifier"],
+                    "name": item["displayName"].upper(),
+                    "warehouse_customer_id": item["clientIdentifier"],
+                    "additional_fields": {},
+                }
+                suppliers.append(supplier)
+        return {"data": suppliers}
+===== integrations/wms/logiwa-io/integration.py:1016 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        if not first_loop:
+            return {"data": []}
+        # ShipmentOrder responses only carry channelId + client ID,
+        # but many channel setups can share the same channelId
+        # (differing only by setupName)
+        # Pull the full channel-setup list and dedup by
+        # channelId + client ID
+        # when we were doing this just from orders, name wasn't always filled out
+        channels_by_id = {}
+        page_token = 0
+        has_next_page = True
+        while has_next_page:
+            path = f"DataSetup/channelsetup/list/i/{page_token}/s/{PAGE_SIZE}"
+            rsp = self.logiwa_request(path)
+            # observed: KIBO connection returns {} — no channelsetup access
+            if not rsp or "totalCount" not in rsp:
+                break
+            has_next_page = False
+            if rsp["totalCount"] > (page_token + 1) * PAGE_SIZE:
+                page_token += 1
+                has_next_page = True
+            for ch in rsp["data"]:
+                channel_id = str(ch["channelId"]) if ch["channelId"] else None
+                if not channel_id:
+                    continue
+                client_id = ch["clientIdentifier"]
+                channel_name = ch["channelName"]
+                full_channel_id = f"{channel_id}_{client_id}"
+                formatted = {
+                    "id": full_channel_id,
+                    "name": channel_name,
+                    "warehouse_customer_id": client_id,
+                    "additional_fields": {},
+                }
+                if full_channel_id in channels_by_id:
+                    existing = channels_by_id[full_channel_id]
+                    assert existing["warehouse_customer_id"] == client_id, (
+                        f"Channel {channel_id} maps to multiple warehouse customers: "
+                        f"{existing['warehouse_customer_id']} vs {client_id}"
+                    )
+                    assert existing["name"] == channel_name, (
+                        f"Channel {channel_id} maps to multiple names: "
+                        f"{existing['name']} vs {channel_name}"
+                    )
+                    continue
+                channels_by_id[full_channel_id] = formatted
+        return {"data": list(channels_by_id.values())}
+===== integrations/wms/luxroutage/integration.py:354 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        page_size = 100
+        page_token = 1
+        rcb = self.integration_secret["rcb"]
+        path = f"supplier/supplierList/{rcb}/{page_token}/{page_size}"
+        response = self.luxroutage_request(path)
+        suppliers = response
+        while len(response) == page_size:
+            page_token += 1
+            path = f"supplier/supplierList/{rcb}/{page_token}/{page_size}"
+            response = self.luxroutage_request(path)
+            suppliers += response
+        formatted_suppliers = []
+        for supplier in suppliers:
+            formatted_supplier = {
+                "id": supplier["name"],
+                "name": supplier["name"],
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+            formatted_suppliers.append(formatted_supplier)
+        return {"data": formatted_suppliers}
+===== integrations/wms/mintsoft/integration.py:370 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        path = "Product/Suppliers"
+        query_params = {"Limit": PAGE_SIZE, "PageNo": 1}
+        rsp = self.mintsoft_request(path, query_params=query_params, ignore_log=True)
+        suppliers = []
+        for raw_supplier in rsp:
+            supplier = {
+                "id": str(raw_supplier["ID"]),
+                "name": raw_supplier["Name"],
+                "warehouse_customer_id": str(raw_supplier["ClientId"]),
+                "additional_fields": {},
+            }
+            suppliers.append(supplier)
+        while len(rsp) == PAGE_SIZE:
+            query_params["PageNo"] += 1
+            rsp = self.mintsoft_request(
+                path, query_params=query_params, ignore_log=True
+            )
+            for raw_supplier in rsp:
+                name = raw_supplier["Name"]
+                if name and name.lower() == "none":
+                    name = None
+                supplier = {
+                    "id": str(raw_supplier["ID"]),
+                    "name": name,
+                    "warehouse_customer_id": str(raw_supplier["ClientId"]),
+                    "additional_fields": {},
+                }
+                suppliers.append(supplier)
+
+        return {"data": suppliers}
+===== integrations/wms/monta/integration.py:130 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        rsp = self.monta_request("supplier")
+        suppliers = []
+        for raw_supplier in rsp:
+            supplier = {
+                "id": raw_supplier["Code"],
+                "name": raw_supplier["Title"],
+                "warehouse_customer_id": None,
+                "additional_fields": {},
+            }
+            suppliers.append(supplier)
+        return {"data": suppliers}
+===== integrations/wms/ongoing/integration.py:427 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        formatted_suppliers = {}
+        for shipment in formatted_inbound_shipments:
+            supplier_object = shipment["supplier_object"]
+            if not supplier_object:
+                continue
+            supplier_id = get_real_string_value(supplier_object["supplier_id"])
+            if not supplier_id:
+                raise Exception("No supplier ID")
+            # ongoing has no supplier master, so the same free-text supplierNumber can
+            # arrive with different supplierNames across purchase orders. keep the first.
+            if supplier_id in formatted_suppliers:
+                continue
+            supplier_name = get_real_string_value(supplier_object["supplier_name"])
+            formatted_suppliers[supplier_id] = {
+                "id": supplier_id,
+                "name": supplier_name,
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+
+        return {"data": list(formatted_suppliers.values())}
+===== integrations/wms/peoplevox/integration.py:369 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        raw_suppliers = self.peoplevox_request("Suppliers", ignore_log=True)
+        suppliers = []
+        for raw_supplier in raw_suppliers:
+            reference = raw_supplier["Reference"]
+            name = raw_supplier["Name"]
+            if not reference and not name:
+                continue
+            supplier = {
+                "id": reference or name,
+                "name": name,
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+            suppliers.append(supplier)
+        return {"data": suppliers}
+===== integrations/wms/picqer/integration.py:300 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, inbounds):
+        if not self.load_supplier_map():
+            # fulfilment accounts can't read suppliers, so take them from the inbounds
+            return super().get_inbound_shipment_suppliers(first_loop, inbounds)
+        return {"data": list(self.supplier_map.values())}
+===== integrations/wms/pulpo/integration.py:345 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        params = {"third_type": "S", "limit": PAGE_LIMIT, "offset": 0}
+        suppliers_res = self.pulpo_request("iam/third_parties", params=params)
+        suppliers = suppliers_res["third_parties"]
+        total_suppliers = len(suppliers) + params["offset"]
+        formatted_suppliers = []
+        for supplier in suppliers:
+            formatted_supplier = self.format_supplier(supplier)
+            formatted_suppliers.append(formatted_supplier)
+        next_token = None  # 100
+        if total_suppliers > PAGE_LIMIT:  # 20
+            next_token = PAGE_LIMIT
+        while next_token:
+            params["offset"] = next_token
+            suppliers_res = self.pulpo_request("iam/third_parties", params=params)
+            suppliers = suppliers_res["third_parties"]
+            total_suppliers = suppliers_res["total_results"] or 0
+            for supplier in suppliers:
+                formatted_supplier = self.format_supplier(supplier)
+                formatted_suppliers.append(formatted_supplier)
+            if total_suppliers > next_token + PAGE_LIMIT:
+                next_token += PAGE_LIMIT
+            else:
+                next_token = None
+        return {"data": formatted_suppliers}
+===== integrations/wms/shiphero/integration.py:1539 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, shipments):
+        if not first_loop:
+            return {"data": []}
+        suppliers = self.get_suppliers()
+        flattened_suppliers = {}
+        for supplier in suppliers:
+            flattened_suppliers[f"{supplier['id']}_{supplier['account_id']}"] = {
+                "name": supplier["name"],
+                "created_date": supplier["created_at"],
+            }
+        data = []
+        for supplier_id, supplier_info in flattened_suppliers.items():
+            wh_customer_id = supplier_id.split("_")[1]
+            name = supplier_info["name"] or None
+            if name and name.lower() == "none":
+                name = None
+            data.append(
+                {
+                    "id": supplier_id,
+                    "name": name,
+                    "warehouse_customer_id": wh_customer_id,
+                    "created_date": format_date(supplier_info["created_date"]),
+                    "additional_fields": {},
+                }
+            )
+        return {"data": data}
+===== integrations/wms/skulabs/integration.py:243 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        path = "distributor/get"
+        rsp = self.skulabs_request(path)
+
+        formatted_suppliers = []
+        for supplier in rsp:
+            formatted_supplier = {
+                "id": supplier["_id"],
+                "name": supplier["name"],
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+            formatted_suppliers.append(formatted_supplier)
+
+        return {"data": formatted_suppliers}
+===== integrations/wms/skusavvy/integration.py:734 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        if not first_loop:
+            return {"data": []}
+
+        def query(page):
+            return """
+                query{
+                    vendors(limit: %s %s){
+                        id
+                        name
+                        createdAt
+                        updatedAt
+                    }
+                }
+                """ % (
+                PAGE_SIZE,
+                f", offset: {page * PAGE_SIZE}" if page else "",
+            )
+
+        page = 0
+        formatted_vendors = []
+        while page is not None:
+            response = self.skusavvy_request(query(page))
+            for vendor in response["data"]["vendors"]:
+                formatted_vendor = {
+                    "id": vendor["id"],
+                    "name": vendor["name"],
+                    "warehouse_customer_id": IntegrationNotImplemented,
+                    "created_date": format_date(vendor["createdAt"]),
+                    "additional_fields": {},
+                }
+                if vendor["updatedAt"]:
+                    formatted_vendor["updated_date"] = format_date(vendor["updatedAt"])
+                formatted_vendors.append(formatted_vendor)
+
+            page = page + 1 if len(response["data"]["vendors"]) == PAGE_SIZE else None
+
+        return {"data": formatted_vendors}
+===== integrations/wms/skuvault/integration.py:506 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        if not first_loop:
+            return {"data": []}
+        suppliers = self.skuvault_request("products/getSuppliers", {}, ignore_log=True)[
+            "Suppliers"
+        ]
+        formatted_suppliers = []
+        for supplier in suppliers:
+            formatted_supplier = {
+                "id": supplier["Name"],
+                "name": supplier["Name"],
+                "warehouse_customer_id": None,
+                "additional_fields": {},
+            }
+            formatted_suppliers.append(formatted_supplier)
+        return {"data": formatted_suppliers}
+===== integrations/wms/star/integration.py:787 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        if not first_loop:
+            return {"data": []}
+        channels = []
+        for code, name in SALES_PLATFORM_ID_TO_NAME.items():
+            channel = {
+                "id": str(code),
+                "name": name,
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "additional_fields": {},
+            }
+            channels.append(channel)
+        return {"data": channels}
+===== integrations/wms/stord/integration.py:588 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        if not first_loop:
+            return {"data": []}
+        warehouse_customer_id = self.customer_id
+        channels = []
+        channel_params = {"limit": 100}
+        channel_next_token = True
+        while channel_next_token:
+            channel_response = self.stord_request("channels", params=channel_params)
+            for channel in channel_response["data"]:
+                channel_id = channel["channel_id"]
+                channel_name = channel["display_name"]
+                channel_object = {
+                    "id": channel_id,
+                    "name": channel_name,
+                    "warehouse_customer_id": warehouse_customer_id,
+                    # category ("D2C"/"B2B") feeds create_order's order type derivation
+                    "additional_fields": {"category": channel["category"]},
+                }
+                channels.append(channel_object)
+            channel_next_token = channel_response["metadata"]["after"]
+            channel_params["after"] = channel_next_token
+        return {"data": channels}
+===== integrations/wms/unleashed/integration.py:520 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        if not first_loop:
+            return {"data": []}
+        page = 1
+        path = f"Suppliers/{page}"
+        suppliers_rsp = self.unleashed_request(path)
+        suppliers = suppliers_rsp["Items"]
+        num_pages = suppliers_rsp["Pagination"]["NumberOfPages"]
+        while page < num_pages:
+            page += 1
+            path = f"Suppliers/{page}"
+            suppliers_rsp = self.unleashed_request(path)
+            suppliers += suppliers_rsp["Items"]
+
+        formatted_suppliers = []
+        for supplier in suppliers:
+            formatted_supplier = {
+                "id": supplier["SupplierCode"],
+                "name": supplier["SupplierName"],
+                "warehouse_customer_id": IntegrationNotImplemented,
+                "created_date": format_date(supplier["CreatedOn"]),
+                "updated_date": format_date(supplier["LastModifiedOn"]),
+                "additional_fields": {},
+            }
+            formatted_suppliers.append(formatted_supplier)
+
+        return {"data": formatted_suppliers}
+===== integrations/wms/veeqo/integration.py:224 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        suppliers = []
+        if not first_loop:
+            return {"data": suppliers}
+        path = "suppliers"
+        page = 1
+        page_size = 25
+        while page:
+            params = {"page": page, "page_size": page_size}
+            rsp = self.veeqo_request("GET", path, params=params)
+            page += 1
+            if len(rsp) < page_size:
+                page = None
+            for supplier in rsp:
+                formatted_supplier = {
+                    "id": str(supplier["id"]),
+                    "name": supplier["name"],
+                    "warehouse_customer_id": IntegrationNotImplemented,
+                    "additional_fields": {},
+                }
+                suppliers.append(formatted_supplier)
+        return {"data": suppliers}
+===== integrations/wms/warehance/integration.py:623 get_order_channels
+    def get_order_channels(self, first_loop, formatted_orders):
+        if not first_loop:
+            return {"data": []}
+        channels = []
+        params = {"limit": PAGE_SIZE}
+        has_next = True
+        while has_next:
+            rsp = self.warehance_request("stores", method="GET", params=params)
+            stores = rsp["data"]["stores"] or []
+            for store in stores:
+                channels.append(
+                    {
+                        "id": str(store["id"]),
+                        "name": store["name"],
+                        "warehouse_customer_id": str(store["client"]["id"]),
+                        "additional_fields": {},
+                    }
+                )
+            has_next = rsp["data"].get("has_next_page", False)
+            if has_next:
+                params["cursor"] = rsp["data"]["next_cursor"]
+        return {"data": channels}
+===== integrations/wms/zoho/integration.py:340 get_inbound_shipment_suppliers
+    def get_inbound_shipment_suppliers(self, first_loop, inbounds):
+        page = 1
+        suppliers = []
+        while True:
+            params = {"page": page, "per_page": PAGE_SIZE}
+            rsp = self.zoho_request("contacts", params=params)
+            contacts = rsp["contacts"]
+            for contact in contacts:
+                if contact["contact_type"] != "vendor":
+                    continue
+                formatted_supplier = {
+                    "id": str(contact["contact_id"]),
+                    "name": contact["contact_name"],
+                    "warehouse_customer_id": None,
+                    "additional_fields": {},
+                }
+                suppliers.append(formatted_supplier)
+            if not rsp["page_context"]["has_more_page"]:
+                break
+            page += 1
+        return {"data": suppliers}

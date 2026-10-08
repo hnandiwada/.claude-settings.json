@@ -1,0 +1,16 @@
+deposco: index the stored cost and measurements directly
+
+Both inventory formatters now read additional_fields["unit_cost"] and
+["measurements"] rather than tolerating their absence, per review. A stored
+product row without them is either one deposco no longer returns or a
+kitHeader-sourced kit, and we would rather see that raise than quietly report an
+item with no cost.
+
+The dev catalog has been backfilled, so the deposco inventory test passes on the
+direct read.
+
+Verified with yarn test -k deposco --inventory --products (3 passed, 2 write tests
+skipped, ledger xfail) and yarn test -k deposco --auth (9 passed, 1 skipped).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017YUtxG7nJczeAE5nrWdMwu

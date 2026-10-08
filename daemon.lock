@@ -1,0 +1,16 @@
+{
+  "pid": 51910,
+  "version": "2.1.294",
+  "jsonPath": "/Users/harshanandiwada/.claude/daemon.json",
+  "logPath": "/Users/harshanandiwada/.claude/daemon.log",
+  "startedAt": 1791436213195,
+  "origin": "transient",
+  "spawnedBy": {
+    "label": "claude",
+    "cwd": "/Users/harshanandiwada/workspace/pokedex",
+    "pid": 63699
+  },
+  "procStart": "Thu Oct  8 05:10:11 2026",
+  "launchTarget": "/Users/harshanandiwada/.local/share/claude/versions/2.1.294",
+  "processWrapper": ""
+}

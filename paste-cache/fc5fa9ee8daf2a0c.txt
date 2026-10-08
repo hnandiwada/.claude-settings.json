@@ -1,0 +1,70 @@
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T07:41:40','page':1,'offset':0}" msg_part="1/1" msg=""Getting page 10 of data""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T07:51:52','page':1,'offset':0}" msg_part="1/1" msg=""Wrote 500 items to submitter lambda s3 for table orders-prod: page 10""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T07:51:52','page':1,'offset':0}" msg_part="1/1" msg=""Getting page 11 of data""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:20:29','page':1,'offset':0}" msg_part="1/1" msg=""Wrote 500 items to submitter lambda s3 for table orders-prod: page 11""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:20:29','page':1,'offset':0}" msg_part="1/1" msg=""Getting page 12 of data""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:26:07','page':1,'offset':0}" msg_part="1/1" msg=""Wrote 500 items to submitter lambda s3 for table orders-prod: page 12""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:26:07','page':1,'offset':0}" msg_part="1/1" msg=""Getting page 13 of data""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:44:25','page':1,'offset':0}" msg_part="1/1" msg=""Wrote 500 items to submitter lambda s3 for table orders-prod: page 13""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:44:25','page':1,'offset':0}" msg_part="1/1" msg=""Getting page 14 of data""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:54:00','page':1,'offset':0}" msg_part="1/1" msg=""Wrote 500 items to submitter lambda s3 for table orders-prod: page 14""
+level="INFO" crawl_id="4a1795b17fff4f8f8b287a76e37c93c1" dd_span_id="None" dd_trace_id="None" page_token="{'modify_date':'2026-09-29T08:54:00','page':1,'offset':0}" msg_part="1/1" msg=""Waiting for submit tasks to drain through 2026-09-29T16:07:23Z""
+
+Uncaught exception: Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/harshanandiwada/workspace/shipstation-orders/scripts/crawl.py", line 268, in <module>
+    call_fn()
+    ~~~~~~~^^
+  File "/Users/harshanandiwada/workspace/shipstation-orders/scripts/crawl.py", line 260, in call_fn
+    raise e
+  File "/Users/harshanandiwada/workspace/shipstation-orders/scripts/crawl.py", line 245, in call_fn
+    run_function(
+    ~~~~~~~~~~~~^
+        function_name,
+        ^^^^^^^^^^^^^^
+    ...<7 lines>...
+        no_heartbeat,
+        ^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/harshanandiwada/workspace/shipstation-orders/scripts/crawl.py", line 75, in run_function
+    crawler.crawl_task(
+    ~~~~~~~~~~~~~~~~~~^
+        connections_row,
+        ^^^^^^^^^^^^^^^^
+    ...<8 lines>...
+        no_heartbeat=no_heartbeat,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/harshanandiwada/workspace/shipstation-orders/.venv/lib/python3.14/site-packages/celery/local.py", line 182, in __call__
+    return self._get_current_object()(*a, **kw)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/Users/harshanandiwada/workspace/shipstation-orders/.venv/lib/python3.14/site-packages/celery/app/task.py", line 430, in __call__
+    return self.run(*args, **kwargs)
+           ~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/harshanandiwada/workspace/shipstation-orders/celery_tasks/crawler.py", line 782, in crawl_task
+    return _execute_crawl_task(
+        self,
+    ...<9 lines>...
+        no_heartbeat,
+    )
+  File "/Users/harshanandiwada/workspace/shipstation-orders/celery_tasks/crawler.py", line 551, in _execute_crawl_task
+    wait_for_submit_drain(
+    ~~~~~~~~~~~~~~~~~~~~~^
+        connection_id,
+        ^^^^^^^^^^^^^^
+    ...<2 lines>...
+        sync_job_id=sync_job_id,
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/harshanandiwada/workspace/shipstation-orders/celery_tasks/crawler.py", line 132, in wait_for_submit_drain
+    raise PokedexException(
+    ...<3 lines>...
+    )
+utils.exceptions.PokedexException: Submit tasks did not drain through 2026-09-29T16:07:23Z in 300s
+
+error Command failed with exit code 1.
+info Visit https://yarnpkg.com/en/docs/cli/run for documentation about this command.

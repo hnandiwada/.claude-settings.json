@@ -1,0 +1,32 @@
+± |claude/practical-maxwell-lkqar8 {1} ✓| → yarn test -k npf --gets
+yarn run v1.22.22
+$ uv run python -m scripts.test -k npf --gets
+$ uv run python -m pytest -m '((gets) and no_perm)' --override-ini='pythonpath=test/integrations' test/integrations/wms/npfulfilment_test.py test/api/api_test.py::test_openapi -v
+STAGE=dev
+LOCALHOST=True
+LOCAL_DOCKER=False
+FARGATE=False
+========================================================================================================================================================================== test session starts ==========================================================================================================================================================================
+platform darwin -- Python 3.14.7, pytest-9.0.3, pluggy-1.6.0 -- /Users/harshanandiwada/workspace/npf/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /Users/harshanandiwada/workspace/npf
+configfile: pytest.ini
+plugins: mock-3.15.1, xdist-3.8.0, timeout-2.4.0, ddtrace-4.15.2, typeguard-2.13.3, order-1.5.0, Faker-40.39.0, anyio-4.13.0
+collected 0 items / 1 error
+
+================================================================================================================================================================================ ERRORS =================================================================================================================================================================================
+_________________________________________________________________________________________________________________________________________________________________ ERROR collecting test/api/api_test.py _________________________________________________________________________________________________________________________________________________________________
+test/api/api_test.py:22: in <module>
+    import api as api_module
+api.py:474: in <module>
+    api.config["SQLALCHEMY_DATABASE_URI"] = create_db_uri()
+                                            ^^^^^^^^^^^^^^^
+utils/sql.py:53: in create_db_uri
+    host = f"[{via6_address(socket.gethostbyname(host), STAGE)}]"
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+======================================================================================================================================================================== short test summary info ========================================================================================================================================================================
+ERROR test/api/api_test.py - socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+=========================================================================================================================================================================== 1 error in 0.77s ============================================================================================================================================================================
+ERROR: found no collectors for /Users/harshanandiwada/workspace/npf/test/api/api_test.py::test_openapi
+

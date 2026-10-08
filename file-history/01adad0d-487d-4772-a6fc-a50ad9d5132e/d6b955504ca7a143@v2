@@ -1,0 +1,557 @@
+from integrations.BaseIntegration import BaseIntegration
+from resources import (
+    InboundShipmentSupplier,
+    InventoryItem,
+    OrderChannel,
+    ShippingMethod,
+)
+from utils.exceptions import PokedexException, ResourceNotFoundException
+from utils.logutil import getLogger
+from utils.schema import IntegrationNotImplemented, get_real_string_value
+from utils.utils import dt_to_str, NoOverwriteDict
+
+logger = getLogger()
+
+
+class WMSIntegration(BaseIntegration):
+    integration_type = "wms"
+    inventory_epsilon = 0
+
+    def get_inventory(self, start, end, first_crawl, first_loop, page_token=None):
+        raise NotImplementedError
+
+    def adjust_inventory(self, request_body, item_id):
+        raise NotImplementedError
+
+    def adjust_inventory_schema(self):
+        raise NotImplementedError
+
+    def store_inventory_page_token(self):
+        return True
+
+    def store_inventory_current_crawl_params(self):
+        return False
+
+    def get_inventory_ledger(
+        self, start, end, first_crawl, first_loop, page_token=None, sync_job_id=None
+    ):
+        raise NotImplementedError
+
+    def allow_inventory_ledger_on_demand_sync(self):
+        return False
+
+    def store_inventory_ledger_page_token(self):
+        return True
+
+    def validate_inventory_sub_sku_math(self):
+        return True
+
+    def validate_inventory_warehouse_math(self):
+        return True
+
+    def get_products(
+        self, start, end, first_crawl, first_loop, page_token=None, sync_job_id=None
+    ):
+        raise NotImplementedError
+
+    def store_product_page_token(self):
+        return True
+
+    def store_product_current_crawl_params(self):
+        return True
+
+    def create_product_schema(self):
+        raise NotImplementedError
+
+    def update_product_schema(self):
+        raise NotImplementedError
+
+    def create_product(self, request_body):
+        raise NotImplementedError
+
+    def update_product(self, request_body, item_id):
+        raise NotImplementedError
+
+    def write_product_custom_validation(self):
+        return {}
+
+    def write_product_ignore_req_fields(self):
+        return []
+
+    def create_kit_schema(self):
+        raise NotImplementedError
+
+    def update_kit_schema(self):
+        raise NotImplementedError
+
+    def create_kit(self, request_body):
+        raise NotImplementedError
+
+    def update_kit(self, request_body, item_id):
+        raise NotImplementedError
+
+    def write_kit_custom_validation(self):
+        return {}
+
+    def write_kit_ignore_req_fields(self):
+        return []
+
+    def create_inventory_item_schema(self):
+        raise NotImplementedError
+
+    def update_inventory_item_schema(self):
+        raise NotImplementedError
+
+    def create_inventory_item(self, request_body):
+        raise NotImplementedError
+
+    def update_inventory_item(self, request_body, item_id):
+        raise NotImplementedError
+
+    def write_inventory_item_custom_validation(self):
+        return {}
+
+    def write_inventory_item_ignore_req_fields(self):
+        return []
+
+    def get_inbound_shipments(
+        self, start, end, first_crawl, first_loop, page_token=None, sync_job_id=None
+    ):
+        raise NotImplementedError
+
+    def store_inbound_shipment_page_token(self):
+        return True
+
+    def store_inbound_shipment_current_crawl_params(self):
+        return True
+
+    def allow_inbound_shipments_on_demand_sync(self):
+        return False
+
+    def create_inbound_shipment_schema(self):
+        raise NotImplementedError
+
+    def update_inbound_shipment_schema(self):
+        raise NotImplementedError
+
+    def create_receipt_schema(self):
+        raise NotImplementedError
+
+    def write_inbound_shipment_custom_validation(self):
+        return {}
+
+    def write_inbound_shipment_ignore_req_fields(self):
+        return []
+
+    def create_inbound_shipment(self, request_body):
+        raise NotImplementedError
+
+    def update_inbound_shipment(self, request_body, item_id):
+        raise NotImplementedError
+
+    def create_receipt(self, request_body, item_id):
+        raise NotImplementedError
+
+    def get_orders(
+        self, start, end, first_crawl, first_loop, page_token=None, sync_job_id=None
+    ):
+        raise NotImplementedError
+
+    def store_order_page_token(self):
+        return True
+
+    def store_order_current_crawl_params(self):
+        return True
+
+    def allow_orders_on_demand_sync(self):
+        return False
+
+    def populate_customer_order_trackstar_tags(
+        self, start, end, first_crawl, first_loop, page_token=None
+    ):
+        raise NotImplementedError
+
+    def get_order_packs(self, order_id):
+        raise NotImplementedError
+
+    def create_order_schema(self):
+        raise NotImplementedError
+
+    def update_order_schema(self):
+        raise NotImplementedError
+
+    def create_order_shipment_schema(self):
+        raise NotImplementedError
+
+    def attach_order_file_schema(self):
+        raise NotImplementedError
+
+    def write_order_custom_validation(self):
+        return {}
+
+    def write_order_ignore_req_fields(self):
+        return []
+
+    def write_order_shipment_custom_validation(self):
+        return {}
+
+    def create_order(self, request_body):
+        raise NotImplementedError
+
+    def update_order(self, request_body, item_id):
+        raise NotImplementedError
+
+    def create_order_shipment(self, request_body, item_id):
+        raise NotImplementedError
+
+    def cancel_order(self, item_id):
+        raise NotImplementedError
+
+    def attach_order_file(self, request_body, item_id):
+        raise NotImplementedError
+
+    def validate_financial_info_with_line_items(self):
+        return True
+
+    def validate_financial_info(self):
+        return True
+
+    def validate_line_item_discounts(self):
+        return True
+
+    def validate_unique_skus_in_order_write(self):
+        return True
+
+    def validate_unique_skus_in_inbound_write(self):
+        return True
+
+    def get_returns(
+        self, start, end, first_crawl, first_loop, page_token, sync_job_id=None
+    ):
+        raise NotImplementedError
+
+    def store_return_page_token(self):
+        return True
+
+    def return_shipments_allow_zero_qty(self):
+        return False
+
+    def return_allow_blind_receipts(self):
+        return False
+
+    def validate_restocked_received(self):
+        return True
+
+    def create_return_schema(self):
+        raise NotImplementedError
+
+    def update_return_schema(self):
+        raise NotImplementedError
+
+    def write_return_custom_validation(self):
+        return {}
+
+    def write_return_ignore_req_fields(self):
+        return []
+
+    def create_return(self, request_body):
+        raise NotImplementedError
+
+    def update_return(self, request_body, item_id):
+        raise NotImplementedError
+
+    def cancel_return(self, item_id):
+        raise NotImplementedError
+
+    def allow_returns_on_demand_sync(self):
+        return False
+
+    def get_shipping_methods(
+        self, start, end, first_crawl, first_loop, page_token=None
+    ):
+        raise NotImplementedError
+
+    def store_shipping_method_page_token(self):
+        return True
+
+    def get_bills(
+        self, start, end, first_crawl, first_loop, page_token, sync_job_id=None
+    ):
+        raise NotImplementedError
+
+    def store_bill_page_token(self):
+        return True
+
+    def store_bill_current_crawl_params(self):
+        return True
+
+    def allow_bills_on_demand_sync(self):
+        return False
+
+    def get_warehouses(self, start, end, first_crawl, first_loop, page_token=None):
+        # Overwrite this method if the integration has a warehouse endpoint
+        if self.in_perm_validator():
+            return {"data": [], "next_token": None, "api_call_made": False}
+
+        if self.is_implemented("get_inventory"):
+            InventoryItem(self).check_first_crawl_complete()
+
+        warehouses = set()
+        if first_crawl:
+            inventory_items = InventoryItem(self).get_all_resources()
+        else:
+            inventory_items = InventoryItem(self).get_all_resources(
+                {"trackstar_updated_date": {"gte": dt_to_str(start)}}
+            )
+        for item in inventory_items:
+            inventory_by_warehouse_id = item["inventory_by_warehouse_id"]
+            for warehouse_id in inventory_by_warehouse_id.keys():
+                warehouses.add(warehouse_id)
+
+        formatted_warehouses = []
+        for warehouse_id in warehouses:
+            formatted_warehouses.append(
+                {
+                    "id": warehouse_id,
+                    "name": warehouse_id,
+                    "code": IntegrationNotImplemented,
+                    "address": IntegrationNotImplemented,
+                    "additional_fields": {},
+                }
+            )
+
+        return {
+            "data": formatted_warehouses,
+            "next_token": None,
+            "api_call_made": False,
+        }
+
+    def store_warehouse_page_token(self):
+        return True
+
+    def create_warehouse_schema(self):
+        raise NotImplementedError
+
+    def create_warehouse(self, request_body):
+        raise NotImplementedError
+
+    def update_warehouse_schema(self):
+        raise NotImplementedError
+
+    def update_warehouse(self, request_body, warehouse_id):
+        raise NotImplementedError
+
+    def get_warehouse_customers(self, start, end, first_crawl, first_loop, page_token):
+        raise NotImplementedError
+
+    def store_warehouse_customer_page_token(self):
+        return True
+
+    def get_order_channels(self, first_loop, formatted_orders):
+        formatted_order_channels = {}
+        for o in formatted_orders:
+            channel_object = o["channel_object"]
+            if not channel_object:
+                continue
+            channel_id = channel_object["channel_id"]
+            channel_id = get_real_string_value(channel_id)
+            if not channel_id:
+                raise Exception(
+                    f"No channel ID for order {o['id']} - channel {channel_object}"
+                )
+            channel_name = channel_object["channel_name"]
+            channel_name = get_real_string_value(channel_name)
+            if not channel_name:
+                channel_name = None
+            wh_customer_id = o["warehouse_customer_id"]
+            wh_customer_id = get_real_string_value(wh_customer_id)
+            if not wh_customer_id:
+                wh_customer_id = None
+            # assume name is only unique by wh_customer_id
+            if channel_id == channel_name:
+                assert not wh_customer_id, (
+                    f"Channel ID and name are the same for a warehouse customer: {channel_id}"
+                )
+            formatted_order_channel = {
+                "id": channel_id,
+                "name": channel_name,
+                "warehouse_customer_id": wh_customer_id,
+                "additional_fields": {},
+            }
+            if channel_id in formatted_order_channels:
+                existing_channel = formatted_order_channels[channel_id]
+                assert existing_channel == formatted_order_channel, (
+                    f"Channel ID {channel_id} has multiple names {existing_channel} and {formatted_order_channel}"
+                )
+            formatted_order_channels[channel_id] = formatted_order_channel
+        return {
+            "data": list(formatted_order_channels.values()),
+            "api_call_made": False,
+        }
+
+    def get_inbound_shipment_suppliers(self, first_loop, formatted_inbound_shipments):
+        formatted_suppliers = {}
+        for o in formatted_inbound_shipments:
+            supplier_object = o["supplier_object"]
+            if not supplier_object:
+                continue
+            supplier_id = supplier_object["supplier_id"]
+            supplier_id = get_real_string_value(supplier_id)
+            if not supplier_id:
+                raise Exception("No supplier ID")
+            supplier_name = supplier_object["supplier_name"]
+            supplier_name = get_real_string_value(supplier_name)
+            wh_customer_id = o["warehouse_customer_id"]
+            wh_customer_id = get_real_string_value(wh_customer_id)
+            # assume name is only unique by wh_customer_id
+            if supplier_id == supplier_name:
+                assert not wh_customer_id, (
+                    f"Supplier ID and name are the same for a warehouse customer: {supplier_id}"
+                )
+            formatted_supplier = {
+                "id": supplier_id,
+                "name": supplier_name,
+                "warehouse_customer_id": wh_customer_id,
+                "additional_fields": {},
+            }
+            if supplier_id in formatted_suppliers:
+                existing_supplier = formatted_suppliers[supplier_id]
+                assert existing_supplier == formatted_supplier, (
+                    "Supplier ID has multiple names"
+                )
+            formatted_suppliers[supplier_id] = formatted_supplier
+
+        return {"data": list(formatted_suppliers.values()), "api_call_made": False}
+
+    def get_warehouse_locations(
+        self, start, end, first_crawl, first_loop, page_token=None
+    ):
+        # Overwrite this method if the integration has a warehouse location endpoint
+        if self.in_perm_validator():
+            return {"data": [], "next_token": None, "api_call_made": False}
+
+        if self.is_implemented("get_inventory"):
+            InventoryItem(self).check_first_crawl_complete()
+
+        if first_crawl:
+            inventory_items = InventoryItem(self).get_all_resources()
+        else:
+            inventory_items = InventoryItem(self).get_all_resources(
+                {"trackstar_updated_date": {"gte": dt_to_str(start)}}
+            )
+        loc_to_wh = NoOverwriteDict()
+        for item in inventory_items:
+            locations = item.get("locations", [])
+            for location in locations:
+                location_id = location["location_id"]
+                warehouse_id = location["warehouse_id"]
+                loc_to_wh[location_id] = warehouse_id
+
+        formatted_locations = []
+        for location_id, warehouse_id in loc_to_wh.items():
+            formatted_locations.append(
+                {
+                    "id": location_id,
+                    "name": IntegrationNotImplemented,
+                    "warehouse_id": warehouse_id,
+                    "type": IntegrationNotImplemented,
+                    "measurements": IntegrationNotImplemented,
+                    "additional_fields": {},
+                }
+            )
+
+        return {
+            "data": formatted_locations,
+            "next_token": None,
+            "api_call_made": False,
+        }
+
+    def store_warehouse_location_page_token(self):
+        return True
+
+    def get_shipping_method_by_name_and_carrier(
+        self, shipping_method_name, carrier=None, carrier_required_for_name=True
+    ):
+        sm_resource = ShippingMethod(self)
+        shipping_method_params = {
+            "name": {"eq": shipping_method_name},
+        }
+        if not carrier:
+            if carrier_required_for_name:
+                raise PokedexException(
+                    "Carrier must be provided if shipping method is a name instead of ID",
+                    400,
+                    origin="trackstar",
+                )
+        else:
+            shipping_method_params["carrier"] = {"eq": carrier}
+        shipping_methods = sm_resource.get_all_resources(shipping_method_params)
+        if not shipping_methods:
+            # try lowercased shipping method name
+            shipping_method_params["name"] = {"eq": shipping_method_name.lower()}
+            shipping_methods += sm_resource.get_all_resources(shipping_method_params)
+        if not shipping_methods:
+            if carrier:
+                raise PokedexException(
+                    f"Shipping method {shipping_method_name} not found for carrier {carrier}",
+                    400,
+                    origin="trackstar",
+                )
+        if not shipping_methods:
+            raise PokedexException(
+                f"Shipping method {shipping_method_name} not found",
+                400,
+                origin="trackstar",
+            )
+        shipping_method = shipping_methods[0]
+        return shipping_method
+
+    def get_order_channel_by_id_or_name(
+        self, channel_identifier, warehouse_customer_id=None
+    ):
+        # TODO delete after fully deprecated
+        channel_resource = OrderChannel(self)
+        try:
+            order_channel = channel_resource.get_resource(channel_identifier)
+        except ResourceNotFoundException:
+            params = {"name": {"eq": channel_identifier}}
+            if warehouse_customer_id:
+                params["warehouse_customer_id"] = {"eq": warehouse_customer_id}
+            order_channel = channel_resource.get_all_resources(params)
+            if not order_channel:
+                raise PokedexException(
+                    f"Order channel {channel_identifier} not found",
+                    400,
+                    origin="trackstar",
+                )
+            order_channel = order_channel[0]
+        order_channel_id = order_channel["id"]
+        if (
+            order_channel.get(
+                "warehouse_customer_id"
+            )  # TODO: only a .get while we're updating the schema
+            and order_channel["warehouse_customer_id"] in order_channel_id
+        ):
+            order_channel_id = order_channel_id.replace(
+                f"_{order_channel['warehouse_customer_id']}", ""
+            )
+        return order_channel_id
+
+    def get_supplier_by_name(self, supplier_name, warehouse_customer_id=None):
+        params = {"name": {"eq": supplier_name}}
+        if warehouse_customer_id:
+            params["warehouse_customer_id"] = {"eq": warehouse_customer_id}
+        supplier = InboundShipmentSupplier(self).get_all_resources(params)
+        if not supplier:
+            raise PokedexException(
+                f"Supplier {supplier_name} not found",
+                400,
+                origin="trackstar",
+            )
+        return supplier[0]
+
+    def make_request(self, path, method, headers=None, data=None, params=None):
+        raise NotImplementedError
+
+    def other_webhooks_to_generate(self):
+        return []

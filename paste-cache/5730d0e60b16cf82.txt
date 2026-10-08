@@ -1,0 +1,169 @@
+(Pdb) pprint(receipt_line_items)
+[
+  {
+    "inventory_item_id": "600000",
+    "sku": "600000",
+    "quantity": 1152,
+    "lot_id": "26A013",
+    "expiration_date": "2028-08-31T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600014",
+    "sku": "600014",
+    "quantity": 5760,
+    "lot_id": "26A010",
+    "expiration_date": "2028-08-28T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600024",
+    "sku": "600024",
+    "quantity": 2304,
+    "lot_id": "26A016",
+    "expiration_date": "2028-08-31T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600000",
+    "sku": "600000",
+    "quantity": 1152,
+    "lot_id": "25R005",
+    "expiration_date": "2028-06-30T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600011",
+    "sku": "600011",
+    "quantity": 2880,
+    "lot_id": "26B019",
+    "expiration_date": "2028-09-30T00:00:00Z"
+  },
+  {
+    "inventory_item_id": "600004",
+    "sku": "600004",
+    "quantity": 4320,
+    "lot_id": "26A011",
+    "expiration_date": "2028-08-31T00:00:00Z"
+  }
+]
+pprint(previous_receipts)
+new_rece(Pdb) pprint(previous_receipts)
+[
+  {
+    "id": "20-1776671744-1",
+    "arrived_date": "2026-05-14T23:06:32Z",
+    "line_items": [
+      {
+        "sku": "700000",
+        "inventory_item_id": "700000",
+        "quantity": 1350,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700004",
+        "inventory_item_id": "700004",
+        "quantity": 2050,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700008",
+        "inventory_item_id": "700008",
+        "quantity": 1400,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700011",
+        "inventory_item_id": "700011",
+        "quantity": 1600,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700014",
+        "inventory_item_id": "700014",
+        "quantity": 1750,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700018",
+        "inventory_item_id": "700018",
+        "quantity": 1800,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700021",
+        "inventory_item_id": "700021",
+        "quantity": 1600,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700024",
+        "inventory_item_id": "700024",
+        "quantity": 1500,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "700028",
+        "inventory_item_id": "700028",
+        "quantity": 1350,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26A013",
+        "inventory_item_id": "26A013",
+        "quantity": 1152,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26A010",
+        "inventory_item_id": "26A010",
+        "quantity": 5760,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26A016",
+        "inventory_item_id": "26A016",
+        "quantity": 2304,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "25R005",
+        "inventory_item_id": "25R005",
+        "quantity": 1152,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26B019",
+        "inventory_item_id": "26B019",
+        "quantity": 2880,
+        "lot_id": null,
+        "expiration_date": null
+      },
+      {
+        "sku": "26A011",
+        "inventory_item_id": "26A011",
+        "quantity": 4320,
+        "lot_id": null,
+        "expiration_date": null
+      }
+    ]
+  }
+]
+(Pdb) new_received_by_key
+defaultdict(<class 'int'>, {('700000', None, None): 1350, ('700004', None, None): 2050, ('700008', None, None): 1400, ('700011', None, None): 1600, ('700014', None, None): 1750, ('700018', None, None): 1800, ('700021', None, None): 1600, ('700024', None, None): 1500, ('700028', None, None): 1350, ('600000', '26A013', '2028-08-31T00:00:00Z'): 1152, ('600014', '26A010', '2028-08-28T00:00:00Z'): 5760, ('600024', '26A016', '2028-08-31T00:00:00Z'): 2304, ('600000', '25R005', '2028-06-30T00:00:00Z'): 1152, ('600011', '26B019', '2028-09-30T00:00:00Z'): 2880, ('600004', '26A011', '2028-08-31T00:00:00Z'): 4320})
+new_received_by_inv_id
+raise_li_exceptions
+(Pdb) new_received_by_inv_id
+defaultdict(<class 'int'>, {'700000': 1350, '700004': 2050, '700008': 1400, '700011': 1600, '700014': 1750, '700018': 1800, '700021': 1600, '700024': 1500, '700028': 1350, '600000': 2304, '600014': 5760, '600024': 2304, '600011': 2880, '600004': 4320})
+raise_li_exceptions
+(Pdb) raise_li_exceptions
+[]

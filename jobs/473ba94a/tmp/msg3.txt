@@ -1,0 +1,17 @@
+deposco: keep the auth-time inventory check to a single page
+
+The auth-time permission check gates connecting an account, so it has to be fast.
+Walking the whole product catalog there (previous commit) was the slow way to
+prove the endpoints read.
+
+Read one page of products instead, which still exercises search/item and
+search/kitHeader, and return right after the first inventory page rather than
+paging on and running a zero-fill that would be wrong against a partial product
+map anyway.
+
+The deposco auth suite drops from 84s to 14s; test_get_inventory_auth_code itself
+is 3.0s. Also verified with yarn test -k deposco --inventory --products (3
+passed, 2 write tests skipped, ledger xfail).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017YUtxG7nJczeAE5nrWdMwu

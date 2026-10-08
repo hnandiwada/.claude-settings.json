@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# Make a bare `git branch` also show which worktree each branch is checked out in.
+#
+#   * main            [my-repo]
+#   + feature/login   [login-wt]
+#     old-branch
+#
+# Any other `git` invocation (including `git branch <args>`) is passed through untouched.
+
+git() {
+	if [[ $# -eq 1 && $1 == branch ]]; then
+		command git for-each-ref refs/heads \
+			--format='%(if)%(HEAD)%(then)* %(color:green)%(else)%(if)%(worktreepath)%(then)+ %(color:cyan)%(else)  %(end)%(end)%(refname:short)%(color:reset)%(if)%(worktreepath)%(then)  %(color:yellow)[@@WT@@%(worktreepath)]%(color:reset)%(end)' \
+			| sed 's#@@WT@@[^]]*/##'
+		return "${PIPESTATUS[0]}"
+	fi
+	command git "$@"
+}

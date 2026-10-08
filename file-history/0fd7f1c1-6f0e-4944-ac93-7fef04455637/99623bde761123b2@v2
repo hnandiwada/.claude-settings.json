@@ -1,0 +1,101 @@
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+os.environ["STAGE"] = "prod"
+os.environ["DRY_RUN"] = "true"
+
+from integrations.wms.logiwa.integration import PAGE_SIZE  # noqa: E402
+from utils.boto import get_connections_row, get_org_private_key, org_decrypt  # noqa: E402
+from utils.integrations import get_integration_file  # noqa: E402
+
+CID = sys.argv[1]
+row = get_connections_row(CID)
+secret = org_decrypt(row["integration_secret"], get_org_private_key(row["org_id"]))
+f = get_integration_file(row["integration_name"], row["integration_type"])
+i = f.Integration(
+    connection_id=CID,
+    org_id=row["org_id"],
+    integration_secret=secret,
+    connection_additional_fields=row["additional_fields"],
+    customer_id=row["customer_id"],
+)
+
+
+def walk(depositor_id):
+    rows = []
+    body = {"PageSize": PAGE_SIZE}
+    if depositor_id:
+        body["DepositorID"] = depositor_id
+    page = 1
+    started = time.time()
+    while page:
+        body["SelectedPageIndex"] = page
+        response = i.logiwa_request("ListingInventoryReport", json=body, ignore_log=True)["Data"]
+        rows.extend(response)
+        if len(response) == PAGE_SIZE:
+            page += 1
+        else:
+            pages = page
+            page = None
+    return rows, pages, time.time() - started
+
+
+# same map-building as get_listing_inventory_and_active_map, so both sides are compared on output
+def build_maps(rows):
+    listing_inventory = {}
+    product_active_map = {}
+    for listing in rows:
+        code = listing["Code"]
+        if listing["ChannelID"] and not product_active_map.get(code):
+            product_active_map[code] = listing["ChannelIsActive"] == True
+        inv_id = f"{code}_{listing['DepositorID']}"
+        if inv_id not in listing_inventory:
+            listing_inventory[inv_id] = listing
+    return listing_inventory, product_active_map
+
+
+customers = i.get_warehouse_customers(None, None, False, True)["data"]
+customer_ids = []
+for customer in customers:
+    customer_ids.append(customer["id"])
+customer_ids.sort()
+print(f"{CID}: {len(customer_ids)} warehouse customers", flush=True)
+
+per_customer_rows = []
+per_customer_pages = 0
+per_customer_seconds = 0
+for customer_id in customer_ids:
+    rows, pages, seconds = walk(customer_id)
+    print(f"  customer {customer_id}: {len(rows)} rows, {pages} pages, {seconds:.0f}s", flush=True)
+    per_customer_rows.extend(rows)
+    per_customer_pages += pages
+    per_customer_seconds += seconds
+
+unfiltered_rows, unfiltered_pages, unfiltered_seconds = walk(None)
+
+unfiltered_inv, unfiltered_active = build_maps(unfiltered_rows)
+per_customer_inv, per_customer_active = build_maps(per_customer_rows)
+
+depositors_outside_customers = {}
+for listing in unfiltered_rows:
+    depositor = str(listing["DepositorID"])
+    if depositor not in customer_ids:
+        depositors_outside_customers[depositor] = depositors_outside_customers.get(depositor, 0) + 1
+
+only_unfiltered = set(unfiltered_inv).difference(per_customer_inv)
+only_per_customer = set(per_customer_inv).difference(unfiltered_inv)
+active_diffs = []
+for code in set(unfiltered_active).union(per_customer_active):
+    if unfiltered_active.get(code) != per_customer_active.get(code):
+        active_diffs.append(code)
+
+print(f"RESULT {CID}")
+print(f"  unfiltered:   {len(unfiltered_rows)} rows, {unfiltered_pages} pages, {unfiltered_seconds / 60:.1f} min")
+print(f"  per customer: {len(per_customer_rows)} rows, {per_customer_pages} pages, {per_customer_seconds / 60:.1f} min")
+print(f"  inventory keys: {len(unfiltered_inv)} unfiltered vs {len(per_customer_inv)} per customer")
+print(f"  keys only in unfiltered: {len(only_unfiltered)} {sorted(only_unfiltered)[:10]}")
+print(f"  keys only in per customer: {len(only_per_customer)} {sorted(only_per_customer)[:10]}")
+print(f"  active map: {len(unfiltered_active)} vs {len(per_customer_active)}, {len(active_diffs)} differ {sorted(active_diffs)[:10]}")
+print(f"  rows under a depositor that isn't a warehouse customer: {depositors_outside_customers}")

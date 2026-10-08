@@ -1,0 +1,605 @@
+import re
+
+W = "integrations/wms/"
+edits = []
+
+
+def e(path, old, new, count=1):
+    edits.append((path, old, new, count))
+
+
+# bigcommerce
+e(
+    "integrations/cart/bigcommerce/integration.py",
+    """                raise PokedexException(
+                    f"BigCommerce accepted shipment {shipment_rsp['id']} for order {order_id} "
+                    f"but after {SHIPMENT_APPLIED_TIMEOUT_SECONDS}s the order still reads "
+                    f"items_shipped {order_rsp['items_shipped']} and status "
+                    f"{order_rsp['status']}. The shipment exists, so do not resend it.",
+                    504,
+                    origin="integration",
+                )""",
+    """                raise WriteNotReturnedException(CartOrder(), order_id)""",
+)
+
+# canary7
+e(
+    W + "canary7/integration.py",
+    """        if len(detail_rsp) == 0:
+            raise PokedexException(
+                "Unable to find inbound shipment", 500, origin="integration"
+            )""",
+    """        if len(detail_rsp) == 0:
+            raise WriteNotReturnedException(
+                InboundShipment(), data["purchase_order_number"]
+            )""",
+)
+
+# controlport
+e(
+    W + "controlport/integration.py",
+    """        if asn is None:
+            raise PokedexException(
+                f"return {asn_id} was created but could not be read back; do not retry",
+                500,
+                origin="integration",
+            )""",
+    """        if asn is None:
+            raise WriteNotReturnedException(Return(), asn_id)""",
+)
+e(
+    W + "controlport/integration.py",
+    """        if not formatted:
+            raise PokedexException(
+                f"order {order_id} was cancelled but could not be read back; "
+                "do not retry",
+                500,
+                origin="integration",
+            )""",
+    """        if not formatted:
+            raise WriteNotReturnedException(Order(), order_id)""",
+)
+
+# deposco
+e(
+    W + "deposco/integration.py",
+    """            except ResourceNotFoundException:
+                if attempt == 5:
+                    raise
+                sleep(2)""",
+    """            except ResourceNotFoundException:
+                if attempt == 5:
+                    raise WriteNotReturnedException(
+                        InboundShipment(), data["purchase_order_number"]
+                    )
+                sleep(2)""",
+)
+e(
+    W + "deposco/integration.py",
+    """        if not status_rsp:
+            raise PokedexException(
+                f"Failed to confirm cancellation of customer order {external_order_number}",
+                500,
+                origin="integration",
+            )""",
+    """        if not status_rsp:
+            raise WriteNotReturnedException(
+                DeposcoCustomerOrder(), external_order_number
+            )""",
+)
+e(
+    W + "deposco/integration.py",
+    """                    if "not find any CoHeaders" in e.message:
+                        raise PokedexException(
+                            f"Failed to create customer order {request_body['reference_id']}",
+                            500,
+                            origin="integration",
+                        )
+                    raise e
+        if not status_rsp:
+            raise PokedexException(
+                f"Failed to create customer order {request_body['reference_id']}",
+                500,
+                origin="integration",
+            )""",
+    """                    if "not find any CoHeaders" in e.message:
+                        raise WriteNotReturnedException(
+                            DeposcoCustomerOrder(), request_body["reference_id"]
+                        )
+                    raise e
+        if not status_rsp:
+            raise WriteNotReturnedException(
+                DeposcoCustomerOrder(), request_body["reference_id"]
+            )""",
+)
+
+# i-fulfilment
+e(
+    W + "i-fulfilment/integration.py",
+    """        if not data:
+            # a degraded sandbox has accepted the order but returned no goodsout
+            raise PokedexException(
+                f"I-Fulfilment accepted order {full_order_ref} but returned no goodsout for it",
+                502,
+                origin="integration",
+            )""",
+    """        if not data:
+            raise WriteNotReturnedException(Order(), full_order_ref)""",
+)
+
+# logicpod
+e(
+    W + "logicpod/integration.py",
+    """        if not found_product:
+            raise PokedexException(
+                "Product was created but not found when fetching. It may still be processing in Logicpod. Please check the Logicpod UI to confirm creation.",
+                400,
+                origin="integration",
+            )""",
+    """        if not found_product:
+            raise WriteNotReturnedException(Product(), data["sku"])""",
+)
+e(
+    W + "logicpod/integration.py",
+    """        if not found_shipment:
+            raise PokedexException(
+                "Inbound shipment was created but not found when fetching. It may still be processing in Logicpod. Please check the Logicpod UI to confirm creation.",
+                400,
+                origin="integration",
+            )""",
+    """        if not found_shipment:
+            raise WriteNotReturnedException(InboundShipment(), po_number)""",
+)
+e(
+    W + "logicpod/integration.py",
+    """        # pre-processing accepted the order but it hasn't dropped into the wms api
+        if not created_order_rsp:
+            raise PokedexException(
+                f"Logicpod accepted order {order_number} but it has not appeared in the WMS api",
+                502,
+                origin="integration",
+            )""",
+    """        # pre-processing accepted the order but it hasn't dropped into the wms api
+        if not created_order_rsp:
+            raise WriteNotReturnedException(Order(), order_number)""",
+)
+
+# logiwa
+e(
+    W + "logiwa/integration.py",
+    """        if not inbound:
+            # a 4xx so client libraries don't retry the create: logiwa said it took
+            # the create, so sending it again risks a second receipt
+            raise PokedexException(
+                f"Logiwa reported inbound shipment {code} as created but we could "
+                "not read it back",
+                400,
+                origin="integration",
+            )""",
+    """        if not inbound:
+            raise WriteNotReturnedException(InboundShipment(), code)""",
+)
+
+# logiwa-io
+e(
+    W + "logiwa-io/integration.py",
+    """        if not inbound_row:
+            raise PokedexException(
+                "Inbound shipment creation timed out", 204, origin="integration"
+            )""",
+    """        if not inbound_row:
+            raise WriteNotReturnedException(InboundShipment(), inbound_shipment_id)""",
+)
+e(
+    W + "logiwa-io/integration.py",
+    """        if not order:
+            raise PokedexException(
+                "Order creation timed out", 204, origin="integration"
+            )""",
+    """        if not order:
+            raise WriteNotReturnedException(Order(), order_id)""",
+)
+
+# masonhub
+M = W + "masonhub/integration.py"
+e(
+    M,
+    """        created_product = self.wait_for_create(created_args, resource_name)""",
+    """        resource = Product()
+        if resource_name == "Kit":
+            resource = Kit()
+        created_product = self.wait_for_create(
+            created_args, resource, created_product_cid
+        )""",
+)
+e(
+    M,
+    """        updated = self.wait_for_update(req_body, updated_args, resource_name)""",
+    """        resource = Product()
+        if resource_name == "Kit":
+            resource = Kit()
+        updated = self.wait_for_update(req_body, updated_args, resource, product_id)""",
+)
+e(
+    M,
+    """        created_inbound_shipment = self.wait_for_create(created_args, "InboundShipment")""",
+    """        created_inbound_shipment = self.wait_for_create(
+            created_args, InboundShipment(), created_inbound_cid
+        )""",
+)
+e(
+    M,
+    """        updated = self.wait_for_update(req_body, updated_args, "Inbound shipment")""",
+    """        updated = self.wait_for_update(
+            req_body, updated_args, InboundShipment(), inbound_shipment_id
+        )""",
+)
+e(
+    M,
+    """        created_order = self.wait_for_create(created_args, "Order")""",
+    """        created_order = self.wait_for_create(created_args, Order(), created_order_cid)""",
+)
+e(
+    M,
+    """        created_return = self.wait_for_create(created_args, "Return")""",
+    """        created_return = self.wait_for_create(
+            created_args, Return(), created_return_cid
+        )""",
+)
+e(
+    M,
+    """        updated = self.wait_for_update(req_body, updated_args, "Return")""",
+    """        updated = self.wait_for_update(req_body, updated_args, Return(), return_id)""",
+)
+e(
+    M,
+    """        if not success:
+            raise PokedexException(
+                "Order update request timed out", 504, origin="integration"
+            )""",
+    """        if not success:
+            raise WriteNotReturnedException(Order(), order_id)""",
+)
+e(
+    M,
+    """    def wait_for_create(self, masonhub_args, resource_name):""",
+    """    def wait_for_create(self, masonhub_args, resource, id):""",
+)
+e(
+    M,
+    """        if not created:
+            raise PokedexException(
+                f"{resource_name} creation timed out", 504, origin="integration"
+            )""",
+    """        if not created:
+            raise WriteNotReturnedException(resource, id)""",
+)
+e(
+    M,
+    """    def wait_for_update(self, raw_req, masonhub_args, resource_name):""",
+    """    def wait_for_update(self, raw_req, masonhub_args, resource, id):""",
+)
+e(
+    M,
+    """        if not updated:
+            raise PokedexException(
+                f"{resource_name} update timed out", 504, origin="integration"
+            )""",
+    """        if not updated:
+            raise WriteNotReturnedException(resource, id)""",
+)
+
+# quiet
+e(
+    W + "quiet/integration.py",
+    """                sleep(1)
+        if len(order_list) != 1:""",
+    """                sleep(1)
+        if not order_list:
+            raise WriteNotReturnedException(Order(), order_number)
+        if len(order_list) != 1:""",
+)
+
+# shipfusion
+S = W + "shipfusion/integration.py"
+for name, var, resource in [
+    ("created product", "created_product_id", "Product()"),
+    ("updated product", "update_product_id", "Product()"),
+    ("created inbound shipment", "created_inbound_shipment_id", "InboundShipment()"),
+    ("created order", "created_order_id", "Order()"),
+    ("updated order", "updated_order_id", "Order()"),
+    ("created return", "return_id", "Return()"),
+]:
+    e(
+        S,
+        f"""            raise PokedexException(
+                f"Shipfusion never returned {name} {{{var}}}",
+                404,
+                origin="integration",
+            )""",
+        f"""            raise WriteNotReturnedException({resource}, {var})""",
+    )
+
+# shiphero
+H = W + "shiphero/integration.py"
+e(
+    H,
+    """            except PokedexException as e:
+                # the return exists, so name it and a caller won't retry into a duplicate
+                raise PokedexException(
+                    f"ShipHero created return {return_id} but it could not be read back: {e}",
+                    500,
+                    origin="integration",
+                ) from e""",
+    """            except PokedexException as e:
+                raise WriteNotReturnedException(Return(), return_id) from e""",
+)
+e(
+    H,
+    """            raise PokedexException("Return update timed out.", 504, origin="trackstar")""",
+    """            raise WriteNotReturnedException(Return(), return_id)""",
+)
+
+# shipmonk
+K = W + "shipmonk/integration.py"
+e(
+    K,
+    """            except PokedexException as e:
+                if "Order with orderKey" in str(e):
+                    time.sleep(1)
+                    continue
+                else:
+                    raise e
+        formatted_order = format_order(orders_response["data"], inv_mapping=inv_mapping)""",
+    """            except PokedexException as e:
+                if "Order with orderKey" in str(e):
+                    time.sleep(1)
+                    current_time = time.time()
+                    continue
+                else:
+                    raise e
+        if not orders_response:
+            raise WriteNotReturnedException(Order(), order_id)
+        formatted_order = format_order(orders_response["data"], inv_mapping=inv_mapping)""",
+)
+e(
+    K,
+    """            raise PokedexException("Order update timed out", 504, origin="trackstar")""",
+    """            raise WriteNotReturnedException(Order(), order_id)""",
+)
+e(
+    K,
+    """            raise PokedexException(
+                f"Return created with id: {created_return_id} but not yet available in Shipmonk API",
+                400,
+                origin="integration",
+            )""",
+    """            raise WriteNotReturnedException(Return(), created_return_id)""",
+)
+
+# shipstation
+e(
+    W + "shipstation/integration.py",
+    """            raise PokedexException("Order timed out", 504, origin="trackstar")""",
+    """            raise WriteNotReturnedException(Order(), item_id)""",
+)
+
+# skuvault
+V = W + "skuvault/integration.py"
+e(
+    V,
+    """        if not product:
+            action = "update" if item_id else "create"
+            raise PokedexException(
+                f"Product {action} timed out", 504, origin="trackstar"
+            )""",
+    """        if not product:
+            raise WriteNotReturnedException(Product(), sku)""",
+)
+e(
+    V,
+    """            raise PokedexException("Kit creation timed out", 504, origin="integration")""",
+    """            raise WriteNotReturnedException(Kit(), data["sku"])""",
+)
+e(
+    V,
+    """        if not pos:
+            raise PokedexException(
+                "Inbound Shipment creation timed out", 504, origin="integration"
+            )""",
+    """        if not pos:
+            raise WriteNotReturnedException(InboundShipment(), po_number)""",
+)
+e(
+    V,
+    """            corrections = receives_history["Corrections"]
+
+        if not receipt_in_skuvault_system:
+            raise PokedexException(
+                "Receipt creation timed out", 504, origin="integration"
+            )""",
+    """            corrections = receives_history["Corrections"]
+            current_time = time.time()
+
+        if not receipt_in_skuvault_system:
+            raise WriteNotReturnedException(InboundShipment(), po_number)""",
+)
+e(
+    V,
+    """        if exc:
+            raise exc
+        if not orders:
+            raise PokedexException("Order creation timed out", 504, origin="trackstar")""",
+    """        if not orders:
+            if exc:
+                raise exc
+            raise WriteNotReturnedException(Order(), order_id)""",
+)
+e(
+    V,
+    """            raise PokedexException("Order update timed out", 504, origin="trackstar")""",
+    """            raise WriteNotReturnedException(Order(), item_id)""",
+)
+
+# smart-warehousing
+SW = W + "smart-warehousing/integration.py"
+e(
+    SW,
+    """            shipments = data["Receipts"]
+            if shipments:
+                shipment = shipments["Receipt"]
+
+        if not shipment:
+            raise PokedexException(
+                "Failed to create inbound shipment", 500, origin="integration"
+            )""",
+    """            shipments = data["Receipts"]
+            if shipments:
+                shipment = shipments["Receipt"]
+            else:
+                time.sleep(1)
+                current_time = time.time()
+
+        if not shipment:
+            raise WriteNotReturnedException(
+                InboundShipment(), request_body["reference_id"]
+            )""",
+)
+e(
+    SW,
+    """            if "order_details" in orders:
+                order = orders["order_details"]
+
+        if not order:
+            raise PokedexException("Failed to create order", 504, origin="trackstar")""",
+    """            if "order_details" in orders:
+                order = orders["order_details"]
+            else:
+                time.sleep(1)
+                current_time = time.time()
+
+        if not order:
+            raise WriteNotReturnedException(Order(), request_body["reference_id"])""",
+)
+e(
+    SW,
+    """            returns = data["Receipts"]
+            if returns:
+                _return = returns["Receipt"]
+
+        if not _return:
+            raise PokedexException("Failed to create return", 400, origin="trackstar")""",
+    """            returns = data["Receipts"]
+            if returns:
+                _return = returns["Receipt"]
+            else:
+                time.sleep(1)
+                current_time = time.time()
+
+        if not _return:
+            raise WriteNotReturnedException(Return(), request_body["reference_id"])""",
+)
+
+# stord
+e(
+    W + "stord/integration.py",
+    """        if not inbound_shipment:
+            raise PokedexException(
+                "Inbound shipment creation timed out", 204, origin="trackstar"
+            )""",
+    """        if not inbound_shipment:
+            raise WriteNotReturnedException(
+                InboundShipment(), data["purchase_order_number"]
+            )""",
+)
+e(
+    W + "stord/integration.py",
+    """        if status != "canceled":
+            raise PokedexException(
+                "Order cancellation timed out", 504, origin="trackstar"
+            )""",
+    """        if status != "canceled":
+            raise WriteNotReturnedException(Order(), order_id)""",
+)
+
+# tlogistics
+T = W + "tlogistics/integration.py"
+e(
+    T,
+    """        return {"data": self.read_order_back(results)}
+
+    def read_order_back(self, results):
+        if not results:
+            # the merge came back clean but the order is not in the extract. it
+            # lands somewhere the read cannot see it yet
+            raise PokedexException(
+                "tlogistics accepted the order but it is not readable back yet",
+                502,
+                origin="integration",
+            )""",
+    """        return {"data": self.read_order_back(results, order_id)}
+
+    def read_order_back(self, results, order_id):
+        if not results:
+            raise WriteNotReturnedException(Order(), order_id)""",
+)
+e(
+    T,
+    """        return {"data": self.read_order_back(results)}""",
+    """        return {"data": self.read_order_back(results, item_id)}""",
+    count=2,
+)
+
+# veracore
+e(
+    W + "veracore/integration.py",
+    """        if not desired_arrival:
+            raise PokedexException(
+                "Inbound Shipment failed to create", 500, origin="integration"
+            )""",
+    """        if not desired_arrival:
+            raise WriteNotReturnedException(InboundShipment(), purchase_order_number)""",
+)
+
+failed = False
+files = {}
+for path, old, new, count in edits:
+    if path not in files:
+        files[path] = open(path).read()
+    found = files[path].count(old)
+    if found != count:
+        print(f"MISMATCH {path}: expected {count}, found {found}\n{old[:120]}\n")
+        failed = True
+        continue
+    files[path] = files[path].replace(old, new)
+
+if failed:
+    raise SystemExit(1)
+
+
+def add_import(src):
+    multi = re.search(r"from utils\.exceptions import \(\n(.*?)\)", src, re.S)
+    if multi:
+        names = multi.group(1)
+        lines = names.rstrip("\n").split("\n")
+        lines.append("    WriteNotReturnedException,")
+        return src.replace(multi.group(0), "from utils.exceptions import (\n" + "\n".join(lines) + "\n)")
+    single = re.search(r"from utils\.exceptions import (.+)\n", src)
+    names = single.group(1).split(", ")
+    names.append("WriteNotReturnedException")
+    joined = ", ".join(names)
+    line = f"from utils.exceptions import {joined}\n"
+    if len(line) > 89:
+        inner = ""
+        for name in names:
+            inner += f"    {name},\n"
+        line = f"from utils.exceptions import (\n{inner})\n"
+    return src.replace(single.group(0), line)
+
+
+for path, src in files.items():
+    src = add_import(src)
+    if path.endswith("deposco/integration.py") or path.endswith("shiphero/integration.py"):
+        pass
+    open(path, "w").write(src)
+    print("updated", path)

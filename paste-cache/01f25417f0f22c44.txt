@@ -1,0 +1,82 @@
+
+ ▐▛███▛█   Claude Code v2.1.294
+▝▜██████▀  Opus 5.5 · Claude Pro
+ ▝▝   ▝▝   ~/workspace/pokedex · /rc
+
+
+❯ read some packiyo prod order data to see if there are per-package costs on multipackage shipments
+
+  Listed 2 directories, ran 3 shell commands
+
+⏺ Writing a read-only script that pulls raw Packiyo orders (with shipments and packages) from a prod connection. First I'm finding a prod Packiyo connection.
+
+  Searched for 1 pattern, ran 2 shell commands
+
+⏺ Packages do carry a shipping_cost and a tracking_number, but all three samples are an exact even split of the shipment cost. Checking more connections for any uneven split.
+
+  Ran 1 shell command
+
+⏺ Yes, Packiyo returns a real cost for each package. Each package has a shipping_cost field, and it is often different from the other packages in the same shipment. Our integration doesn't read it. Instead,
+  integrations/wms/packiyo/integration.py:851 divides the shipment's total cost evenly across its packages.
+
+  I checked 72 multi-package shipments from orders updated in the last 3 days, across 10 working prod connections (3 others returned invalid credentials):
+
+  - Uneven split: 27 shipments had packages with different costs. For example, shipment 28742 cost 135.57, split 24.27 and 111.30. Shipment 92162 cost 142.86, split 32.82, 38.76, 46.53 and 24.75. With an even
+    split we'd report 67.79 and 35.72 per package, which is wrong.
+  - Even split: the other 45 shipments had the same cost on every package. Packiyo likely splits the cost itself when the carrier doesn't give one per package.
+  - Package costs always add up: none of the 72 had a missing package cost, and every set of package costs summed to the shipment cost (within 2 cents).
+
+  There are two smaller things worth knowing if you switch to per-package costs:
+
+  - Shipment cost comes back as a string ("26.70"), but package shipping_cost is a number (13.35).
+  - Each package also has its own tracking_number. That would let us match tracking to packages directly, instead of the current check (use_single_tracking_info) that compares how many trackings and packages
+    there are.
+
+  The scripts I used are .claude/tmp/packiyo_pkg_costs.py (prints the raw data) and .claude/tmp/packiyo_pkg_costs_summary.py (the counts). Both only read data.
+
+✻ Churned for 7m 15s · done 10:58 AM
+
+※ recap: You asked whether Packiyo prod data has per-package costs on multi-package shipments; it does, and 27 of the 72 shipments I sampled split unevenly, while we divide the total evenly. Next: decide whether
+  to switch the integration to per-package costs. (disable recaps in /config)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 

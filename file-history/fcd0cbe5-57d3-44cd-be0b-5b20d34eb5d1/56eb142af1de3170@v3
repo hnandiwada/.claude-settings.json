@@ -1,0 +1,276 @@
+import copy
+
+from utils.schema import REDACTED, IntegrationNotImplemented, redact_resource_pii
+
+
+def person_address():
+    return {
+        "full_name": "Jane Smith",
+        "company": "Smith Co",
+        "address1": "42 Elm St",
+        "address2": "Apt 7",
+        "address3": "Floor 2",
+        "city": "Boston",
+        "state": "MA",
+        "postal_code": "02110",
+        "country": "US",
+        "phone_number": "617-555-0100",
+        "email_address": "jane@example.com",
+    }
+
+
+def redacted_person_address():
+    return {
+        "full_name": REDACTED,
+        "company": "Smith Co",
+        "address1": REDACTED,
+        "address2": REDACTED,
+        "address3": REDACTED,
+        "city": "Boston",
+        "state": "MA",
+        "postal_code": "02110",
+        "country": "US",
+        "phone_number": REDACTED,
+        "email_address": REDACTED,
+    }
+
+
+def billing_address():
+    return {
+        "full_name": "Jane Smith",
+        "address1": "42 Elm St",
+        "address2": "Apt 7",
+        "address3": None,
+        "city": "Boston",
+        "state": "MA",
+        "postal_code": "02110",
+        "country": "US",
+    }
+
+
+def warehouse_address():
+    return {
+        "address1": "1 Warehouse Way",
+        "address2": "Dock 4",
+        "address3": None,
+        "city": "Reno",
+        "state": "NV",
+        "postal_code": "89501",
+        "country": "US",
+    }
+
+
+def wms_order():
+    return {
+        "id": "order_1",
+        "warehouse_customer_id": "wc_1",
+        "reference_id": "#1001",
+        "status": "shipped",
+        "ship_to_address": person_address(),
+        "line_items": [
+            {"product_id": "p_1", "sku": "sku_1", "quantity": 2, "unit_price": 9.99}
+        ],
+        "shipments": [
+            {
+                "shipment_id": "shipment_1",
+                "warehouse_id": "wh_1",
+                "line_items": [
+                    {
+                        "inventory_item_id": "item_1",
+                        "sku": "sku_1",
+                        "quantity": 2,
+                        "parent_product_id": None,
+                    }
+                ],
+                "ship_to_address": person_address(),
+                "ship_from_address": warehouse_address(),
+                "packages": [
+                    {
+                        "package_id": "package_1",
+                        "tracking_number": "1Z999",
+                        "line_items": [],
+                    }
+                ],
+            }
+        ],
+        "tags": ["vip"],
+        "trackstar_tags": [],
+    }
+
+
+def test_wms_order():
+    order = wms_order()
+    original = copy.deepcopy(order)
+
+    redacted = redact_resource_pii(order)
+
+    expected = wms_order()
+    expected["ship_to_address"] = redacted_person_address()
+    expected["shipments"][0]["ship_to_address"] = redacted_person_address()
+    assert redacted == expected
+    assert order == original
+
+
+def test_wms_order_with_partial_address():
+    order = wms_order()
+    order["ship_to_address"]["address2"] = ""
+    order["ship_to_address"]["address3"] = None
+    order["ship_to_address"]["email_address"] = IntegrationNotImplemented
+
+    redacted = redact_resource_pii(order)
+
+    ship_to_address = redacted["ship_to_address"]
+    assert ship_to_address["full_name"] == REDACTED
+    assert ship_to_address["address1"] == REDACTED
+    assert ship_to_address["address2"] == ""
+    assert ship_to_address["address3"] is None
+    assert ship_to_address["email_address"] is IntegrationNotImplemented
+
+
+def wms_return():
+    return {
+        "id": "return_1",
+        "warehouse_customer_id": "wc_1",
+        "status": "received",
+        "order_id": "order_1",
+        "notes": ["customer said too small"],
+        "line_items": [
+            {
+                "inventory_item_id": "item_1",
+                "sku": "sku_1",
+                "expected_quantity": 1,
+                "received_quantity": 1,
+                "return_reason": "Too Small",
+            }
+        ],
+        "shipments": [
+            {
+                "tracking_number": "1Z999",
+                "warehouse_id": "wh_1",
+                "measurements": {"length": 1, "width": 1, "height": 1, "unit": "in"},
+                "line_items": [
+                    {
+                        "inventory_item_id": "item_1",
+                        "sku": "sku_1",
+                        "quantity": 1,
+                        "receiving_details": [
+                            {
+                                "quantity": 1,
+                                "condition": "good",
+                                "disposition": "restocked",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_wms_return_has_no_address_to_redact():
+    assert redact_resource_pii(wms_return()) == wms_return()
+
+
+def wms_inbound_shipment():
+    return {
+        "id": "inbound_1",
+        "warehouse_customer_id": "wc_1",
+        "purchase_order_number": "PO-1",
+        "status": "open",
+        "supplier_object": {"supplier_id": "s_1", "supplier_name": "Acme"},
+        "warehouse_id": "wh_1",
+        "line_items": [
+            {
+                "inventory_item_id": "item_1",
+                "sku": "sku_1",
+                "expected_quantity": 10,
+                "received_quantity": 0,
+            }
+        ],
+        "receipts": [],
+        "ship_from_address": warehouse_address(),
+        "tracking_numbers": ["1Z999"],
+    }
+
+
+def test_wms_inbound_shipment_keeps_ship_from_address():
+    assert redact_resource_pii(wms_inbound_shipment()) == wms_inbound_shipment()
+
+
+def cart_order():
+    return {
+        "id": "cart_order_1",
+        "order_number": "#1001",
+        "status": "fulfilled",
+        "ship_to_address": person_address(),
+        "bill_to_address": billing_address(),
+        "line_items": [
+            {"product_id": "p_1", "sku": "sku_1", "quantity": 1, "unit_price": 9.99}
+        ],
+        "shipments": [
+            {
+                "shipment_id": "shipment_1",
+                "line_items": [{"product_id": "p_1", "sku": "sku_1", "quantity": 1}],
+                "shipping_groups": ["sg_1"],
+                "ship_from_address": warehouse_address(),
+            }
+        ],
+    }
+
+
+def test_cart_order():
+    redacted = redact_resource_pii(cart_order())
+
+    expected = cart_order()
+    expected["ship_to_address"] = redacted_person_address()
+    expected["bill_to_address"] = {
+        "full_name": REDACTED,
+        "address1": REDACTED,
+        "address2": REDACTED,
+        "address3": None,
+        "city": "Boston",
+        "state": "MA",
+        "postal_code": "02110",
+        "country": "US",
+    }
+    assert redacted == expected
+
+
+def erp_customer():
+    return {
+        "id": "customer_1",
+        "customer_number": "CUS0001",
+        "name": "Jane Smith",
+        "email": "jane@example.com",
+        "phone": "617-555-0100",
+        "is_individual": True,
+        "active": True,
+        "billing_address": billing_address(),
+        "shipping_address": person_address(),
+        "custom_fields": {
+            "custentity_tier": {"value": "gold", "type": "text", "label": "Tier"}
+        },
+        "external_system_url": "https://erp.example.com/customer/1",
+        "additional_fields": {},
+    }
+
+
+def test_erp_customer():
+    redacted = redact_resource_pii(erp_customer())
+
+    expected = erp_customer()
+    expected["name"] = REDACTED
+    expected["email"] = REDACTED
+    expected["phone"] = REDACTED
+    expected["billing_address"] = {
+        "full_name": REDACTED,
+        "address1": REDACTED,
+        "address2": REDACTED,
+        "address3": None,
+        "city": "Boston",
+        "state": "MA",
+        "postal_code": "02110",
+        "country": "US",
+    }
+    expected["shipping_address"] = redacted_person_address()
+    assert redacted == expected

@@ -1,0 +1,1597 @@
+import pytest
+from base_test import BaseTest
+
+from actions import (
+    AdjustInventory,
+    Cancel,
+    Create,
+    CreateReceipt,
+    CreateShipment,
+    Update,
+)
+from integrations.wms.WMSIntegration import WMSIntegration
+from resources import (
+    Bill,
+    InboundShipment,
+    InboundShipmentSupplier,
+    InventoryItem,
+    InventoryLedger,
+    Kit,
+    Order,
+    OrderChannel,
+    OrderPack,
+    Product,
+    Return,
+    ShippingMethod,
+    Warehouse,
+    WarehouseCustomer,
+)
+from resources.wms.warehouse_locations import WarehouseLocation
+from utils.boto import get_resource_implemented
+from utils.schema import IntegrationNotImplementedClass
+from utils.utils import retry
+
+ordering = {  # implemented in conftest
+    # applies pytest.mark.after=ordering[item.name] to each test
+    "test_get_warehouse_locations": ["test_get_warehouses"],
+    "test_get_inventory": ["test_get_warehouses", "test_get_warehouse_locations"],
+    "test_get_inventory_ledger": ["test_get_inventory"],
+    "test_get_products": ["test_get_inventory"],
+    "test_get_inbound_shipments": ["test_get_warehouses", "test_get_inventory"],
+    "test_get_orders": [
+        "test_get_inventory",
+        "test_get_products",
+        "test_get_shipping_methods",
+        "test_get_warehouses",
+    ],
+    "test_get_order_packs": ["test_get_orders"],
+    "test_get_returns": [
+        "test_get_warehouses",
+        "test_get_inventory",
+        "test_get_orders",
+        "test_get_shipping_methods",
+    ],
+    "test_update_product": ["test_create_product"],
+    "test_update_kit": ["test_create_kit"],
+    "test_update_inbound_shipment": ["test_create_inbound_shipment"],
+    "test_create_receipt": ["test_update_inbound_shipment"],
+    "test_update_order": ["test_create_order"],
+    "test_cancel_order": ["test_update_order"],
+    "test_create_order_shipment": ["test_cancel_order", "test_get_orders"],
+    "test_update_return": ["test_create_return"],
+    "test_cancel_return": ["test_update_return"],
+    "test_adjust_inventory": ["test_get_inventory"],
+}
+
+
+class WMSTest(BaseTest):
+    @pytest.fixture(scope="module")
+    def integration_type(self):
+        return "wms"
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_warehouses(self, mocker, integration, start_time, end_time, context):
+        if not integration.is_implemented("get_warehouses"):
+            pytest.skip("get_warehouses not implemented")
+        resource = Warehouse(integration)
+        try:
+            response = self.get_and_validate(mocker, resource, start_time, end_time)
+        except AssertionError as e:
+            if "no warehouses returned" not in str(e):
+                raise
+            uses_fallback = (
+                type(integration).get_warehouses is WMSIntegration.get_warehouses
+            )
+            try:
+                inventory_implemented = get_resource_implemented(
+                    InventoryItem(integration)
+                )
+            except Exception:
+                inventory_implemented = {}
+            # the fallback reads warehouse ids off stored inventory, so it has none to find
+            if uses_fallback and not integration.is_implemented("get_inventory"):
+                pytest.xfail("get_inventory not implemented")
+            if (
+                uses_fallback
+                and "inventory_by_warehouse_id" in inventory_implemented
+                and not inventory_implemented["inventory_by_warehouse_id"]
+            ):
+                pytest.xfail("inventory_by_warehouse_id not implemented")
+            raise
+        warehouse_ids = {warehouse["id"] for warehouse in response["data"]}
+        context["warehouse_ids"] = warehouse_ids
+
+    # @pytest.mark.only
+    def test_get_warehouses_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_warehouses"):
+            pytest.skip("get_warehouses not implemented")
+        resource = Warehouse(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_warehouse_locations(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        first_crawl=False,
+        page_token: object = "default",
+    ):
+        if not integration.is_implemented("get_warehouse_locations"):
+            pytest.skip("get_warehouse_locations not implemented")
+        resource = WarehouseLocation(integration)
+        try:
+            response = self.get_and_validate(
+                mocker,
+                resource,
+                start_time,
+                end_time,
+                first_crawl=first_crawl,
+                page_token=page_token,
+            )
+        except AssertionError as e:
+            if "no warehouse_locations returned" not in str(e):
+                raise
+            uses_fallback = (
+                type(integration).get_warehouse_locations
+                is WMSIntegration.get_warehouse_locations
+            )
+            try:
+                inventory_implemented = get_resource_implemented(
+                    InventoryItem(integration)
+                )
+            except Exception:
+                inventory_implemented = {}
+            # the fallback reads locations off stored inventory, so it has none to find
+            if uses_fallback and not integration.is_implemented("get_inventory"):
+                pytest.xfail("get_inventory not implemented")
+            if (
+                uses_fallback
+                and "locations" in inventory_implemented
+                and not inventory_implemented["locations"]
+            ):
+                pytest.xfail("inventory locations not implemented")
+            raise
+        data = response["data"]
+        warehouse_location_ids = {
+            warehouse_location["id"] for warehouse_location in data
+        }
+        context["warehouse_location_ids"] = warehouse_location_ids
+        if "warehouse_ids" in context:
+            if not any(
+                warehouse_location["warehouse_id"] in context["warehouse_ids"]
+                for warehouse_location in response["data"]
+            ):
+                raise AssertionError(
+                    "no warehouse_ids from warehouse locations in warehouses"
+                )
+
+    # @pytest.mark.only
+    def test_get_warehouse_locations_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_warehouse_locations"):
+            pytest.skip("get_warehouse_locations not implemented")
+        resource = WarehouseLocation(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    def returns_with_inv_by_warehouse(self):
+        return True
+
+    # @pytest.mark.only
+    def test_get_inventory(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        first_crawl=False,
+        page_token: object = "default",
+    ):
+        resource = InventoryItem(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, first_crawl, page_token
+        )
+        data = response["data"]
+        context["inventory_ids"] = {item["id"] for item in response["data"]}
+        inventory_item_id = None
+        warehouse_ids = set()
+        lot_warehouse_ids = set()
+        warehouse_location_ids = set()
+        for item in data:
+            if item["active"] and item["inventory_by_warehouse_id"]:
+                inventory_item_id = item["id"]
+                warehouse_ids.update(item["inventory_by_warehouse_id"].keys())
+            for lot in item["lots"]:
+                if lot["warehouse_id"]:
+                    lot_warehouse_ids.add(lot["warehouse_id"])
+            for location in item["locations"]:
+                if location["location_id"]:
+                    warehouse_location_ids.add(location["location_id"])
+        try:
+            resource_implemented = get_resource_implemented(resource)
+        except Exception:
+            resource_implemented = {}
+        if self.returns_with_inv_by_warehouse():
+            if resource_implemented.get("inventory_by_warehouse_id"):
+                if not inventory_item_id:
+                    raise AssertionError(
+                        "no inventory items with inventory_by_warehouse_id"
+                    )
+        elif warehouse_ids or inventory_item_id:
+            raise Exception("undo test_returns_with_inv_by_warehouse - data is found")
+        context["inventory_warehouse_ids"] = warehouse_ids
+        if (
+            "warehouse_ids" in context
+            and warehouse_ids
+            and "inventory_warehouse_ids" not in self.ignore_link_tests()
+        ):
+            if not (warehouse_ids & context["warehouse_ids"]):
+                raise AssertionError("no warehouse ids from inventory in warehouses")
+            if lot_warehouse_ids:
+                if not (lot_warehouse_ids & context["warehouse_ids"]):
+                    raise AssertionError("no warehouse ids from lots in warehouses")
+        context["inventory_warehouse_location_ids"] = warehouse_location_ids
+        if (
+            "warehouse_location_ids" in context
+            and warehouse_location_ids
+            and "inventory_warehouse_location_ids" not in self.ignore_link_tests()
+        ):
+            if not (warehouse_location_ids & context["warehouse_location_ids"]):
+                raise AssertionError(
+                    "no warehouse location ids from inventory in warehouse locations"
+                )
+        external_system_url = data[0].get("external_system_url")
+        if external_system_url:
+            self.validate_external_system_url(external_system_url)
+
+        context["inventory_item"] = data[0]
+
+    # @pytest.mark.only
+    def test_get_inventory_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_inventory"):
+            pytest.skip("get_inventory not implemented")
+        resource = InventoryItem(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    # @pytest.mark.only
+    def test_get_inventory_ledger(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        first_crawl=False,
+        page_token: object = "default",
+    ):
+        if not integration.is_implemented("get_inventory_ledger"):
+            pytest.skip("get_inventory_ledger not implemented")
+        resource = InventoryLedger(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, first_crawl, page_token
+        )
+        data = response["data"]
+        inventory_ledger_ids = set()
+        warehouse_ids = set()
+        location_ids = set()
+        for item in data:
+            inventory_ledger_ids.add(item["inventory_item_id"])
+            warehouse_ids.add(item["warehouse_id"])
+            if item["location_id"]:
+                location_ids.add(item["location_id"])
+        context["ledger_inv_ids"] = inventory_ledger_ids
+        if "inventory_ids" in context:
+            if "ledger_inv_ids" not in self.ignore_link_tests():
+                if not (inventory_ledger_ids & context["inventory_ids"]):
+                    raise AssertionError(
+                        "no inventory_ids from inventory ledger in inventory"
+                    )
+        if "warehouse_ids" in context:
+            if not (warehouse_ids & context["warehouse_ids"]):
+                raise AssertionError(
+                    "no warehouse ids from inventory ledger in warehouses"
+                )
+        if "warehouse_location_ids" in context and location_ids:
+            if "ledger_location_ids" not in self.ignore_link_tests():
+                if not (location_ids & context["warehouse_location_ids"]):
+                    raise AssertionError(
+                        "no warehouse location ids from inventory ledger in warehouse locations"
+                    )
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_products(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        first_crawl=False,
+        page_token: object = "default",
+    ):
+        resource = Product(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, first_crawl, page_token
+        )
+        data = response["data"]
+        context["product_ids"] = {item["id"] for item in data}
+        context["skus"] = {item["sku"] for item in data}
+        # be wary of using this - not always unique
+        product_id = None
+        inventory_item_ids = set()
+        for item in data:
+            if item["inventory_items"]:
+                product_id = item["id"]
+                curr_inventory_item_ids = set(
+                    [
+                        inv_item["inventory_item_id"]
+                        for inv_item in item["inventory_items"]
+                    ]
+                )
+                inventory_item_ids.update(curr_inventory_item_ids)
+        try:
+            resource_implemented = get_resource_implemented(resource)
+        except Exception:
+            resource_implemented = {}
+        context["product_inventory_ids"] = inventory_item_ids
+        if resource_implemented.get("inventory_items"):
+            if not product_id:
+                raise AssertionError("no products with inventory_item_ids")
+            if "inventory_ids" in context:
+                if "product_inventory_ids" not in self.ignore_link_tests():
+                    if not (inventory_item_ids & context["inventory_ids"]):
+                        raise AssertionError(
+                            "no inventory_item_ids from products in inventory"
+                        )
+        external_system_url = data[0].get("external_system_url")
+        if external_system_url:
+            self.validate_external_system_url(external_system_url)
+
+    # @pytest.mark.only
+    def test_get_product_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_products"):
+            pytest.skip("get_products not implemented")
+        resource = Product(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    def allow_unordered_inbound_receipt_li(self):
+        return True
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_inbound_shipments(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        page_token: object = "default",
+    ):
+        resource = InboundShipment(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, page_token=page_token
+        )
+        data = response["data"]
+        po_id = None
+        warehouse_ids = set()
+        li_inventory_item_ids = set()
+        receipt_inventory_item_ids = set()
+        suppliers = {}
+        for item in data:
+            if item["warehouse_id"]:
+                warehouse_ids.add(item["warehouse_id"])
+            if item["line_items"]:
+                po_id = item["id"]
+                li_inventory_item_ids.update(
+                    [li["inventory_item_id"] for li in item["line_items"]]
+                )
+            if not isinstance(item["receipts"], IntegrationNotImplementedClass):
+                for receipt in item["receipts"]:
+                    receipt_inventory_item_ids.update(
+                        [li["inventory_item_id"] for li in receipt["line_items"]]
+                    )
+            supplier_object = item["supplier_object"]
+            if supplier_object:
+                if supplier_object["supplier_id"] not in suppliers:
+                    suppliers[supplier_object["supplier_id"]] = supplier_object
+                elif "inbound_shipment_suppliers" not in self.ignore_link_tests():
+                    assert suppliers[supplier_object["supplier_id"]] == supplier_object
+        if not po_id:
+            raise AssertionError("no purchase orders with line_items")
+        if li_inventory_item_ids and receipt_inventory_item_ids:
+            if not self.allow_unordered_inbound_receipt_li():
+                if not receipt_inventory_item_ids.issubset(li_inventory_item_ids):
+                    raise AssertionError(
+                        "receipt inventory items not in po inventory items"
+                    )
+
+        context["inbound_inventory_ids"] = li_inventory_item_ids
+        if "inventory_ids" in context:
+            if "inbound_inventory_ids" not in self.ignore_link_tests():
+                if not (li_inventory_item_ids & context["inventory_ids"]):
+                    raise AssertionError(
+                        "no inventory_item_ids from inbound shipment line items in inventory"
+                    )
+        if "warehouse_ids" in context and warehouse_ids:
+            if "inbound_warehouse_ids" not in self.ignore_link_tests():
+                if not (warehouse_ids & context["warehouse_ids"]):
+                    raise AssertionError(
+                        "no warehouse ids from inbound shipments in warehouses"
+                    )
+        external_system_url = data[0].get("external_system_url")
+        if external_system_url:
+            self.validate_external_system_url(external_system_url)
+
+        child_resources = response.get("child_resources", {})
+        child_suppliers = []
+        for child_resource in child_resources:
+            if not isinstance(child_resource, InboundShipmentSupplier):
+                continue
+            child_suppliers_rsp = child_resources[child_resource]
+            for supplier in child_suppliers_rsp["data"]:
+                supplier_copy = {
+                    "supplier_id": supplier["id"],
+                    "supplier_name": supplier["name"],
+                }
+                child_suppliers.append(supplier_copy)
+        if suppliers and "inbound_shipment_suppliers" not in self.ignore_link_tests():
+            if not child_suppliers:
+                raise AssertionError("no suppliers attached to inbound shipments")
+            if not any(supplier in suppliers.values() for supplier in child_suppliers):
+                raise AssertionError(
+                    "no suppliers from inbound shipments in child_resources"
+                )
+
+    # @pytest.mark.only
+    def test_get_inbound_shipments_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_inbound_shipments"):
+            pytest.skip("get_inbound_shipments not implemented")
+        resource = InboundShipment(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_orders(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        first_crawl=False,
+        page_token: object = "default",
+        return_data=False,
+    ):
+        resource = Order(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, first_crawl, page_token
+        )
+        data = response["data"]
+        order_id = None
+        li_product_ids = set()
+        shipment_inv_ids = set()
+        warehouse_ids = set()
+        channels = {}
+        shipping_methods = {}
+        order_ids = set()
+        carriers = {}
+        try:
+            resource_implemented = get_resource_implemented(resource)
+        except Exception:
+            resource_implemented = {}
+        for item in data:
+            if item["line_items"]:
+                order_id = item["id"]
+            li_product_ids.update([li["product_id"] for li in item["line_items"]])
+            shipping_method_id = item["shipping_method_id"]
+            shipping_method_name = item["shipping_method_name"]
+            if shipping_method_id and resource_implemented.get("shipping_method_name"):
+                if shipping_method_id not in shipping_methods:
+                    shipping_methods[shipping_method_id] = shipping_method_name
+                else:
+                    old_sm_name = shipping_methods[shipping_method_id]
+                    if self.consistent_shipping_method():
+                        if old_sm_name != shipping_method_name:
+                            raise AssertionError(
+                                f"shipping method name changed for same id {shipping_method_id}: {old_sm_name} != {shipping_method_name}"
+                            )
+            carrier_id = item["carrier_id"]
+            carrier_name = item["carrier_name"]
+            scac = item["scac"]
+            if carrier_id and resource_implemented.get("carrier_name"):
+                if carrier_id not in carriers:
+                    carriers[carrier_id] = {
+                        "carrier_name": carrier_name,
+                        "scac": scac,
+                    }
+                else:
+                    old_carrier_name = carriers[carrier_id]["carrier_name"]
+                    if old_carrier_name != carrier_name:
+                        raise AssertionError(
+                            f"carrier name changed for same id {carrier_id}: {old_carrier_name} != {carrier_name}"
+                        )
+                    # actually, scac can change for same carrier
+                    # assert carriers[carrier_id]["scac"] == scac, (
+                    #     f"scac changed for same carrier id {carrier_id}"
+                    # )
+            for shipment in item["shipments"]:
+                shipment_inv_ids.update(
+                    [p["inventory_item_id"] for p in shipment["line_items"]]
+                )
+                # box inv ids are all in shipment line items (validator) - no need to check
+                warehouse_ids.add(shipment["warehouse_id"])
+                for package in shipment["packages"]:
+                    shipping_method_id = package["shipping_method_id"]
+                    shipping_method_name = package["shipping_method_name"]
+                    package_sm_impl = False
+                    shipments_impl = resource_implemented.get("shipments")
+                    if shipments_impl:
+                        shipment_impl = shipments_impl[0]
+                        package_impl = shipment_impl.get("packages")
+                        if package_impl:
+                            package_sm_impl = package_impl[0].get(
+                                "shipping_method_name"
+                            )
+                    if shipping_method_id and package_sm_impl:
+                        if shipping_method_id not in shipping_methods:
+                            shipping_methods[shipping_method_id] = shipping_method_name
+                        else:
+                            old_sm_name = shipping_methods[shipping_method_id]
+                            if self.consistent_shipping_method():
+                                if old_sm_name != shipping_method_name:
+                                    raise AssertionError(
+                                        f"shipping method name changed for same id {shipping_method_id}: {old_sm_name} != {shipping_method_name}"
+                                    )
+                    carrier_id = package["carrier_id"]
+                    carrier_name = package["carrier_name"]
+                    scac = package["scac"]
+                    if carrier_id:
+                        if carrier_id not in carriers:
+                            carriers[carrier_id] = {
+                                "carrier_name": carrier_name,
+                                "scac": scac,
+                            }
+                        else:
+                            old_carrier_name = carriers[carrier_id]["carrier_name"]
+                            if old_carrier_name != carrier_name:
+                                raise AssertionError(
+                                    f"carrier name changed for same id: {carrier_id}: {old_carrier_name} != {carrier_name}"
+                                )
+                            # actually, scac can change for same carrier
+                            # assert carriers[carrier_id]["scac"] == scac, (
+                            #     "scac changed for same carrier id"
+                            # )
+            channel_object = item["channel_object"]
+            if channel_object:
+                if channel_object["channel_id"] not in channels:
+                    channels[channel_object["channel_id"]] = channel_object
+                else:
+                    assert channels[channel_object["channel_id"]] == channel_object
+            order_ids.add(item["id"])
+            if item["shipments"]:
+                context["order_id_with_packs"] = item["id"]
+
+        context["order_ids"] = order_ids
+        if not order_id:
+            raise AssertionError("no orders with line_items")
+        context["order_product_ids"] = li_product_ids
+        if "product_ids" in context:
+            if "order_product_ids" not in self.ignore_link_tests():
+                if not (li_product_ids & context["product_ids"]):
+                    raise AssertionError(
+                        "no product_ids from order line items in products"
+                    )
+        context["order_shipment_inventory_ids"] = shipment_inv_ids
+        if "inventory_ids" in context:
+            if shipment_inv_ids:
+                if "order_shipment_inventory_ids" not in self.ignore_link_tests():
+                    if not (shipment_inv_ids & context["inventory_ids"]):
+                        raise AssertionError(
+                            "no inventory_ids from order shipments in inventory"
+                        )
+        context["order_shipment_warehouses"] = warehouse_ids
+        if "warehouse_ids" in context and warehouse_ids:
+            if "order_shipment_warehouses" not in self.ignore_link_tests():
+                if not (warehouse_ids & context["warehouse_ids"]):
+                    raise AssertionError(
+                        "no warehouse ids from order shipments in warehouses"
+                    )
+        context["order_shipping_methods"] = shipping_methods
+        if "shipping_method_ids" in context and shipping_methods:
+            if (
+                "order_shipping_methods" not in self.ignore_link_tests()
+                and resource_implemented.get("shipping_method_name")
+            ):
+                found = False
+                for (
+                    shipping_method_id,
+                    shipping_method_name,
+                ) in shipping_methods.items():
+                    if shipping_method_id in context["shipping_method_ids"]:
+                        found = True
+                        old_name = context["shipping_method_ids"][shipping_method_id]
+                        if old_name != shipping_method_name:
+                            raise AssertionError(
+                                f"shipping method name changed for same id {shipping_method_id}: {old_name} != {shipping_method_name}"
+                            )
+                if not found:
+                    raise AssertionError(
+                        "no shipping methods from orders in shipping methods"
+                    )
+        context["order_carriers"] = carriers
+        if context.get("carriers"):
+            if (
+                "order_carriers" not in self.ignore_link_tests()
+                and carriers
+                and resource_implemented.get("carrier_name")
+            ):
+                found = False
+                for carrier_id, carrier_info in carriers.items():
+                    if carrier_id in context["carriers"]:
+                        found = True
+                        if resource_implemented.get("carrier_name"):
+                            old_name = context["carriers"][carrier_id]["carrier_name"]
+                            if old_name != carrier_info["carrier_name"]:
+                                raise AssertionError(
+                                    f"carrier name changed for same id {carrier_id}: {old_name} != {carrier_info['carrier_name']}"
+                                )
+                            # actually, scac can change for same carrier
+                            # assert (
+                            #     context["carriers"][carrier_id]["scac"]
+                            #     == carrier_info["scac"]
+                            # ), f"scac changed for same carrier id {carrier_id}"
+                if not found:
+                    raise AssertionError("no carriers from orders in carriers")
+        external_system_url = data[0].get("external_system_url")
+        if external_system_url:
+            self.validate_external_system_url(external_system_url)
+
+        child_resources = response.get("child_resources", {})
+        child_channels = []
+        for child_resource in child_resources:
+            if not isinstance(child_resource, OrderChannel):
+                continue
+            child_channels_rsp = child_resources[child_resource]
+            for channel in child_channels_rsp["data"]:
+                channel_copy = {
+                    "channel_id": channel["id"],
+                    "channel_name": channel["name"],
+                }
+                child_channels.append(channel_copy)
+        if channels:
+            if not child_channels:
+                raise AssertionError("no channels attached to orders")
+            if not any(channel in channels.values() for channel in child_channels):
+                raise AssertionError("no channels from orders in child_resources")
+        if return_data:
+            context["orders_response"] = response
+
+    # @pytest.mark.only
+    def test_get_orders_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_orders"):
+            pytest.skip("get_orders not implemented")
+        resource = Order(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    def consistent_shipping_method(self):
+        return True
+
+    # @pytest.mark.only
+    def test_get_order_packs(self, integration, context):
+        if not integration.is_implemented("get_order_packs"):
+            pytest.skip("get_order_packs not implemented")
+        if not context.get("order_ids"):
+            pytest.skip("get_orders failed")
+        if not context.get("order_id_with_packs"):
+            raise Exception("No order_id_with_packs in context")
+        resource = OrderPack(integration)
+        rsp = self.get_and_validate_passthrough(
+            resource, context["order_id_with_packs"]
+        )
+        data = rsp["data"]
+        if not data["packs"]:
+            raise AssertionError("no packages in response")
+        # check that order line items are in product response
+        # check that package line items are in product_inventory_ids response
+        order_line_item_product_ids = set()
+        for order in data["order_line_items"]:
+            order_line_item_product_ids.add(order["product_id"])
+        pack_inventory_item_ids = set()
+        for package in data["packs"]:
+            for line_item in package["line_items"]:
+                pack_inventory_item_ids.add(line_item["inventory_item_id"])
+        context["order_pack_product_ids"] = order_line_item_product_ids
+        if "product_ids" in context:
+            if "order_pack_product_ids" not in self.ignore_link_tests():
+                if not (order_line_item_product_ids & context["product_ids"]):
+                    raise AssertionError(
+                        "no product_ids from order pack line items in products"
+                    )
+        if "inventory_ids" in context:
+            for package in data["packs"]:
+                for line_item in package["line_items"]:
+                    assert line_item["inventory_item_id"] in context["inventory_ids"]
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_returns(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        page_token: object = "default",
+        return_data=False,
+    ):
+        if not integration.is_implemented("get_returns"):
+            pytest.skip("get_returns not implemented")
+
+        resource = Return(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, page_token=page_token
+        )
+        data = response["data"]
+        inventory_ids = set()
+        warehouse_ids = set()
+        order_ids = set()
+        carriers = {}
+        return_id = None
+        for item in data:
+            if item["line_items"]:
+                if item["created_date"]:
+                    return_id = item["id"]
+            for line_item in item["line_items"]:
+                inventory_ids.add(line_item["inventory_item_id"])
+            if item["order_id"]:
+                order_ids.add(item["order_id"])
+            for shipment in item["shipments"]:
+                if shipment["warehouse_id"] is not None:
+                    warehouse_ids.add(shipment["warehouse_id"])
+                carrier_id = shipment["carrier_id"]
+                carrier_name = shipment["carrier_name"]
+                scac = shipment["scac"]
+                if carrier_id:
+                    if carrier_id not in carriers:
+                        carriers[carrier_id] = {
+                            "carrier_name": carrier_name,
+                            "scac": scac,
+                        }
+                    else:
+                        old_carrier_name = carriers[carrier_id]["carrier_name"]
+                        if old_carrier_name != carrier_name:
+                            raise AssertionError(
+                                f"carrier name changed for same id {carrier_id}: {old_carrier_name} != {carrier_name}"
+                            )
+                        # actually, scac can change for same carrier
+                        # assert carriers[carrier_id]["scac"] == scac, (
+                        #     f"scac changed for same carrier id {carrier_id}"
+                        # )
+        if not return_id:
+            raise AssertionError("no returns with line_items")
+        context["return_inventory_ids"] = inventory_ids
+        if "inventory_ids" in context:
+            if "return_inventory_ids" not in self.ignore_link_tests():
+                if not (inventory_ids & context["inventory_ids"]):
+                    raise AssertionError(
+                        "no inventory_item_ids from returns in inventory"
+                    )
+        if "warehouse_ids" in context and warehouse_ids:
+            if not (warehouse_ids & context["warehouse_ids"]):
+                raise AssertionError("no warehouse_ids from returns in warehouses")
+        context["return_order_ids"] = order_ids
+        if "order_ids" in context and order_ids:
+            if "return_order_ids" not in self.ignore_link_tests():
+                if not (order_ids & context["order_ids"]):
+                    raise AssertionError("no order_ids from returns in orders")
+        if context.get("carriers") and carriers:
+            if "return_carriers" not in self.ignore_link_tests():
+                found = False
+                for carrier_id, carrier_info in carriers.items():
+                    if carrier_id in context["carriers"]:
+                        found = True
+                        old_carrier_name = context["carriers"][carrier_id][
+                            "carrier_name"
+                        ]
+                        if old_carrier_name != carrier_info["carrier_name"]:
+                            raise AssertionError(
+                                f"carrier name changed for same id {carrier_id}: {old_carrier_name} != {carrier_info['carrier_name']}"
+                            )
+                        # actually, scac can change for same carrier
+                        # assert (
+                        #     context["carriers"][carrier_id]["scac"]
+                        #     == carrier_info["scac"]
+                        # ), f"scac changed for same carrier id {carrier_id}"
+                if not found:
+                    raise AssertionError("no carriers from returns in carriers")
+        external_system_url = data[0].get("external_system_url")
+        if external_system_url:
+            self.validate_external_system_url(external_system_url)
+        if return_data:
+            context["returns_response"] = response
+
+    # @pytest.mark.only
+    def test_get_returns_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_returns"):
+            pytest.skip("get_returns not implemented")
+        resource = Return(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_shipping_methods(
+        self,
+        mocker,
+        integration,
+        start_time,
+        end_time,
+        context,
+        page_token: object = "default",
+    ):
+        if not integration.is_implemented("get_shipping_methods"):
+            pytest.skip("get_shipping_methods not implemented")
+        resource = ShippingMethod(integration)
+        response = self.get_and_validate(
+            mocker, resource, start_time, end_time, page_token=page_token
+        )
+        shipping_methods = {}
+        carriers = {}
+        for shipping_method in response["data"]:
+            shipping_method_id = shipping_method["id"]
+            shipping_method_name = shipping_method["name"]
+            carrier_id = shipping_method["carrier_id"]
+            shipping_methods[shipping_method_id] = shipping_method_name
+            if carrier_id:
+                if carrier_id not in carriers:
+                    carriers[carrier_id] = {
+                        "carrier_name": shipping_method["carrier_name"],
+                        "scac": shipping_method["scac"],
+                    }
+                else:
+                    old_carrier_name = carriers[carrier_id]["carrier_name"]
+                    if old_carrier_name != shipping_method["carrier_name"]:
+                        raise AssertionError(
+                            f"carrier name changed for same id: {carrier_id}: {old_carrier_name} != {shipping_method['carrier_name']}"
+                        )
+                    # actually, scac can change for same carrier
+                    # assert carriers[carrier_id]["scac"] == shipping_method["scac"], (
+                    #     "scac changed for same carrier id"
+                    # )
+        context["shipping_method_ids"] = shipping_methods
+        context["carriers"] = carriers
+
+    # @pytest.mark.only
+    def test_get_shipping_methods_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_shipping_methods"):
+            pytest.skip("get_shipping_methods not implemented")
+        resource = ShippingMethod(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_bills(self, mocker, integration, start_time, end_time):
+        if not integration.is_implemented("get_bills"):
+            pytest.skip("get_bills not implemented")
+        resource = Bill(integration)
+        self.get_and_validate(mocker, resource, start_time, end_time)
+
+    # @pytest.mark.only
+    def test_get_bills_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_bills"):
+            pytest.skip("get_bills not implemented")
+        resource = Bill(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    def test_get_warehouse_customers(self, mocker, integration, start_time, end_time):
+        if not integration.is_implemented("get_warehouse_customers"):
+            pytest.skip("get_warehouse_customers not implemented")
+        resource = WarehouseCustomer(integration)
+        self.get_and_validate(mocker, resource, start_time, end_time)
+
+    # @pytest.mark.only
+    def test_get_warehouse_customers_perm_validator(self, integration_with_auth_code):
+        if not integration_with_auth_code.is_implemented("get_warehouse_customers"):
+            pytest.skip("get_warehouse_customers not implemented")
+        resource = WarehouseCustomer(integration_with_auth_code)
+        self.get_with_perm_validator(resource)
+
+    def full_product(self, update, context):
+        full_schema = Product().schema()
+        created_date = "2020-01-01T01:01:01Z" if not update else "2020-01-01T01:01:02Z"
+        updated_date = "2021-01-01T01:01:01Z" if not update else "2021-01-01T01:01:02Z"
+        schema = {
+            "id": "product_id",
+            "warehouse_customer_id": "warehouse_customer_id",
+            "unit_price": 1.0,
+            "created_date": created_date,
+            "updated_date": updated_date,
+            "name": "Test Product" if not update else "Test Product-2",
+            "sku": "sku",
+            "gtin": "gtin",
+            "inventory_items": [
+                {
+                    "inventory_item_id": "inventory_item_id_0",
+                    "sku": "sku",
+                    "unit_quantity": 1,
+                }
+            ],
+            "is_kit": False,
+            "active": True,
+            "supplier_object": {
+                "supplier_id": "supplier_id",
+                "supplier_name": "supplier_name",
+            },
+            "country_of_origin": "US",
+            "harmonized_code": "123456",
+            "supplier_products": [],
+            "external_system_url": "external_system_url",
+            "trackstar_tags": ["tag1", {"tag": "tag2"}] if not update else None,
+            "categories": [],
+            "image_urls": [],
+            "additional_fields": {},
+        }
+        full_schema.load(schema)  # validate full schema
+        return schema
+
+    def full_kit(self, update, context):
+        full_schema = Kit().schema()
+        created_date = "2020-01-01T01:01:01Z" if not update else "2020-01-01T01:01:02Z"
+        updated_date = "2021-01-01T01:01:01Z" if not update else "2021-01-01T01:01:02Z"
+        schema = {
+            "id": "kit_product_id",
+            "warehouse_customer_id": "warehouse_customer_id",
+            "created_date": created_date,
+            "updated_date": updated_date,
+            "name": "Test Product" if not update else "Test Product-2",
+            "unit_price": 1.0,
+            "sku": "sku",
+            "gtin": "gtin",
+            "inventory_items": [
+                {
+                    "inventory_item_id": "inventory_item_id_0",
+                    "sku": "component_sku_1",
+                    "unit_quantity": 1 if not update else 2,
+                },
+                {
+                    "inventory_item_id": "inventory_item_id_1",
+                    "sku": "component_sku_2",
+                    "unit_quantity": 1 if not update else 2,
+                },
+            ],
+            "is_kit": True,
+            "active": True,
+            "supplier_object": {
+                "supplier_id": "supplier_id",
+                "supplier_name": "supplier_name",
+            },
+            "country_of_origin": "US",
+            "harmonized_code": "123456",
+            "supplier_products": [],
+            "external_system_url": "external_system_url",
+            "trackstar_tags": ["tag1", {"tag": "tag2"}] if not update else None,
+            "categories": [],
+            "image_urls": [],
+            "additional_fields": {},
+        }
+        full_schema.load(schema)  # validate full schema
+        return schema
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_create_product(
+        self, integration, connection_id, connection_row, request, context
+    ):
+        if not integration.is_implemented("create_product"):
+            pytest.skip("create_product not implemented")
+
+        action = Create(Product(integration))
+        full_body = self.full_product(False, context)
+        data = self.write_and_validate(action, full_body, connection_row)
+        data["connection_id"] = connection_id
+        context["product_id"] = data["id"]
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_update_product(self, integration, connection_row, request, context):
+        if not integration.is_implemented("update_product"):
+            pytest.skip("update_product not implemented")
+        product_id = context.get("product_id")
+        if not product_id:
+            pytest.skip("create_product failed")
+
+        action = Update(Product(integration))
+        full_body = self.full_product(True, context)
+        data = self.write_and_validate(action, full_body, connection_row, product_id)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_create_kit(
+        self, integration, connection_id, connection_row, request, context
+    ):
+        if not integration.is_implemented("create_kit"):
+            pytest.skip("create_kit not implemented")
+
+        action = Create(Kit(integration))
+        full_body = self.full_kit(False, context)
+        data = self.write_and_validate(action, full_body, connection_row)
+        data["connection_id"] = connection_id
+        context["kit_id"] = data["id"]
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_update_kit(self, integration, connection_row, request, context):
+        if not integration.is_implemented("update_kit"):
+            pytest.skip("update_kit not implemented")
+        kit_id = context.get("kit_id")
+        if not kit_id:
+            pytest.skip("create_kit failed")
+
+        action = Update(Kit(integration))
+        full_body = self.full_kit(True, context)
+        data = self.write_and_validate(action, full_body, connection_row, kit_id)
+
+    def full_inbound_shipment(self, update, context):
+        full_schema = InboundShipment().schema()
+        created_date = "2020-01-01T01:01:01Z" if not update else "2020-01-01T01:01:02Z"
+        updated_date = "2021-01-01T01:01:01Z" if not update else "2021-01-01T01:01:02Z"
+        expected_date = "2024-01-01T01:01:01Z" if not update else "2025-01-01T01:01:02Z"
+        schema = {
+            "id": "inbound_shipment_id",
+            "warehouse_customer_id": "warehouse_customer_id",
+            "created_date": created_date,
+            "updated_date": updated_date,
+            "purchase_order_number": "123" if not update else "1234",
+            "status": "open" if not update else "received",
+            "raw_status": "raw_status" if not update else "raw_status2",
+            "supplier_object": {
+                "supplier_id": "supplier_id" if not update else "supplier_id_2",
+                "supplier_name": "supplier_name" if not update else "supplier_name_2",
+            },
+            "expected_arrival_date": expected_date,
+            "warehouse_id": "1" if not update else "2",
+            "line_items": [
+                {
+                    "inventory_item_id": "inventory_id_0",
+                    "sku": "sku",
+                    "expected_quantity": 3 if not update else 4,
+                    "received_quantity": 1 if not update else 2,
+                    "unit_cost": 1.0 if not update else 2.0,
+                    "external_id": "external_id" if not update else "external_id_2",
+                }
+            ],
+            "ship_from_address": {
+                "address1": "123 Main St" if not update else "124 Main St",
+                "address2": "Apt 4" if not update else "Apt 5",
+                "address3": "Floor 2" if not update else "Floor 3",
+                "city": "San Francisco" if not update else "New York",
+                "state": "CA" if not update else "NY",
+                "postal_code": "94105" if not update else "10001",
+                "country": "US",
+            },
+            "receipts": [
+                {
+                    "id": "receipt_id_0",
+                    "arrived_date": "2021-01-01T01:01:01Z",
+                    "line_items": [
+                        {
+                            "inventory_item_id": "inventory_id_0",
+                            "sku": "sku",
+                            "quantity": 1 if not update else 2,
+                            "lot_id": "lot_id_0",
+                            "expiration_date": "2023-01-01T01:01:01Z",
+                        }
+                    ],
+                }
+            ],
+            "tracking_numbers": (
+                ["tracking_number_0"] if not update else ["tracking_number_1"]
+            ),
+            "notes": ["note_0"],
+            "external_system_url": "external_system_url",
+            "trackstar_tags": ["tag1", {"tag": "tag2"}] if not update else None,
+            "additional_fields": {},
+        }
+        full_schema.load(schema)  # validate full schema
+        return schema
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_create_inbound_shipment(
+        self, integration, connection_id, connection_row, request, context
+    ):
+        if not integration.is_implemented("create_inbound_shipment"):
+            pytest.skip("create_inbound_shipment not implemented")
+
+        action = Create(InboundShipment(integration))
+        full_body = self.full_inbound_shipment(False, context)
+        data = self.write_and_validate(action, full_body, connection_row)
+        data["connection_id"] = connection_id
+        context["inbound_shipment_id"] = data["id"]
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_update_inbound_shipment(
+        self, integration, connection_row, request, context
+    ):
+        if not integration.is_implemented("update_inbound_shipment"):
+            pytest.skip("update_inbound_shipment not implemented")
+        inbound_shipment_id = context.get("inbound_shipment_id")
+        if not inbound_shipment_id:
+            pytest.skip("create_inbound_shipment failed")
+
+        action = Update(InboundShipment(integration))
+        full_body = self.full_inbound_shipment(True, context)
+        data = self.write_and_validate(
+            action, full_body, connection_row, inbound_shipment_id
+        )
+
+    def full_inbound_receipt(self, context):
+        return {
+            "warehouse_id": "2",
+            "warehouse_location_id": "location_id",
+            "line_items": [
+                {
+                    "sku": "sku",
+                    "quantity": 1,
+                }
+            ],
+        }
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_create_receipt(self, integration, connection_row, request, context):
+        if not integration.is_implemented("create_receipt"):
+            pytest.skip("create_receipt not implemented")
+        inbound_shipment_id = context.get("inbound_shipment_id")
+        if not inbound_shipment_id:
+            pytest.skip("create_inbound_shipment failed")
+
+        action = CreateReceipt(InboundShipment(integration))
+        full_body = self.full_inbound_receipt(context)
+        data = self.write_and_validate(
+            action, full_body, connection_row, context["inbound_shipment_id"]
+        )
+        if len(data["receipts"]) != 1:
+            raise AssertionError("receipt not created")
+
+    def full_order(self, update, context):
+        full_schema = Order().schema()
+        created_date = "2020-01-01T01:01:01Z" if not update else "2020-01-01T01:01:02Z"
+        updated_date = "2021-01-01T01:01:01Z" if not update else "2021-01-01T01:01:02Z"
+        schema = {
+            "id": "order_id",
+            "warehouse_customer_id": "warehouse_customer_id",
+            "warehouse_id": "warehouse_id_1",
+            "created_date": created_date,
+            "updated_date": updated_date,
+            "reference_id": "reference_id" if not update else "reference_id_2",
+            "order_number": "order_number" if not update else "order_number_2",
+            "status": "open" if not update else "confirmed",
+            "raw_status": "raw_status" if not update else "raw_status_2",
+            "channel_object": {
+                "channel_id": "shopify_id_1" if not update else "shopify_id_2",
+                "channel_name": "shopify_name_1" if not update else "shopify_name_2",
+            },
+            "type": "d2c",
+            "service_level": "req_method_0" if not update else "req_method_1",
+            "shipping_method_id": "shipping_method_id_0"
+            if not update
+            else "shipping_method_id_1",
+            "shipping_method_name": "shipping_method_name_0"
+            if not update
+            else "shipping_method_name_1",
+            "carrier_id": "carrier_id_0" if not update else "carrier_id_1",
+            "carrier_name": "carrier_name_0" if not update else "carrier_name_1",
+            "scac": "scac_0" if not update else "scac_1",
+            "invoice_currency_code": "CAD" if not update else "USD",
+            "trading_partner": "Test Partner" if not update else "Test Partner 2",
+            "total_price": 1.0 if not update else 4.0,
+            "total_tax": 0.0,
+            "total_discount": 0.0,
+            "total_shipping": 0.0,
+            "ship_to_address": {
+                "full_name": "Jane Doe" if not update else "Joan Deer",
+                "company": "Company1" if not update else "Company2",
+                "address1": "123 Main St" if not update else "124 Main St",
+                "address2": "Apt 4" if not update else "Apt 5",
+                "address3": "Door 1" if not update else "Door 2",
+                "city": "San Francisco" if not update else "New York",
+                "state": "California" if not update else "NY",
+                "postal_code": "94105" if not update else "10001",
+                "country": "United States",
+                "phone_number": "555-123-4567",
+                "email_address": "jdoe@gmail.com",
+            },
+            "line_items": [
+                {
+                    "product_id": "product_id_0",
+                    "sku": "sku",
+                    "quantity": 1 if not update else 2,
+                    "unit_price": 1.0 if not update else 2.0,
+                    "discount_amount": 0.0,
+                }
+            ],
+            "required_ship_date": "2021-01-01T01:01:01Z",
+            "is_third_party_freight": False,
+            "third_party_freight_account_number": None,
+            "first_party_freight_account_number": None,
+            "saturday_delivery": False,
+            "signature_required": False,
+            "international_duty_paid_by": None,
+            "tags": ["tag_0"],
+            "shipments": [  # to pass validation - don't allow writing shipments
+                {
+                    "ship_to_address": {
+                        "full_name": "Jane Doe",
+                        "company": "Company",
+                        "address1": "123 Main St",
+                        "address2": None,
+                        "address3": None,
+                        "city": "San Francisco",
+                        "state": "CA",
+                        "postal_code": "94105",
+                        "country": "US",
+                        "phone_number": "555-123-4567",
+                        "email_address": "jdoe@gmail.com",
+                    },
+                    "ship_from_address": {
+                        "address1": "123 Main St",
+                        "address2": None,
+                        "address3": None,
+                        "city": "San Francisco",
+                        "state": "CA",
+                        "postal_code": "94105",
+                        "country": "US",
+                    },
+                    "shipment_id": "shipment_id_0",
+                    "raw_status": "raw_status",
+                    "status": "shipped",
+                    "line_items": [
+                        {
+                            "inventory_item_id": "inventory_item_id_0",
+                            "sku": "sku",
+                            "quantity": 1,
+                            "parent_product_id": None,
+                        }
+                    ],
+                    "warehouse_id": "1",
+                    "shipped_date": "2021-01-01T01:01:01Z",
+                    "packages": [
+                        {
+                            "package_id": "package_id_0",
+                            "package_name": "package_name",
+                            "tracking_number": "tracking_number",
+                            "tracking_url": "tracking_url",
+                            "shipping_method_id": "shipping_method_id_0"
+                            if not update
+                            else "shipping_method_id_1",
+                            "shipping_method_name": "shipping_method_name_0"
+                            if not update
+                            else "shipping_method_name_1",
+                            "carrier_id": "carrier_id_0"
+                            if not update
+                            else "carrier_id_1",
+                            "carrier_name": "carrier_name_0"
+                            if not update
+                            else "carrier_name_1",
+                            "scac": "scac_0" if not update else "scac_1",
+                            "bill_of_lading": "bill_of_lading",
+                            "sscc": "sscc",
+                            "pro_number": "pro_number",
+                            "shipping_cost": 2.5,
+                            "measurements": {
+                                "length": 1.0,
+                                "width": 1.0,
+                                "height": 1.0,
+                                "weight": 1.0,
+                                "unit": "in",
+                                "weight_unit": "lb",
+                            },
+                            "line_items": [
+                                {
+                                    "inventory_item_id": "inventory_item_id_0",
+                                    "sku": "sku",
+                                    "quantity": 1,
+                                    "lot_id": "lot_id",
+                                    "expiration_date": "2021-01-01T01:01:01Z",
+                                    "parent_product_id": None,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "external_system_url": "external_system_url",
+            "trackstar_tags": ["tag1", {"tag": "tag2"}] if not update else None,
+            "additional_fields": {},
+        }
+        full_schema.load(schema)  # validate full schema
+        schema["ship_to_address"]["first_name"] = "Jane" if not update else "Joan"
+        schema["ship_to_address"]["last_name"] = "Doe" if not update else "Deer"
+        schema["bill_to_address"] = {
+            "full_name": "John Doe" if not update else "Jim Deer",
+            "company": "Company1" if not update else "Company2",
+            "address1": "456 Main St" if not update else "457 Main St",
+            "address2": "Apt 6" if not update else "Apt 7",
+            "address3": "Door 1" if not update else "Door 2",
+            "city": "Los Angeles" if not update else "Chicago",
+            "state": "CA" if not update else "IL",
+            "postal_code": "94110" if not update else "60601",
+            "country": "US",
+        }
+        del schema["shipping_method_name"]
+        schema["passthrough_fields"] = {}
+        for li in schema["line_items"]:
+            li["passthrough_fields"] = {}
+        return schema
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=2, reset_timer=True)
+    def test_create_order(
+        self, integration, connection_id, connection_row, request, context
+    ):
+        if not integration.is_implemented("create_order"):
+            pytest.skip("create_order not implemented")
+
+        action = Create(Order(integration))
+        full_body = self.full_order(False, context)
+        data = self.write_and_validate(action, full_body, connection_row)
+        data["connection_id"] = connection_id
+        context["order_id"] = data["id"]
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=2, reset_timer=True)
+    def test_update_order(self, integration, connection_row, request, context):
+        if not integration.is_implemented("update_order"):
+            pytest.skip("update_order not implemented")
+        order_id = context.get("order_id")
+        if not order_id:
+            pytest.skip("create_order failed")
+
+        action = Update(Order(integration))
+        full_body = self.full_order(True, context)
+        data = self.write_and_validate(action, full_body, connection_row, order_id)
+
+    @retry(retries=2, reset_timer=True)
+    def test_update_order_skip_retrieval(
+        self, integration, connection_row, request, context
+    ):
+        if not integration.is_implemented("update_order"):
+            pytest.skip("update_order not implemented")
+        order_id = context.get("order_id")
+        if not order_id:
+            pytest.skip("create_order failed")
+
+        action = Update(Order(integration))
+        if not self.supports_skip_retrieval(action):
+            pytest.skip("skip_retrieval not implemented")
+
+        full_body = self.full_order(True, context)
+        full_body["skip_retrieval"] = True
+        data = self.write_and_validate(action, full_body, connection_row, order_id)
+        self.assert_skip_retrieval_response(data)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=2, reset_timer=True)
+    def test_cancel_order(self, integration, connection_row, request, context):
+        if not integration.is_implemented("cancel_order"):
+            pytest.skip("cancel_order not implemented")
+        order_id = context.get("order_id")
+        if not order_id:
+            pytest.skip("create_order failed")
+
+        action = Cancel(Order(integration))
+        full_body = self.full_order(True, context)
+        full_body["status"] = "cancelled"
+        full_body["raw_status"] = "raw_cancelled"
+        data = self.write_and_validate(action, full_body, connection_row, order_id)
+        context["cancelled_order"] = order_id
+
+    def create_shipment_body(self, context):
+        return {
+            "shipped_date": "2024-01-01T00:00:00Z",
+            "tracking_number": "tracking_number",
+            "tracking_url": "tracking_url",
+            "shipping_method_id": "shipping_method_id",
+            "carrier_id": "carrier_id",
+            "shipping_cost": 2.5,
+            "measurements": {
+                "length": 1.0,
+                "width": 1.0,
+                "height": 1.0,
+                "weight": 1.0,
+                "unit": "in",
+                "weight_unit": "lb",
+            },
+            "warehouse_id": "warehouse_id_1",
+        }
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=2, reset_timer=True)
+    def test_create_order_shipment(
+        self, integration, connection_id, connection_row, request, context
+    ):
+        if not integration.is_implemented("create_order_shipment"):
+            pytest.skip("create_order_shipment not implemented")
+        order_id = context.get("order_id")
+        if not order_id:
+            pytest.skip("create_order failed")
+        elif context.get("cancelled_order") == order_id:
+            full_body = self.full_order(True, context)
+            create_order_action = Create(Order(integration))
+            data = self.write_and_validate(
+                create_order_action, full_body, connection_row
+            )
+            data["connection_id"] = connection_id
+            order_id = data["id"]
+
+        action = CreateShipment(Order(integration))
+        full_body = self.create_shipment_body(context)
+        data = self.write_and_validate(action, full_body, connection_row, order_id)
+
+    def full_return(self, update, context):
+        full_schema = Return().schema()
+        created_date = "2020-01-01T01:01:01Z" if not update else "2020-01-01T01:01:02Z"
+        updated_date = "2021-01-01T01:01:01Z" if not update else "2021-01-01T01:01:02Z"
+        returned_date = "2022-01-01T01:01:01Z" if not update else "2022-01-01T01:01:02Z"
+        inventory_id = "inventory_id_0" if not update else "inventory_id_1"
+        sku = "sku" if not update else "sku_1"
+        warehouse_id = "warehouse_id_0" if not update else "warehouse_id_1"
+        schema = {
+            "id": "return_id",
+            "warehouse_customer_id": "warehouse_customer_id",
+            "created_date": created_date,
+            "updated_date": updated_date,
+            "status": "open" if not update else "received",
+            "raw_status": "raw_open" if not update else "raw_received",
+            "order_id": "order_id",
+            "notes": ["note_0"] if not update else ["note_1"],
+            "line_items": [
+                {
+                    "inventory_item_id": inventory_id,
+                    "sku": sku,
+                    "expected_quantity": 1 if not update else 2,
+                    "received_quantity": 1 if not update else 2,
+                    "return_reason": (
+                        "return_reason" if not update else "return_reason_2"
+                    ),
+                    "restocked_quantity": 1 if not update else 2,
+                }
+            ],
+            "shipments": [
+                {
+                    "tracking_number": "tracking_number",
+                    "shipped_date": "2021-01-01T01:01:01Z",
+                    "arrived_date": "2022-01-01T01:01:01Z",
+                    "warehouse_id": "warehouse_id",
+                    "carrier_id": "carrier_id_0" if not update else "carrier_id_1",
+                    "carrier_name": "carrier_name_0"
+                    if not update
+                    else "carrier_name_1",
+                    "scac": "scac_0" if not update else "scac_1",
+                    "shipping_cost": 2.5,
+                    "measurements": {
+                        "length": 1.0,
+                        "width": 1.0,
+                        "height": 1.0,
+                        "weight": 1.0,
+                        "unit": "in",
+                        "weight_unit": "lb",
+                    },
+                    "line_items": [
+                        {
+                            "inventory_item_id": inventory_id,
+                            "sku": sku,
+                            "quantity": 1,
+                            "receiving_details": [
+                                {
+                                    "quantity": 1,
+                                    "condition": "new",
+                                    "disposition": "restock",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "external_system_url": "external_system_url",
+            "trackstar_tags": ["tag1", {"tag": "tag2"}] if not update else None,
+            "additional_fields": {},
+        }
+        full_schema.load(schema)  # validate full schema
+        return schema
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_create_return(
+        self, integration, connection_id, connection_row, request, context
+    ):
+        if not integration.is_implemented("create_return"):
+            pytest.skip("create_return not implemented")
+
+        action = Create(Return(integration))
+        full_body = self.full_return(False, context)
+        data = self.write_and_validate(action, full_body, connection_row)
+        data["connection_id"] = connection_id
+        context["return_id"] = data["id"]
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_update_return(self, integration, connection_row, request, context):
+        if not integration.is_implemented("update_return"):
+            pytest.skip("update_return not implemented")
+        return_id = context.get("return_id")
+        if not return_id:
+            pytest.skip("create_return failed")
+
+        action = Update(Return(integration))
+        full_body = self.full_return(True, context)
+        data = self.write_and_validate(action, full_body, connection_row, return_id)
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=2, reset_timer=True)
+    def test_cancel_return(self, integration, connection_row, request, context):
+        if not integration.is_implemented("cancel_return"):
+            pytest.skip("cancel_return not implemented")
+        return_id = context.get("return_id")
+        if not return_id:
+            pytest.skip("create_return failed")
+
+        action = Cancel(Return(integration))
+        full_body = self.full_return(True, context)
+        full_body["status"] = "cancelled"
+        full_body["raw_status"] = "raw_cancelled"
+        data = self.write_and_validate(action, full_body, connection_row, return_id)
+
+    def full_inventory_adjustment(self, context):
+        return {
+            "sku": "sku",
+            "quantity": 1,
+            "adjustment_type": "increase",
+            "warehouse_id": "warehouse_id_0",
+            "location_id": "location_id_0",
+        }
+
+    # @pytest.mark.only
+    # @pytest.mark.skip
+    @retry(retries=1, reset_timer=True)
+    def test_adjust_inventory(self, integration, connection_row, request, context):
+        if not integration.is_implemented("adjust_inventory"):
+            pytest.skip("adjust_inventory not implemented")
+        inv_item = context.get("inventory_item")
+        if not inv_item:
+            # TODO: find a workaround so we can test sandbox
+            pytest.skip("no inventory item to adjust")
+
+        action = AdjustInventory(InventoryItem(integration))
+        full_body = self.full_inventory_adjustment(context)
+        data = self.write_and_validate(
+            action, full_body, connection_row, inv_item["id"]
+        )
+        # get inventory item before update and assert changes by quantity in proper direction
+        if full_body["adjustment_type"] == "increase":
+            assert data["onhand"] == inv_item["onhand"] + full_body["quantity"]
+        else:
+            assert data["onhand"] == inv_item["onhand"] - full_body["quantity"]

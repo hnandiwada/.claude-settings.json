@@ -1,0 +1,62 @@
+"""
+Runs `yarn resync` against prod for a list of connections, one after another.
+
+Usage: fill in the variables at the top of main() (connection_ids,
+functions_to_sync, and optionally sync_start_time / sync_end_time), then run
+`yarn bulk-resync`. Every parameter is passed to `yarn resync` on the command
+line, so resync.json is neither read nor written.
+
+    connection_ids     connections to resync
+    functions_to_sync  e.g. ["get_orders"]; empty prompts and then syncs ALL
+    sync_start_time    ISO 8601, e.g. "2026-01-01T00:00:00Z"; None = historical sync
+    sync_end_time      ISO 8601; None = now. only bounds the sync when resync creates
+                       an on-demand job. if it falls back to resetting the scheduler row
+                       (force_scheduler, no start time, or a function that can't do
+                       on-demand), the crawl runs from the start time through to now
+    force_scheduler    reset the scheduler row instead of creating on-demand sync jobs
+"""
+
+import subprocess
+
+
+def main():
+    # Load connection IDs
+    connection_ids = []
+    functions_to_sync = []
+    sync_start_time = None  # Optional: set to None if not needed
+    sync_end_time = None  # Optional: set to None to sync through now
+    force_scheduler = False
+
+    if not functions_to_sync:
+        print(
+            "Warning: No functions_to_sync specified, defaulting to ALL. Continue? (Y/n): ",
+            end="",
+        )
+        user_input = input().strip().lower()
+        if user_input in ["n", "no"]:
+            print("Operation aborted.")
+            return
+
+    for conn_id in connection_ids:
+        cmd = [
+            "yarn",
+            "resync",
+            "-s",
+            "prod",
+            "--skip-confirmation",
+            "--connection-id",
+            conn_id,
+        ]
+        if functions_to_sync:
+            cmd += ["--functions", ",".join(functions_to_sync)]
+        if sync_start_time:
+            cmd += ["--start-time", sync_start_time]
+        if sync_end_time:
+            cmd += ["--end-time", sync_end_time]
+        if force_scheduler:
+            cmd.append("--force-scheduler")
+        subprocess.run(cmd, check=True)
+
+
+if __name__ == "__main__":
+    main()

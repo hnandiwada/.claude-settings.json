@@ -1,0 +1,18 @@
+{
+  "name": "session-e106c9b4",
+  "createdAt": 1791468464488,
+  "leadAgentId": "team-lead@session-e106c9b4",
+  "leadSessionId": "e106c9b4-bd49-47a2-b8ff-6bbb349b9de5",
+  "members": [
+    {
+      "agentId": "team-lead@session-e106c9b4",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "joinedAt": 1791468464488,
+      "tmuxPaneId": "leader",
+      "cwd": "/Users/harshanandiwada/workspace/packiyo",
+      "subscriptions": [],
+      "backendType": "in-process"
+    }
+  ]
+}

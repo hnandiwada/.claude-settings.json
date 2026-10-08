@@ -1,0 +1,4136 @@
+import base64
+import copy
+import hashlib
+import json
+import re
+import time
+import uuid
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
+from functools import wraps
+
+from actions import Action, AddTrackstarTag, AdjustInventory, Cancel, Create
+from apispec import APISpec
+from apispec_oneofschema import MarshmallowPlugin
+from botocore.utils import ClientError
+from celery_tasks.crawler import enqueue_crawl_task
+from config import (
+    BATCH_GET_KEY_CHUNK,
+    BILLING_STATUSES,
+    DEPOSCO_CUSTOMER_ORDER_CONNECTIONS,
+    EVENT_TYPES,
+    INACTIVE_BILLING_STATUSES,
+    MAX_API_GET_DURATION,
+    MAX_API_RESPONSE_BYTES,
+    MIN_API_RETURN_SIZE,
+    OAUTH_STATE_FIELD_EQUALITY_OPERATOR,
+    OAUTH_STATE_FIELD_SEPARATOR,
+    OPENAPI_VERSION,
+    RDS_LOG_RETENTION_DAYS,
+)
+import config
+from flask import current_app, request
+from flask_cors import cross_origin
+from resources import (
+    Connection,
+    DeposcoCustomerOrder,
+    Resource,
+    function_to_resource_map,
+    resource_map,
+)
+from utils.billing import (
+    BILLING_BASE_FEE_TYPES,
+    BILLING_CONNECTION_FEE_TYPES,
+    billing_tiers_field,
+    validate_billing_month,
+    validate_billing_period,
+    validate_billing_periods,
+)
+from utils.boto import (
+    IDEMPOTENCY_SUCCEEDED,
+    create_dynamo_args,
+    create_idempotency_key_row,
+    create_sync_job,
+    decode_access_token,
+    decode_auth_header,
+    delete_connections_row,
+    delete_idempotency_key_row,
+    dynamo_to_dict,
+    encode_access_token,
+    get_all_scheduler_rows_for_org,
+    get_api_key_row_cached,
+    get_connection_errors,
+    get_connection_errors_for_org,
+    get_connection_scheduler_rows,
+    get_connections_by_org_id,
+    get_connections_row,
+    get_events_for_org,
+    get_link_token_row,
+    get_org_private_key,
+    get_org_row,
+    get_org_row_cached,
+    get_rows_for_dynamo_webhook,
+    get_sync_job,
+    get_sync_jobs_for_connection,
+    get_table_meta,
+    mark_idempotency_key_succeeded,
+    org_decrypt,
+    query,
+    record_event,
+    store_resources,
+    update_connections_row,
+    update_crawl_items,
+    update_sync_job,
+    write_pickle_to_s3,
+)
+from utils.celery import (
+    crawl_heartbeat_active,
+    crawl_started,
+    handle_api_call_errors,
+    handle_perm_cred_err,
+)
+from utils.exceptions import (
+    InvalidCredentialsException,
+    InvalidTrackstarCredentialsException,
+    NotImplementedException,
+    PermissionsException,
+    PokedexException,
+    ResourceNotFoundException,
+    ThrottleException,
+    format_exception,
+)
+from utils.integrations import (
+    NOT_SURE_FLOW,
+    REQUESTABLE_INTEGRATION_TYPES,
+    WMS_REQUEST_FLOWS,
+    build_integration,
+    get_available_actions_for_integration,
+    get_integration_file,
+    list_integration_names,
+    resolve_crawl_frequency,
+    resolve_disabled_functions,
+)
+from utils.logutil import getLogger, tracer
+from utils.schema import (
+    CREATED_DATE,
+    CUSTOMER_ID,
+    IDEMPOTENCY_KEY_HEADER,
+    NEXT_TOKEN,
+    TOTAL_COUNT,
+    UPDATED_DATE,
+    Boolean,
+    CommaSeparatedList,
+    Date,
+    DateTime,
+    Dict,
+    Float,
+    Integer,
+    Length,
+    List,
+    NestedSchema,
+    OneOf,
+    OneOfSchema,
+    OperatorQueryParams,
+    Range,
+    Raw,
+    Schema,
+    String,
+    ValidationError,
+    allowed_operators,
+    validates_schema,
+)
+from utils.utils import EPOCH, dt_to_str, now, str_to_dt
+
+logger = getLogger()
+
+
+def update_openapi_spec(spec, test=False, skip_webhooks=False):
+    def find_original_name(schema_name):
+        match = re.match(r"^(.*?)(\d+)?$", schema_name)
+        if match:
+            original_name, suffix = match.group(1), match.group(2)
+            return original_name
+        return schema_name
+
+    def update_component(component):
+        if isinstance(component, dict):
+            # keys = list(component.keys()) # TODO remove these comments when nullable object better supported
+            # for key in keys:
+            for key, value in component.items():
+                # value = component[key]
+                # if key == "anyOf":
+                #     if len(value) == 2:
+                #         original_name = None
+                #         nullable = False
+                #         for item in value:
+                #             if "$ref" in item:
+                #                 ref = item["$ref"]
+                #                 original_name = find_original_name(ref.split("/")[-1])
+                #             if "type" in item and item.get("nullable"):
+                #                 nullable = True
+                #         if nullable and original_name:
+                #             component["allOf"] = [{"$ref": f"#/components/schemas/{original_name}"}]
+                #             component["nullable"] = True
+                #             del component["anyOf"]
+                # elif key in ["$ref", "id", "name"] and isinstance(value, str):
+                if key in ["$ref", "id", "name"] and isinstance(value, str):
+                    if not value.startswith("#/components/schemas/"):
+                        continue
+                    schema_name = value.split("/")[-1]
+                    original_name = find_original_name(schema_name)
+                    component[key] = f"#/components/schemas/{original_name}"
+                else:
+                    component[key] = update_component(value)
+            component.pop("allow_not_implemented", None)
+            return component
+        elif isinstance(component, list):
+            return [update_component(item) for item in component]
+        else:
+            return component
+
+    def add_referenced_schemas(schema_dict, apispec_schemas, spec):
+        """Recursively find all $ref and add them to spec.components"""
+        if isinstance(schema_dict, dict):
+            if "$ref" in schema_dict:
+                ref = schema_dict["$ref"]
+                ref_name = find_original_name(ref.split("/")[-1])
+                if (
+                    ref_name not in spec.components.schemas
+                    and ref_name in apispec_schemas
+                ):
+                    ref_schema = apispec_schemas[ref_name]
+                    updated_ref_schema = update_component(ref_schema)
+                    spec.components.schema(ref_name, updated_ref_schema)
+                    # recursively process the newly added schema
+                    add_referenced_schemas(updated_ref_schema, apispec_schemas, spec)
+            for value in schema_dict.values():
+                add_referenced_schemas(value, apispec_schemas, spec)
+        elif isinstance(schema_dict, list):
+            for item in schema_dict:
+                add_referenced_schemas(item, apispec_schemas, spec)
+
+    condensed_schemas = {}
+    for schema_name, schema_definition in spec.components.schemas.items():
+        original_name = find_original_name(schema_name)
+        condensed_schema_definition = update_component(schema_definition)
+        condensed_schema_definition["title"] = original_name
+        if "--" in original_name:
+            # created in decorate_write_endpoint
+            # turn this: "CreatewmsKit--Cin7__Core__-_Dear__Systems_---"
+            # into this: "Cin7 Core (Dear Systems)"
+            with_removed_prefix = "".join(original_name.split("--")[1:])
+            with_removed_surrounding = with_removed_prefix.replace("--", " ")
+            with_replaced_open_parens = with_removed_surrounding.replace("-_", "(")
+            with_replaced_close_parens = with_replaced_open_parens.replace("_-", ")")
+            with_replaced_amp = with_replaced_close_parens.replace("_AMP_", "&")
+            replaced_integration_name = with_replaced_amp.replace("__", " ")
+            condensed_schema_definition["title"] = replaced_integration_name
+        if original_name in condensed_schemas:
+            existing_schema = condensed_schemas[original_name]
+            if existing_schema != condensed_schema_definition:
+                if test:
+                    raise Exception(
+                        f"""Schema conflict: {original_name}
+Existing schema: {existing_schema}
+New schema: {condensed_schema_definition}"""
+                    )
+                logger.error(f"Schema conflict: {original_name}")
+                raise PokedexException(
+                    "An unexpected error occurred generating the OpenAPI spec.",
+                    500,
+                    origin="trackstar",
+                )
+        condensed_schemas[original_name] = condensed_schema_definition
+
+    # strip fake discriminators: OneOfSchema (marshmallow_oneofschema) emits a
+    # `type` discriminator on write input wrappers, but the variant schemas
+    # have no `type` property — the integration is identified by the access
+    # token header. Detect via the "--" in the variant names given by
+    # decorate_write_endpoint, which no real discriminator uses. There are true
+    # discriminators (e.g. channel objects) which should NOT be affected
+    for schema_definition in condensed_schemas.values():
+        discriminator = schema_definition.get("discriminator")
+        if not discriminator:
+            continue
+        variant_refs = (discriminator.get("mapping") or {}).values()
+        if any("--" in ref for ref in variant_refs):
+            schema_definition.pop("discriminator", None)
+
+    # can't directly set spec.components.schemas to condensed_schemas, so we have to delete and re-add
+    for schema in list(spec.components.schemas.keys()):
+        del spec.components.schemas[schema]
+    for schema_name, schema_definition in condensed_schemas.items():
+        spec.components.schema(schema_name, schema_definition)
+    # auth is documented as request headers (parameters), not securitySchemes.
+    # declare an empty root `security` so every operation satisfies the
+    # "operation must have security defined on it or at the root level" lint
+    # rule without forcing an Authorizations section in the docs.
+    # the authorization stuff struggles with optional fields and examples
+    spec.options["security"] = []
+    for path, path_item in spec._paths.items():
+        for operation in path_item.values():
+            # sanitize auto-generated operationIds — apiflask derives them
+            # from the flask endpoint name, which for path-routed endpoints
+            # ends up with slashes and angle brackets that fail the redocly
+            # URL-safe rule
+            if "operationId" in operation:
+                operation["operationId"] = re.sub(
+                    r"[^A-Za-z0-9_.-]+", "_", operation["operationId"]
+                ).strip("_")
+            for parameter in operation.get("parameters", []):
+                if "schema" in parameter and parameter["schema"].get("$ref"):
+                    schema_name = parameter["schema"]["$ref"].split("/")[-1]
+                    original_name = find_original_name(schema_name)
+                    parameter["schema"]["$ref"] = (
+                        f"#/components/schemas/{original_name}"
+                    )
+                    parameter["style"] = "deepObject"
+                    parameter["explode"] = True
+            for response in operation.get("responses", {}).values():
+                for media_type in response.get("content", {}).values():
+                    if "schema" in media_type:
+                        if "$ref" not in media_type["schema"]:
+                            # for endpoints without output specs
+                            # should just be write-info
+                            if not path.endswith("write-info"):
+                                raise Exception(
+                                    f"Unexpected schema without $ref in response for path {path}: {media_type['schema']}"
+                                )
+                            continue
+                        schema_name = media_type["schema"]["$ref"].split("/")[-1]
+                        original_name = find_original_name(schema_name)
+                        media_type["schema"]["$ref"] = (
+                            f"#/components/schemas/{original_name}"
+                        )
+            if "requestBody" in operation:
+                request_body = operation["requestBody"]
+                if "content" in request_body:
+                    request_body_content = request_body["content"]
+                    for media_type in request_body_content.values():
+                        if "schema" in media_type:
+                            schema_name = media_type["schema"]["$ref"].split("/")[-1]
+                            original_name = find_original_name(schema_name)
+                            media_type["schema"]["$ref"] = (
+                                f"#/components/schemas/{original_name}"
+                            )
+
+    apispec = APISpec(
+        title="dummy",
+        version="1.0.0",
+        openapi_version=OPENAPI_VERSION,
+        plugins=[
+            MarshmallowPlugin(schema_name_resolver=lambda sch: sch.__class__.__name__)
+        ],
+    )
+    webhooks = {}
+    for resource_type in resource_map:
+        if skip_webhooks:
+            continue
+        sub_resource_map = resource_map[resource_type]
+        for resource in sub_resource_map.values():
+            resource = resource()
+            if resource.suppress_webhooks():
+                continue
+            try:
+                webhook_base_type = resource.webhook_base_type()
+            except NotImplementedError:
+                continue  # not a type we send webhooks for
+            webhook_types = resource.supported_webhook_types()
+            for verb in webhook_types:
+                webhook_name = f"{webhook_base_type}.{verb}"
+                description = webhook_types[verb]["description"]
+                attributes_to_exclude = []
+                previous_attribute_field = webhook_types[verb].get("change_field")
+                if verb != "updated" and not previous_attribute_field:
+                    attributes_to_exclude.append("previous_attributes")
+                schema = resource.webhook_schema(
+                    verb, resource_type, exclude=attributes_to_exclude
+                )
+                apispec.components.schema("dummy", schema=schema)
+                apispec_schemas = apispec.to_dict()["components"]["schemas"]
+                apispec_schema = apispec_schemas["dummy"]
+                # the library always names a "type" field for telling the two
+                # shapes apart, but a webhook has no such field to read
+                apispec_schema.pop("discriminator", None)
+                del apispec.components.schemas["dummy"]
+                schema_name = schema.__class__.__name__
+                updated_apispec_schema = update_component(apispec_schema)
+                add_referenced_schemas(updated_apispec_schema, apispec_schemas, spec)
+                if schema_name not in spec.components.schemas:
+                    spec.components.schema(schema_name, updated_apispec_schema)
+                else:
+                    if spec.components.schemas[schema_name] != updated_apispec_schema:
+                        logger.error(f"Schema conflict: {schema_name}")
+                        raise PokedexException(
+                            "An unexpected error occurred generating the OpenAPI spec.",
+                            500,
+                            origin="trackstar",
+                        )
+                summary = webhook_name.replace(".", " ").replace("-", " ").capitalize()
+                operation_id = "webhook_" + re.sub(
+                    r"[^A-Za-z0-9_.-]+", "_", webhook_name
+                ).strip("_")
+                webhooks[webhook_name] = {
+                    "post": {
+                        "operationId": operation_id,
+                        "summary": summary,
+                        "description": description,
+                        # outbound — the customer doesn't auth to receive these
+                        "security": [],
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": f"#/components/schemas/{schema_name}"
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "Success"}},
+                    }
+                }
+    if webhooks:
+        # svix uses this
+        spec.options["x-webhooks"] = webhooks
+    mintlify_webhooks = {}
+    for webhook_name, webhook_info in webhooks.items():
+        post = webhook_info["post"]
+        schema = post["requestBody"]["content"]["application/json"]["schema"]
+        mintlify_webhooks[webhook_name] = {
+            "description": post["description"],
+            "schema": schema,
+        }
+    if webhooks:
+        # don't know why this is not using mintlify_webhooks here tbh
+        spec.options["webhooks"] = webhooks
+    return spec
+
+
+def get_shared_integration_type(data):
+    integration_type = None
+    try:
+        state = data["state"]
+        state_parts = state.split(OAUTH_STATE_FIELD_SEPARATOR)
+        for part in state_parts:
+            if not part.startswith("integration_type"):
+                continue
+            integration_type = part.split(OAUTH_STATE_FIELD_EQUALITY_OPERATOR)[1]
+    except:
+        logger.error(
+            f"Error: No integration type provided for shared integration: {data}"
+        )
+        integration_type = "wms"
+    if not integration_type:
+        logger.error(
+            f"No Error: No integration type provided for shared integration: {data}"
+        )
+        integration_type = "wms"
+    return integration_type
+
+
+def is_connection_paused(schedules):
+    # a connection is "paused" only when it has schedules and every one is paused
+    if not schedules:
+        return False
+    paused_count = 0
+    for schedule in schedules:
+        if schedule.get("paused"):
+            paused_count += 1
+    return paused_count == len(schedules)
+
+
+def recompute_connection_paused(connection_id):
+    # nothing recomputes this later, so both reads have to see what the last toggle
+    # wrote: a stale one stores a wrong flag, or a wrong paused_at, for good
+    schedules = get_connection_scheduler_rows(connection_id, consistent=True)
+    paused = is_connection_paused(schedules)
+    connection = get_connections_row(connection_id, consistent=True)
+    was_paused = connection.get("paused") is True
+    update_fields = {"paused": paused}
+    # only stamp on the transition into paused, so an idempotent re-pause keeps
+    # the original time; clear it on resume
+    if paused and not was_paused:
+        update_fields["paused_at"] = dt_to_str(now())
+    elif not paused:
+        update_fields["paused_at"] = None
+    update_connections_row(connection_id, update_fields)
+    # a connection is disabled once every schedule is paused, and enabled again
+    # when it leaves that state; only record the actual transition
+    if paused and not was_paused:
+        connection_event_type = "connection_disabled"
+    elif was_paused and not paused:
+        connection_event_type = "connection_enabled"
+    else:
+        connection_event_type = None
+    if connection_event_type:
+        record_event(
+            connection["org_id"],
+            connection_event_type,
+            connection["integration_name"],
+            connection["integration_type"],
+            connection_id=connection_id,
+            customer_id=connection.get("customer_id"),
+        )
+    return paused
+
+
+def record_schedule_pause_events(connection_id, function_names, paused):
+    # one event per function paused or unpaused. fetching the connection (which
+    # a concurrent delete could remove) must never break the toggle, so on any
+    # failure just skip the events
+    try:
+        connection = get_connections_row(connection_id)
+    except Exception as e:
+        logger.error(f"failed to record schedule pause events: {format_exception(e)}")
+        return
+    event_type = "schedule_paused" if paused else "schedule_unpaused"
+    for function_name in function_names:
+        record_event(
+            connection["org_id"],
+            event_type,
+            connection["integration_name"],
+            connection["integration_type"],
+            connection_id=connection_id,
+            customer_id=connection.get("customer_id"),
+            additional_fields={"function_name": function_name},
+        )
+
+
+# pokecenter loads every connection, so we hand it several dynamo pages at once.
+# capped so one org's response stays well under the lambda response size limit.
+INTERNAL_CONNECTIONS_PAGE_TARGET = 1000
+
+
+def api_query_connections(org_id, connection_id, page_token, internal_call=False):
+    items = []
+    next_token = None
+    connection_id_to_schedule_map = {}
+    if connection_id:
+        try:
+            item = get_connections_row(connection_id)
+        except:
+            raise PokedexException(
+                f"Connection {connection_id} not found", 404, origin="trackstar"
+            )
+        if item["org_id"] != org_id:
+            raise PokedexException(
+                f"Connection {connection_id} not found", 404, origin="trackstar"
+            )
+        items.append(item)
+        connection_errors = get_connection_errors(connection_id)
+        raw_schedules = get_connection_scheduler_rows(connection_id)
+        connection_id_to_schedule_map[connection_id] = raw_schedules
+    else:
+        if internal_call:
+            # gather several dynamo pages per response so a big org loads in one
+            # round trip instead of many, and the org-wide error and schedule
+            # scans below run once for the whole batch rather than once per page.
+            page = page_token
+            more_pages = True
+            while more_pages:
+                response = get_connections_by_org_id(org_id, page_token=page)
+                items.extend(response["Items"])
+                last_key = response.get("LastEvaluatedKey")
+                if last_key is None:
+                    more_pages = False
+                else:
+                    page = base64.b64encode(
+                        json.dumps(last_key).encode("utf-8")
+                    ).decode("utf-8")
+                    if len(items) >= INTERNAL_CONNECTIONS_PAGE_TARGET:
+                        next_token = page
+                        more_pages = False
+        else:
+            response = get_connections_by_org_id(org_id, page_token=page_token)
+            items = response["Items"]
+            last_key = response.get("LastEvaluatedKey")
+            if last_key is not None:
+                last_key = json.dumps(last_key).encode("utf-8")
+                next_token = base64.b64encode(last_key).decode("utf-8")
+        connection_errors = get_connection_errors_for_org(org_id)
+        # pokecenter's connection list shows each row's status from its errors
+        # alone and loads a connection's schedules only when the row is opened, so
+        # for the internal call skip the org-wide schedule scan and the per-
+        # connection sync-status work it feeds. that enrichment is the bulk of the
+        # time on a large org, and nothing in the list view reads it.
+        if not internal_call:
+            raw_schedules = get_all_scheduler_rows_for_org(org_id)
+            for schedule in raw_schedules:
+                schedule_connection_id = schedule["connection_id"]
+                if schedule_connection_id not in connection_id_to_schedule_map:
+                    connection_id_to_schedule_map[schedule_connection_id] = []
+                connection_id_to_schedule_map[schedule_connection_id].append(schedule)
+
+    errors_by_connection = defaultdict(list)
+    for error in connection_errors:
+        error_connection_id = error["connection_id"]
+        errors_by_connection[error_connection_id].append(error)
+
+    # org policy is constant across this org's connections; fetch once for the resolver
+    org_row = None
+    if not internal_call:
+        org_row = get_org_row(org_id)
+
+    connection_id_map = {}
+    display_name_by_integration = {}
+    for item in items:
+        sync_schedules = []
+        available_actions = []
+        item_id = item["id"]
+        connection_type = item["integration_type"]
+        integration_file = get_integration_file(
+            item["integration_name"], connection_type
+        )
+        customer_id = item.get("customer_id")
+        integration = integration_file.Integration()
+        # cache the manifest display name so a batch of connections to the same
+        # integration doesn't re-read the same file; keyed on type too because the
+        # same name lives under different types with different display names
+        display_name_key = (item["integration_name"], connection_type)
+        if display_name_key not in display_name_by_integration:
+            display_name_by_integration[display_name_key] = (
+                integration.get_display_name()
+            )
+        if not internal_call:
+            try:
+                disabled_functions = resolve_disabled_functions(
+                    item, org_row, item["integration_name"], connection_type
+                )
+                available_actions = get_available_actions_for_integration(
+                    integration_file,
+                    org_id,
+                    item_id,
+                    disabled_functions=disabled_functions,
+                )
+            except PokedexException as e:
+                if e.status_code != 404:  # integration not found
+                    raise e
+
+        item_errors = []
+        errors_for_connection = errors_by_connection[item["id"]]
+        for connection_error in errors_for_connection:
+            item_error = {
+                "error_message": connection_error["error_message"],
+                "affected_endpoints": connection_error.get("affected_endpoints"),
+                "first_seen": connection_error["created_date"],
+                "last_seen": connection_error["last_seen"],
+            }
+            item_errors.append(item_error)
+        schedules_for_connection = connection_id_to_schedule_map.get(item_id, [])
+        for schedule in schedules_for_connection:
+            function_name = schedule["function_name"]
+            resource = function_to_resource_map[connection_type][function_name](
+                integration
+            )
+            if resource.is_hidden():
+                continue
+            schedule["resource_name"] = resource.english_plural_name()
+            crawl_frequency = item["crawl_frequencies"].get(
+                function_name, resource.crawl_frequency()
+            )
+            sync_frequency = int(crawl_frequency)
+
+            last_crawl_end = schedule.get("last_crawl_end")
+            sync_status = get_sync_status(
+                schedule, item_errors, resource.endpoint_base()
+            )
+
+            sync_schedules.append(
+                {
+                    "function_name": schedule["function_name"],
+                    "last_crawl_start": schedule.get("last_crawl_start"),
+                    "last_crawl_end": last_crawl_end,
+                    "latest_data": schedule.get("latest_data"),
+                    "sync_frequency": sync_frequency,
+                    "sync_status": sync_status,
+                }
+            )
+        connection = {
+            "connection_id": item_id,
+            "customer_id": customer_id,
+            "integration_name": item["integration_name"],
+            # human-readable name from the manifest so callers don't maintain their own mapping
+            "integration_display_name": display_name_by_integration[display_name_key],
+            "integration_type": connection_type,
+            "created_at": item["created_at"],
+            "last_used": item.get("last_used"),
+            "times_used": item.get("times_used"),
+            "errors": item_errors,
+            "sync_schedules": sync_schedules,
+            "available_actions": available_actions,
+            "webhooks_disabled": item.get("webhooks_disabled", False),
+            "paused": item.get("paused", False),
+            # absent on connections that have never been paused
+            "paused_at": item.get("paused_at"),
+            "historical_sync_completed": item.get("historical_sync_completed", {}),
+            "me": None,
+        }
+        connection_id_map[item_id] = {
+            "connection": connection,
+            "integration_file": integration_file,
+            "dynamo_connection_row": item,
+        }
+    transformed_items = []
+    max_workers = min(len(items), 10)
+    if internal_call or not max_workers:
+        transformed_items = [v["connection"] for v in connection_id_map.values()]
+    else:
+        org_private_key = get_org_private_key(org_id)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_connection_row = {}
+            for connection_id, conn_and_integration in connection_id_map.items():
+                connection_row_to_return = conn_and_integration["connection"]
+                integration_file = conn_and_integration["integration_file"]
+                dynamo_connection_row = conn_and_integration["dynamo_connection_row"]
+                customer_id = connection_row_to_return["customer_id"]
+                future = executor.submit(
+                    call_integration_me,
+                    integration_file,
+                    dynamo_connection_row,
+                    org_private_key,
+                    connection_id,
+                    org_id,
+                    customer_id,
+                    True,
+                )
+                future_to_connection_row[future] = connection_row_to_return
+            for future in as_completed(future_to_connection_row):
+                integration_me = future.result()
+                connection_row_to_return = future_to_connection_row[future]
+                connection_row_to_return["me"] = integration_me
+                transformed_items.append(connection_row_to_return)
+    api_response = {
+        "data": transformed_items,
+        "total_count": len(transformed_items),
+        "next_token": next_token,
+    }
+    to_return = api_response
+    loose_schema = get_connections_response_schema(partial=True, unknown="include")
+    try:
+        to_return = loose_schema.load(api_response)
+        strict_schema = get_connections_response_schema()
+        strict_schema.load(to_return)
+    except Exception as e:
+        logger.error(f"Validation Exception: {e}")
+    return to_return
+
+
+class EventsQueryParamSchema(Schema):
+    integration_name = String(
+        "Filter events by integration name.",
+        "shipbob",
+        allow_none=True,
+        required=False,
+    )
+    integration_type = String(
+        "Filter events by integration type.",
+        "wms",
+        allow_none=True,
+        required=False,
+    )
+    connection_id = String(
+        "Filter events by connection id.",
+        "07b344db-0304-4866-9ae1-ac8af5292a28",
+        allow_none=True,
+        required=False,
+    )
+    customer_id = CUSTOMER_ID(allow_none=True, required=False)
+    type = String(
+        "Filter events by type.",
+        "install_failed",
+        allow_none=True,
+        required=False,
+        validate=[OneOf(EVENT_TYPES)],
+    )
+    # required (the default) so every feed query has a lower time bound and hits
+    # the org_id+created_at index as a key condition, never a full-partition read
+    start_date = DateTime(
+        "Only return events at or after this time (ISO 8601).",
+        "2024-01-01T00:00:00Z",
+    )
+    end_date = DateTime(
+        "Only return events at or before this time (ISO 8601).",
+        "2024-01-31T23:59:59Z",
+        allow_none=True,
+        required=False,
+    )
+
+
+class EventsResponseSchema(Schema):
+    data = List(
+        "The list of events, newest first.",
+        obj=NestedSchema(
+            schema_name="Event",
+            id=String("The event id.", "550e8400-e29b-41d4-a716-446655440000"),
+            type=String(
+                "The event type.", "install_failed", validate=[OneOf(EVENT_TYPES)]
+            ),
+            integration_name=String("The integration name.", "shipbob"),
+            integration_type=String("The integration type.", "wms"),
+            customer_id=String(
+                "Your identifier for the end customer, if any.",
+                "cust_123",
+                allow_none=True,
+            ),
+            connection_id=String(
+                "The connection the event belongs to, if any.",
+                "07b344db-0304-4866-9ae1-ac8af5292a28",
+                allow_none=True,
+            ),
+            message=String(
+                "A human-readable message, if the event has one.",
+                "Invalid credentials.",
+                allow_none=True,
+            ),
+            created_at=DateTime("When the event occurred.", "2024-01-15T12:00:00Z"),
+            additional_fields=Raw(required=False),
+        ),
+    )
+    next_token = NEXT_TOKEN
+
+
+def api_query_events(
+    org_id,
+    integration_name=None,
+    integration_type=None,
+    connection_id=None,
+    customer_id=None,
+    event_type=None,
+    start_date=None,
+    end_date=None,
+):
+    events = []
+    for row in get_events_for_org(
+        org_id,
+        start_date=start_date,
+        end_date=end_date,
+        integration_name=integration_name,
+        integration_type=integration_type,
+        connection_id=connection_id,
+        customer_id=customer_id,
+        event_type=event_type,
+    ):
+        events.append(
+            {
+                "id": row["id"],
+                "type": row["event_type"],
+                "integration_name": row["integration_name"],
+                "integration_type": row["integration_type"],
+                "customer_id": row["customer_id"],
+                "connection_id": row["connection_id"],
+                "message": row["message"],
+                "created_at": row["created_at"],
+                "additional_fields": row["additional_fields"],
+            }
+        )
+
+    # created_at is fixed-width ISO, so a string sort orders newest-first.
+    # severity/attention count are derived from the event type by the Events page
+    # (src/eventTypes.js), and integration display names live there too.
+    events.sort(key=lambda event: event["created_at"], reverse=True)
+    return {"data": events, "next_token": None}
+
+
+def hydrate_index_page(resource, index_items):
+    # index rows are thin projections, so we refill them from the main table.
+    # we stop at the cap: pulling a whole page of big rows timed requests out
+    ids_to_get = [item["id"] for item in index_items]
+    hydrated = []
+    running_size = 0
+    for start in range(0, len(ids_to_get), BATCH_GET_KEY_CHUNK):
+        chunk = ids_to_get[start : start + BATCH_GET_KEY_CHUNK]
+        fetched = resource.batch_get_resources(chunk)
+        # batch_get does not preserve order, and the next token comes off the
+        # last row we keep, so put the page back in the order ddb walked it
+        fetched_by_id = {item["id"]: item for item in fetched}
+        chunk_rows = [fetched_by_id[id_] for id_ in chunk if id_ in fetched_by_id]
+        hydrated.extend(chunk_rows)
+        running_size += len(json.dumps(chunk_rows, default=str).encode("utf-8"))
+        if running_size > MAX_API_RESPONSE_BYTES:
+            return hydrated, True
+    return hydrated, False
+
+
+def api_get_resources(resource_type, query_params):
+    # for use by the API
+    integration = request.environ["integration"]
+    resource = resource_type(integration)
+    connection_id = request.environ["connection_id"]
+
+    table_name = resource.table_name()
+
+    # if list of ids is provided, we ignore the rest of the query params
+    if "ids" in query_params:
+        ids = query_params["ids"]
+        for value in ids.values():
+            ids = value if isinstance(value, list) else [value]
+        response = resource.batch_get_resources(ids)
+        last_key = None
+        items = response
+    else:
+        dynamo_args, filters = create_dynamo_args(
+            table_name, connection_id, query_params=query_params
+        )
+        try:
+            response = query(table_name, dynamo_args, filters)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in (
+                "ThrottlingException",
+                "RequestLimitExceeded",
+            ):
+                raise ThrottleException(integration.integration_name, 1)
+            raise e
+
+        last_key = response.get("LastEvaluatedKey")
+        items = response["Items"]
+        stopped_early = False
+        if dynamo_args.get("IndexName"):
+            # see utils.boto.get_all_resources/get_resources_single_page
+            items, stopped_early = hydrate_index_page(resource, items)
+        running_size = len(json.dumps(items, default=str).encode("utf-8"))
+        # over the byte cap, or stopped short of the page: either way the index's
+        # own last key is wrong, so rebuild the next token off the last row kept
+        if (running_size > MAX_API_RESPONSE_BYTES or stopped_early) and len(items) > 1:
+            # key_fields is the schema we use to rebuild
+            # last evaluated key if it's manually set.
+            # e.g. for an index query on updated_date,
+            # key_fields = ["connection_id", "id", "updated_date"]
+            # and the rebuilt last_key looks like
+            # {"connection_id": "abc", "id": "42", "updated_date": "2026-..."}.
+            # if no index, will just be connection_id and id
+            meta = get_table_meta(table_name)
+            if last_key is not None:
+                key_fields = list(last_key.keys())
+            else:
+                key_fields = [k["AttributeName"] for k in meta["key_schema"]]
+                if dynamo_args.get("IndexName"):
+                    for idx in meta["global_secondary_indexes"]:
+                        if idx["IndexName"] != dynamo_args["IndexName"]:
+                            continue
+                        for k in idx["KeySchema"]:
+                            if k["AttributeName"] not in key_fields:
+                                key_fields.append(k["AttributeName"])
+            while running_size > MAX_API_RESPONSE_BYTES and len(items) > 1:
+                # estimate how many items to drop
+                target_count = max(
+                    1,
+                    int(len(items) * MAX_API_RESPONSE_BYTES / running_size),
+                )
+                if target_count >= len(items):
+                    target_count = len(items) - 1
+                del items[target_count:]
+                running_size = len(json.dumps(items, default=str).encode("utf-8"))
+            last_key = {field: items[-1][field] for field in key_fields}
+        start_time = time.time()
+        cur_time = start_time
+        limit_size = MIN_API_RETURN_SIZE
+        if query_params.get("limit"):
+            limit_size = query_params["limit"]["eq"]
+        api_return_size = min(limit_size, MIN_API_RETURN_SIZE)
+        while (
+            last_key is not None
+            and len(items) < api_return_size
+            and cur_time - start_time < MAX_API_GET_DURATION
+            and running_size < MAX_API_RESPONSE_BYTES
+        ):
+            dynamo_args["ExclusiveStartKey"] = last_key
+            dynamo_args["Limit"] = api_return_size - len(items)
+            try:
+                response = query(table_name, dynamo_args, filters)
+            except ClientError as e:
+                if e.response["Error"]["Code"] in (
+                    "ThrottlingException",
+                    "RequestLimitExceeded",
+                ):
+                    raise ThrottleException(integration.integration_name, 1)
+                raise e
+            page_items = response["Items"]
+            if dynamo_args.get("IndexName"):
+                page_items, stopped_early = hydrate_index_page(resource, page_items)
+                if stopped_early:
+                    # this page alone fills a response, so leave it for next time
+                    break
+            new_items_size = len(json.dumps(page_items, default=str).encode("utf-8"))
+            if running_size + new_items_size > MAX_API_RESPONSE_BYTES:
+                break
+            running_size += new_items_size
+            last_key = response.get("LastEvaluatedKey")
+            items.extend(page_items)
+            cur_time = time.time()
+
+    next_token = None
+    if last_key is not None:
+        next_token = base64.b64encode(json.dumps(last_key).encode("utf-8")).decode(
+            "utf-8"
+        )
+
+    reconstituted_items = []
+    for item in items:
+        item = dynamo_to_dict(item)
+        del item["connection_id"]
+        reconstituted_items.append(item)
+    items = reconstituted_items
+    api_response = OrderedDict()
+    api_response["data"] = items
+    api_response["total_count"] = len(items)
+    api_response["next_token"] = next_token
+    return api_response
+
+
+def api_get_resource(resource_type, item_id):
+    integration = request.environ["integration"]
+    resource = resource_type(integration)
+    connection_id = request.environ["connection_id"]
+    table_name = resource.table_name()
+
+    dynamo_args, filters = create_dynamo_args(table_name, connection_id, item_id)
+    try:
+        query_rsp = query(table_name, dynamo_args, filters)
+    except ClientError as e:
+        if e.response["Error"]["Code"] in (
+            "ThrottlingException",
+            "RequestLimitExceeded",
+        ):
+            raise ThrottleException(integration.integration_name, 1)
+        raise e
+    if not query_rsp["Items"]:
+        raise ResourceNotFoundException(resource, item_id)
+
+    item = dynamo_to_dict(query_rsp["Items"][0])
+    del item["connection_id"]
+    api_response = {"data": item}
+
+    to_return = best_effort_load(
+        resource.validate_single_item_endpoint,
+        resource.single_item_endpoint_schema,
+        api_response,
+    )
+    return to_return
+
+
+def cleanup_meta_schema(schema):
+    if "example" in schema:
+        del schema["example"]
+    if "allow_not_implemented" in schema:
+        del schema["allow_not_implemented"]
+    if "allOf" in schema:
+        if len(schema["allOf"]) == 1:
+            schema["$ref"] = schema["allOf"][0]["$ref"]
+            del schema["allOf"]
+    for key, value in schema.items():
+        if isinstance(value, dict):
+            cleanup_meta_schema(value)
+        elif isinstance(value, list):
+            for v in value:
+                if isinstance(v, dict):
+                    cleanup_meta_schema(v)
+    return schema
+
+
+def connection_meta_endpoint(resource_type, action_type):
+    integration = request.environ["integration"]
+    resource = resource_type(integration)
+    action = action_type(resource)
+
+    schema = action.input_schema()
+    apispec = APISpec(
+        title="dummy",
+        version="1.0.0",
+        openapi_version=OPENAPI_VERSION,
+        plugins=[
+            MarshmallowPlugin(schema_name_resolver=lambda sch: sch.__class__.__name__)
+        ],
+    )
+    schema_name = schema.__class__.__name__
+    apispec.components.schema(schema_name, schema=schema)
+    apispec_schemas = apispec.to_dict()["components"]["schemas"]
+    cleaned = cleanup_meta_schema(apispec_schemas)
+    # TODO deprecate
+    to_return = {"$ref": f"#/definitions/{schema_name}", "definitions": cleaned}
+    sorted_return = recursively_sort_dict_keys(to_return)
+    return sorted_return
+
+
+def recursively_sort_dict_keys(d):
+    # can remove this when we deprecate
+    """
+    Recursively sorts the keys of a dictionary and any nested dictionaries.
+    Returns a new dictionary with sorted keys.
+    """
+    if not isinstance(d, dict):
+        return d  # Return non-dict values as-is
+
+    sorted_items = sorted(d.items())  # Sort items by key
+    sorted_dict = {}
+    for key, value in sorted_items:
+        sorted_dict[key] = recursively_sort_dict_keys(value)  # Recurse for nested dicts
+    return sorted_dict
+
+
+def parse_request_body() -> dict:
+    if not request.headers.get("Content-Type"):
+        raise PokedexException("Content-Type header required", 400, origin="trackstar")
+    content_type = request.headers["Content-Type"].lower()
+    if "application/json" in content_type:
+        return request.get_json(silent=True) or {}
+    if "multipart/form-data" in content_type:
+        body = request.form.to_dict()
+        if request.files:
+            body.update(request.files)
+        return body
+    raise PokedexException("Unsupported content type", 415, origin="trackstar")
+
+
+def tag_write_function(action):
+    # tag before the first log line so every line for the request carries @function.
+    # best-effort: resolving raises for e.g. unimplemented writes — skip the tag and
+    # let action.run() re-raise that where it's handled, after the body is logged
+    try:
+        tags = {"function": action.function().__name__}
+    except Exception:
+        return
+    logger.updateConfig(tags)
+    tracer.set_tags(tags)
+
+
+def run_action(action, loaded_body, item_id=None):
+    action.set_skip_retrieval(loaded_body)
+    body_to_pass = copy.deepcopy(loaded_body)
+    args = []
+    if "body" in action.run_args():
+        args.append(body_to_pass)
+    if "item_id" in action.run_args():
+        args.append(item_id)
+    return action.run(*args)
+
+
+def validate_write_body(integration, action, body):
+    # a write schema may call the vendor to build its choices, so the same
+    # translations the write itself gets apply here
+    try:
+        assert_write_function_enabled(integration, action)
+        # generally duplicated in base_test.py write_and_validate
+        return action.validate_body(body)
+    except (PermissionsException, InvalidCredentialsException) as e:
+        handle_perm_cred_err(e, action.resource, request.method)
+        raise Exception("unreachable")
+    except AssertionError as e:
+        raise PokedexException(str(e), 422, origin="trackstar")
+
+
+def inject_trackstar_bookkeeping(item, existing, resource, body=None):
+    # post-write fields write_item and write_items add per item (created_date,
+    # trackstar_*). `existing` is the prior dynamo row if any; `body` is the
+    # request body when single-item writes can pass trackstar_tags through it
+    # (e.g. the AddTrackstarTag action).
+    if "created_date" not in item:
+        if existing:
+            item["created_date"] = existing["created_date"]
+        else:
+            item["created_date"] = EPOCH
+    if "updated_date" not in item:
+        item["updated_date"] = item["created_date"]
+    now_str = dt_to_str(now())
+    item["trackstar_created_date"] = now_str
+    item["trackstar_updated_date"] = now_str
+    if not AddTrackstarTag(resource).is_implemented():
+        return
+    if "trackstar_tags" in item:
+        return
+    if body is not None and "trackstar_tags" in body:
+        item["trackstar_tags"] = body["trackstar_tags"]
+    elif existing:
+        # sandbox doesn't start with trackstar_tags
+        item["trackstar_tags"] = existing.get("trackstar_tags")
+    else:
+        item["trackstar_tags"] = None
+
+
+def persist_items_and_emit_webhook(resource, items, connection_id):
+    items_to_store = []
+    for item in items:
+        item_to_store = copy.deepcopy(item)
+        item_to_store["connection_id"] = connection_id
+        items_to_store.append(item_to_store)
+    rows_for_dynamo, rows_for_webhook = get_rows_for_dynamo_webhook(
+        resource, items_to_store
+    )
+    store_resources(resource.table_name(), rows_for_dynamo)
+    webhook_payload = {
+        "resource": resource.trimmed(),
+        "data": rows_for_webhook,
+    }
+    write_pickle_to_s3("webhook", webhook_payload, source="api")
+
+
+def assert_write_function_enabled(integration, action):
+    # connection_row is stashed by the access-token auth path that every write goes through
+    connection_row = request.environ["connection_row"]
+    org_row = get_org_row(request.environ["org_id"])
+    disabled_functions = resolve_disabled_functions(
+        connection_row,
+        org_row,
+        integration.integration_name,
+        connection_row["integration_type"],
+    )
+    # common case: nothing disabled, so don't even resolve the write's name
+    if not disabled_functions:
+        return
+    write_function_name = action.function().__name__
+    if write_function_name in disabled_functions:
+        raise PokedexException(
+            f"{write_function_name} is disabled for this connection",
+            403,
+            origin="trackstar",
+        )
+
+
+def use_idempotency_key(loaded_body, resource):
+    # the header was validated by the endpoint's header schema before we got here
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key is None:
+        return None, None
+    logger.info(f"idempotency_key: {idempotency_key}")
+    connection_id = request.environ["connection_id"]
+    # the same key on another endpoint or with another body is a mistake, not a retry
+    body_json = json.dumps(loaded_body, sort_keys=True, default=str)
+    request_hash = hashlib.sha256(
+        f"{request.method} {request.path}\n{body_json}".encode()
+    ).hexdigest()
+    existing = create_idempotency_key_row(
+        connection_id, idempotency_key, request_hash, logger.config["request_id"]
+    )
+    if existing is None:
+        return idempotency_key, None
+    if existing["request_hash"] != request_hash:
+        raise PokedexException(
+            f"Idempotency-Key `{idempotency_key}` was already used for a different request",
+            400,
+            origin="trackstar",
+        )
+    if existing["status"] == IDEMPOTENCY_SUCCEEDED:
+        request.environ["idempotent_replayed"] = True
+        return idempotency_key, replay_first_write(existing, resource)
+    # the put takes over a row left in progress by a dead request, so a row still
+    # here belongs to a request that is really running
+    raise PokedexException(
+        f"A request with Idempotency-Key `{idempotency_key}` is still in progress. "
+        "Wait for it to finish before retrying.",
+        409,
+        origin="trackstar",
+    )
+
+
+def replay_first_write(existing, resource):
+    if existing.get("response"):
+        # apiflask serializes this the same way it did the first time
+        return json.loads(existing["response"])
+    # the first response was too big for the row, so rebuild it from the resource
+    write_ids = existing["write_ids"]
+    if not write_ids:
+        raise PokedexException(
+            "The first request with this Idempotency-Key succeeded, but its response "
+            f"is too large to replay. Fetch the {resource.english_singular_name().lower()} directly.",
+            409,
+            origin="trackstar",
+        )
+    if existing["batch"]:
+        return {"data": resource.batch_get_resources(write_ids), "unused_fields": []}
+    write_id = write_ids[0]
+    if existing["skip_retrieval"]:
+        data = {"id": write_id, "success": True}
+        return {"id": write_id, "data": data, "unused_fields": []}
+    try:
+        data = resource.get_resource(write_id)
+    except ResourceNotFoundException:
+        # some writes never store a row; the retry still gets its id back
+        data = {"id": write_id}
+    return {"id": write_id, "data": data, "unused_fields": []}
+
+
+def store_response_for_replay(idempotency_key, action, to_return):
+    if idempotency_key is None:
+        return
+    # the write already succeeded, so a failure here must not turn it into an error
+    try:
+        batch = action.is_batch()
+        write_ids = []
+        if batch:
+            for item in to_return["data"]:
+                write_ids.append(str(item["id"]))
+        elif to_return.get("id") is not None:
+            write_ids.append(str(to_return["id"]))
+        response = current_app.json.dumps(action.response_schema().dump(to_return))
+        if len(response.encode()) > config.IDEMPOTENCY_RESPONSE_MAX_BYTES:
+            response = None
+        mark_idempotency_key_succeeded(
+            request.environ["connection_id"],
+            idempotency_key,
+            write_ids,
+            batch,
+            action.skip_retrieval,
+            response,
+        )
+    except Exception as e:
+        logger.error(f"could not mark idempotency_key {idempotency_key} succeeded: {e}")
+
+
+def delete_idempotency_key(idempotency_key):
+    # the write failed, so a retry with this key must run the write again
+    if idempotency_key is None:
+        return
+    try:
+        delete_idempotency_key_row(request.environ["connection_id"], idempotency_key)
+    except Exception as e:
+        logger.error(f"could not delete idempotency_key {idempotency_key}: {e}")
+
+
+def api_write_resource(
+    resource_type,
+    action_type,
+    item_id=None,
+    fail_validation=False,
+):
+    integration = request.environ["integration"]
+    resource: Resource = resource_type(integration)
+    action: Action = action_type(resource)
+
+    body = parse_request_body()
+    tag_write_function(action)
+    loaded_body, unused_fields = validate_write_body(integration, action, body)
+    idempotency_key, replay = use_idempotency_key(loaded_body, resource)
+    if replay is not None:
+        return replay
+    write_args = (resource, action, body, loaded_body, unused_fields, fail_validation)
+    try:
+        if action.is_batch():
+            to_return = write_items(*write_args)
+        else:
+            to_return = write_item(*write_args, item_id)
+    except Exception:
+        delete_idempotency_key(idempotency_key)
+        raise
+    store_response_for_replay(idempotency_key, action, to_return)
+    return to_return
+
+
+def write_item(
+    resource, action, body, loaded_body, unused_fields, fail_validation, item_id
+):
+    integration = resource.integration
+
+    if "item_id" in action.run_args():
+        assert item_id
+    else:
+        assert not item_id
+    logger.info(f"Request body: {body}")
+    connection_id = request.environ["connection_id"]
+
+    linked_resource_key = resource.linked_resource_key
+    linked_id_from_body = None
+
+    try:
+        action.set_skip_retrieval(loaded_body)
+        body_to_pass = copy.deepcopy(loaded_body)
+        # child Create: lift linked_resource_key out of the body and pass it as
+        # the positional id so the integration signature stays (data, linked_id).
+        if (
+            linked_resource_key
+            and isinstance(action, Create)
+            and isinstance(body_to_pass, dict)
+            and linked_resource_key in body_to_pass
+        ):
+            linked_id_from_body = body_to_pass.pop(linked_resource_key)
+        args = []
+        if "body" in action.run_args():
+            args.append(body_to_pass)
+        if "item_id" in action.run_args():
+            args.append(item_id)
+        elif linked_id_from_body is not None:
+            args.append(linked_id_from_body)
+        rsp = action.run(*args)
+    except (PermissionsException, InvalidCredentialsException) as e:
+        handle_perm_cred_err(e, resource, request.method)
+        raise Exception("unreachable")
+    except ValidationError as e:
+        raise e
+    except AssertionError as e:
+        raise PokedexException(str(e), 422, origin="trackstar")
+    else:
+        handle_api_call_errors(rsp, resource, request.method, allow_errors=False)
+    if (
+        connection_id in DEPOSCO_CUSTOMER_ORDER_CONNECTIONS
+        and resource.name() == "orders"
+    ):
+        if isinstance(action, Create) and body.get("trackstar_tags"):
+            # only has reference_id
+            created = now()
+            # normally, inject_trackstar_bookkeeping would add the trackstar_tags
+            # but since we don't store the order in dynamo, we have to early
+            # return and store the tags here
+            # we delete the row anyway in populate_customer_order_trackstar_tags,
+            # but adding a ttl just in case to avoid orphaned rows
+            ttl = int((created + timedelta(days=90)).timestamp())
+            side_row = {
+                "connection_id": connection_id,
+                "id": body["reference_id"],
+                "trackstar_tags": body["trackstar_tags"],
+                "created_date": dt_to_str(created),
+                "updated_date": dt_to_str(created),
+                # need for store_resources ^
+                "ttl": ttl,
+            }
+            dco = DeposcoCustomerOrder(integration)
+            try:
+                dco.get_resource(body["reference_id"])
+                logger.info(
+                    f"DeposcoCustomerOrder with id {body['reference_id']} already exists, skipping side store insert"
+                )
+            except ResourceNotFoundException:
+                store_resources(dco.table_name(), [side_row])
+        return rsp
+    item = rsp["data"]
+
+    if not isinstance(action, Create):
+        try:
+            original_item = resource.get_resource(item_id)
+        except ResourceNotFoundException:
+            original_item = None
+    else:
+        original_item = None
+
+    if isinstance(item, dict) and not action.skip_retrieval:
+        inject_trackstar_bookkeeping(item, original_item, resource, body=body)
+
+    rsp["unused_fields"] = unused_fields
+    write_id = rsp.get("id")
+    # for some integrations that don't actually create a new shipment, but modify an existing one
+    if not write_id:
+        write_id = action.get_write_id(item, original_item, item_id, fail_validation)
+    rsp["id"] = write_id
+    to_return = best_effort_load(
+        action.validate_write_response,
+        action.response_schema,
+        rsp,
+        fail_validation=fail_validation,
+    )
+    if not action.store_response():
+        return to_return
+
+    # TODO: this is a hack to avoid having FBM update inventory
+    if integration.integration_name == "fba" and isinstance(action, AdjustInventory):
+        return to_return
+    try:
+        action.validate_write_response_fields(loaded_body, to_return, item_id, write_id)
+    except Exception as e:
+        logger.error(f"Validation Exception: {str(e)}")
+        if fail_validation:
+            raise e
+    # don't update dynamo when skipping resource retrieval on writes
+    if action.skip_retrieval:
+        return to_return
+    persist_items_and_emit_webhook(resource, [to_return["data"]], connection_id)
+
+    if resource.linked_resource_type is not None:
+        # child write already committed + webhooked; enqueue async refresh of the
+        # linked record. failure here must not 500 the caller (would duplicate).
+        try:
+            # write response echoes the linked record's FK; on create it was
+            # lifted from the body, so fall back to that. one child, one linked.
+            linked_id = (
+                to_return["data"].get(linked_resource_key) or linked_id_from_body
+            )
+            if linked_id:
+                now_str = dt_to_str(now())
+                payload = {
+                    "resource": resource.trimmed(),
+                    "data": [str(linked_id)],
+                    "start": now_str,
+                    "end": now_str,
+                    "tracking_id": "",
+                }
+                write_pickle_to_s3("linked-refresh", payload, "linked_refresh")
+        except Exception as e:
+            logger.error(f"linked-refresh enqueue failed for {resource.name()}: {e}")
+
+    return to_return
+
+
+def write_items(resource, action, body, loaded_body, unused_fields, fail_validation):
+    # batch sibling of write_item: integration returns a list of items
+    # under rsp["data"] instead of a single dict. shared post-processing
+    # (trackstar bookkeeping injection, dynamo upsert, webhook emit) runs once
+    # over the list rather than once per single-item write.
+    logger.info(f"Request body: {body}")
+    connection_id = request.environ["connection_id"]
+
+    try:
+        rsp = run_action(action, loaded_body)
+    except (PermissionsException, InvalidCredentialsException) as e:
+        handle_perm_cred_err(e, resource, request.method)
+        raise Exception("unreachable")
+    except ValidationError as e:
+        raise e
+    except AssertionError as e:
+        raise PokedexException(str(e), 422, origin="trackstar")
+    else:
+        handle_api_call_errors(rsp, resource, request.method, allow_errors=False)
+
+    items = rsp["data"]
+
+    # batch-lookup existing dynamo rows so we can preserve created_date and
+    # trackstar_* immutables — same logic as the single-item path's
+    # `original_item = resource.get_resource(item_id)`, just one round-trip.
+    item_ids = []
+    for item in items:
+        item_ids.append(item["id"])
+    if item_ids:
+        existing_items = resource.batch_get_resources(item_ids)
+    else:
+        existing_items = []
+    existing_by_id = {}
+    for existing in existing_items:
+        existing_by_id[existing["id"]] = existing
+
+    for item in items:
+        inject_trackstar_bookkeeping(item, existing_by_id.get(item["id"]), resource)
+
+    rsp["unused_fields"] = unused_fields
+
+    to_return = best_effort_load(
+        action.validate_write_response,
+        action.response_schema,
+        rsp,
+        fail_validation=fail_validation,
+    )
+
+    # batch semantic check: line-by-line, did the response reflect what we
+    # asked for? mirrors the single-item validate_write_response_fields hop
+    # in write_item. logs in prod; raises under fail_validation.
+    try:
+        action.validate_write_response_fields(loaded_body, to_return, None, None)
+    except Exception as e:
+        logger.error(f"Validation Exception: {str(e)}")
+        if fail_validation:
+            raise e
+
+    if not action.store_response():
+        return to_return
+    if not to_return["data"]:
+        return to_return
+    persist_items_and_emit_webhook(resource, to_return["data"], connection_id)
+    return to_return
+
+
+def best_effort_load(validator, schema_fn, rsp, fail_validation=False) -> dict:
+    to_return = rsp
+    schema = schema_fn()
+    try:
+        dumped = schema.dump(rsp)
+        # to exclude hidden fields
+        to_return = dumped
+        to_return = schema.load(dumped, partial=True, unknown="include")
+        validator(to_return)
+    except Exception as e:
+        parsed_err = str(e).split("\n")[0]
+        prefix = "Response Validation Exception: "
+        data = to_return.get("data", {})
+        if isinstance(data, dict):
+            id = data.get("id")
+            if id:
+                prefix = f"Response Validation Exception for {id}: "
+        logger.error(f"{prefix}{parsed_err}")
+        if fail_validation:
+            raise e
+    return to_return
+
+
+def delete_connection_helper(connection_id, org_id):
+    try:
+        # the sandbox connection backs the dashboard's onboarding state; deleting it
+        # bounces the customer's home page back to the getting-started screen
+        connection = get_connections_row(connection_id)
+        if connection["integration_name"] == "sandbox":
+            raise PokedexException(
+                "Sandbox connections cannot be deleted", 403, origin="trackstar"
+            )
+        deleted_connection = delete_connections_row(connection_id)
+        integration_name = deleted_connection["Attributes"]["integration_name"]
+        integration_type = deleted_connection["Attributes"]["integration_type"]
+        customer_id = deleted_connection["Attributes"].get("customer_id")
+        record_event(
+            org_id,
+            "connection_deleted",
+            integration_name,
+            integration_type,
+            connection_id=connection_id,
+            customer_id=customer_id,
+        )
+
+        # decrypt secret so integration can call external apis (e.g. unsubscribe from notifications)
+        integration_secret = None
+        try:
+            org_private_key = get_org_private_key(org_id)
+            encrypted_secret = deleted_connection["Attributes"].get(
+                "integration_secret"
+            )
+            if encrypted_secret:
+                integration_secret = org_decrypt(encrypted_secret, org_private_key)
+        except Exception as e:
+            logger.error(f"Could not decrypt integration_secret for delete: {e}")
+
+        integration = build_integration(
+            deleted_connection["Attributes"],
+            org_id,
+            integration_secret=integration_secret,
+        )
+
+        try:
+            integration.pre_delete()
+        except Exception as e:
+            logger.error(f"pre_delete error for {connection_id}: {e}")
+
+        connection_deleted = {
+            "item": {
+                "connection_id": connection_id,
+                "deleted_date": dt_to_str(now()),
+            },
+            "action": "deleted",
+        }
+        resource = Connection(integration).trimmed()
+        webhook_payload = {
+            "resource": resource,
+            "data": [connection_deleted],
+        }
+        write_pickle_to_s3("webhook", webhook_payload, source="api")
+        logger.info(f"Deleted connection row: {deleted_connection['Attributes']}")
+    except PokedexException:
+        # let the sandbox-block 403 (and any other intentional status) through
+        raise
+    except Exception:
+        raise PokedexException("Error deleting connection", 500, origin="trackstar")
+
+    return {"id": connection_id, "object": "connection", "deleted": True}
+
+
+def call_integration_me(
+    integration_file,
+    integration_row,
+    org_private_key,
+    connection_id,
+    org_id,
+    customer_id,
+    safe=False,
+):
+    integration_secret = integration_row["integration_secret"]
+    additional_fields = integration_row["additional_fields"]
+    raw_integration_secret = org_decrypt(integration_secret, org_private_key)
+    integration = integration_file.Integration(
+        connection_id=connection_id,
+        org_id=org_id,
+        customer_id=customer_id,
+        integration_secret=raw_integration_secret,
+        connection_additional_fields=additional_fields,
+    )
+    me = None
+    try:
+        if not safe:
+            me = integration.me()
+        else:
+            me = integration.safe_me()
+    except Exception as e:
+        endpoint = "safe_me" if safe else "me"
+        logger.error(
+            f"Error fetching '{endpoint}' info for integration {connection_id}: {str(e)}"
+        )
+    return me
+
+
+# API inputs and outputs
+
+
+def enforce_active_org_billing(org_row):
+    # cache miss or missing row: allow the call rather than locking everyone out
+    if not org_row:
+        return
+    if org_row["billing_status"] in INACTIVE_BILLING_STATUSES:
+        raise InvalidTrackstarCredentialsException("Organization is not active")
+
+
+def validate_api_key(api_key):
+    try:
+        row = get_api_key_row_cached(api_key)
+    except:
+        logger.info(f"Invalid API key: {api_key}")
+        raise InvalidTrackstarCredentialsException("Invalid API key")
+    if row["read_only"] and request.method != "GET":
+        raise PokedexException(
+            "Read-only API key cannot make write requests", 403, "trackstar"
+        )
+    org_id = row["org_id"]
+    request.environ["org_id"] = org_id
+    logger.updateConfig({"org_id": org_id})
+    tracer.set_tags({"org_id": org_id})
+    org_row = None
+    try:
+        org_row = get_org_row_cached(org_id)
+        org_name = org_row["name"]
+        request.environ["org_name"] = org_name
+        logger.updateConfig({"org_name": org_name})
+        tracer.set_tags({"org_name": org_name})
+    except:
+        pass
+    enforce_active_org_billing(org_row)
+
+
+def validate_auth_header(auth_header):
+    try:
+        frontend_token = decode_auth_header(auth_header)
+    except:
+        raise InvalidTrackstarCredentialsException("Invalid Authorization header")
+    exp, nbf = frontend_token["exp"], frontend_token["nbf"]
+    cur = int(time.time())
+    if cur > exp:
+        raise InvalidTrackstarCredentialsException("Token has expired")
+    if cur < nbf:
+        raise InvalidTrackstarCredentialsException("Token is not valid yet")
+
+    org_id = frontend_token["org_id"]
+    request.environ["org_id"] = org_id
+    logger.updateConfig({"org_id": org_id})
+    tracer.set_tags({"org_id": org_id})
+    submitter_user_id = frontend_token.get("sub")
+    if submitter_user_id:
+        request.environ["submitter_user_id"] = submitter_user_id
+    try:
+        org_row = get_org_row_cached(org_id)
+        org_name = org_row["name"]
+        request.environ["org_name"] = org_name
+        logger.updateConfig({"org_name": org_name})
+        tracer.set_tags({"org_name": org_name})
+    except:
+        pass
+
+
+def validate_access_token(access_token):
+    if not access_token.startswith("trackstar_"):
+        raise ValidationError("Malformed access token")
+    access_token = access_token.split("trackstar_")[1]
+
+    org_id = request.environ.get("org_id")
+    if not org_id:
+        raise InvalidTrackstarCredentialsException("API key required")
+    try:
+        org_private_key = get_org_private_key(org_id)
+    except:
+        logger.error(f"Failed to get org private key for {org_id}")
+        raise InvalidTrackstarCredentialsException("Invalid access token")
+    try:
+        decoded_token = decode_access_token(access_token, org_private_key)
+    except:
+        logger.error(f"Failed to decode access token {access_token}")
+        raise InvalidTrackstarCredentialsException("Invalid access token")
+
+    integration_name = decoded_token.get("integration_name")
+    request.environ["integration_name"] = integration_name
+    logger.updateConfig({"integration_name": integration_name})
+    tracer.set_tags({"integration_name": integration_name})
+
+    connection_id = decoded_token.get("connection_id") or decoded_token.get("token_id")
+    # to support when connection ID used to be called token ID
+    request.environ["connection_id"] = connection_id
+    logger.updateConfig({"connection_id": connection_id})
+    tracer.set_tags({"connection_id": connection_id})
+
+    if not integration_name or not connection_id:
+        raise InvalidTrackstarCredentialsException("Invalid access token")
+
+    try:
+        connections_row = get_connections_row(connection_id)
+    except:
+        raise InvalidTrackstarCredentialsException("Invalid access token")
+
+    integration_type = connections_row["integration_type"]
+    request.environ["integration_type"] = integration_type
+    request.environ["connection_row"] = connections_row
+    logger.updateConfig({"integration_type": integration_type})
+    tracer.set_tags({"integration_type": integration_type})
+    request.environ["integration"] = build_integration(connections_row, org_id)
+
+
+API_KEY_HEADER = String(
+    "Your organization-level Trackstar API key.",
+    "<x-trackstar-api-key>",
+    data_key="x-trackstar-api-key",
+    validate=[validate_api_key],
+)
+AUTH_HEADER = String(
+    "Auth header from Trackstar frontend.", validate=[validate_auth_header]
+)
+ACCESS_TOKEN_HEADER = String(
+    "Your user's access token for a specific integration (ShipHero, Extensiv, etc).",
+    "<x-trackstar-access-token>",
+    data_key="x-trackstar-access-token",
+    validate=[validate_access_token],
+)
+
+INTEGRATION_TYPES = ["wms"] + [
+    k for k in resource_map.keys() if k not in ["general", "wms"]
+]
+
+ALL_INTEGRATION_NAMES = sorted(
+    {
+        name
+        for integration_type in INTEGRATION_TYPES
+        for name in list_integration_names(integration_type)
+    }
+)
+
+
+def validate_link_token(link_token):
+    try:
+        link_token_row = get_link_token_row(link_token)
+        request.environ["org_id"] = link_token_row["org_id"]
+    except:
+        raise InvalidTrackstarCredentialsException(
+            "Invalid link token. Session may have timed out. Refresh your browser and try again.",
+        )
+    request.environ["link_token_connection_id"] = link_token_row["connection_id"]
+    # validate connection_id exists for org_id
+    if link_token_row["connection_id"]:
+        try:
+            connection_row = get_connections_row(link_token_row["connection_id"])
+            if connection_row["org_id"] != link_token_row["org_id"]:
+                raise Exception
+        except:
+            raise InvalidTrackstarCredentialsException(
+                "Invalid link token. Connection does not belong to org."
+            )
+
+
+class GetAccessTokenQueryParamSchema(Schema):
+    connection_id = String(
+        "A unique connection ID for the integration.", "unique_connection_id"
+    )
+    integration_name = String(
+        "The name of the integration that was installed.", "integration_name"
+    )
+
+
+class LinkTokenHeaderSchema(Schema):
+    link_token = String(
+        data_key="x-trackstar-link-token", validate=[validate_link_token]
+    )
+
+
+class APIKeyHeaderSchema(Schema):
+    x_trackstar_api_key = API_KEY_HEADER
+
+
+class AuthHeaderSchema(Schema):
+    Authorization = AUTH_HEADER
+
+
+class CreateOrgSchema(Schema):
+    name = String()
+    creator_email = String(required=False)
+
+
+class AdminOrgBillingStatusBodySchema(Schema):
+    billing_status = String(required=True, validate=[OneOf(BILLING_STATUSES)])
+    trial_end_date = Date(required=False)
+
+
+class AdminBillingPricingRuleBodySchema(Schema):
+    # canonical shape of one pricing rule (one customer contract); oak conforms
+    # to this schema, not the other way around
+    id = String()
+    org_id = String()
+    # the customer's own name comes from the org, and the vertical comes from
+    # type_filter; an alias is only for a contract signed under a different brand
+    alias = String(required=False, allow_none=True)
+    base_fee_type = String(allow_none=True, validate=[OneOf(BILLING_BASE_FEE_TYPES)])
+    base_fee_amount = Float(validate=[Range(min=0)])
+    connection_fee_type = String(
+        allow_none=True, validate=[OneOf(BILLING_CONNECTION_FEE_TYPES)]
+    )
+    flat_rate = Float(validate=[Range(min=0)])
+    tiers = billing_tiers_field("BillingRuleTier")
+    pricing_changes = List(
+        "Dated fee-structure changes; the latest change at or before the billing month applies",
+        obj=NestedSchema(
+            "BillingRulePricingChange",
+            effective_month=String(validate=[validate_billing_month]),
+            base_fee_type=String(
+                allow_none=True, validate=[OneOf(BILLING_BASE_FEE_TYPES)]
+            ),
+            base_fee_amount=Float(validate=[Range(min=0)]),
+            connection_fee_type=String(
+                allow_none=True, validate=[OneOf(BILLING_CONNECTION_FEE_TYPES)]
+            ),
+            flat_rate=Float(validate=[Range(min=0)]),
+            tiers=billing_tiers_field("BillingPricingChangeTier"),
+            note=String(required=False, allow_none=True),
+        ),
+    )
+    type_filter = List(
+        "Verticals this rule bills; a rule always names at least one",
+        obj=String(validate=[OneOf(INTEGRATION_TYPES)]),
+        validate=[Length(min=1)],
+    )
+    free_connections = Integer(validate=[Range(min=0)])
+    lag_new_connections = Boolean()
+    active_only = Boolean()
+    min_connection_age_days = Integer(
+        "Only bill a connection once it has existed this many days; 0 bills from day one",
+        validate=[Range(min=0)],
+    )
+    skip_deleted_in_period = Boolean(
+        "Don't bill a connection in the month it was removed"
+    )
+    exclude_end_customer_patterns = List(
+        "Drop connections whose end-customer name contains any of these",
+        obj=String(),
+    )
+    exclude_integrations = List(
+        "Drop connections whose integration name matches any of these",
+        obj=String(),
+    )
+    dedup_rules = List(
+        "Collapse several connections into one billable connection",
+        obj=NestedSchema(
+            "BillingRuleDedup",
+            integrations=List("Integration names", obj=String()),
+            group_by=List(
+                "One billable per unique group key",
+                obj=String(validate=[OneOf(["customer_id", "integration_name"])]),
+            ),
+            customer_pattern=String(required=False, allow_none=True),
+            collapse_all_for_customer=Boolean(required=False, allow_none=True),
+        ),
+    )
+    integration_overrides = List(
+        "Price a subset of connections separately from the main pool",
+        obj=NestedSchema(
+            "BillingRuleIntegrationOverride",
+            integrations=List("Integration names", obj=String()),
+            customer_pattern=String(required=False, allow_none=True),
+            status_filter=List(
+                "Connection statuses", obj=String(), required=False, allow_none=True
+            ),
+            flat_fee_each=Float(
+                required=False, allow_none=True, validate=[Range(min=0)]
+            ),
+            flat_fee_bundle=Float(
+                required=False, allow_none=True, validate=[Range(min=0)]
+            ),
+            tiers=billing_tiers_field(
+                "BillingOverrideTier", required=False, allow_none=True
+            ),
+        ),
+    )
+    signed_month = String(
+        required=False, allow_none=True, validate=[validate_billing_month]
+    )
+    first_billable_month = String(
+        required=False, allow_none=True, validate=[validate_billing_month]
+    )
+    churn_month = String(
+        required=False, allow_none=True, validate=[validate_billing_month]
+    )
+    skip = Boolean()
+    note = String(required=False, allow_none=True)
+
+
+class AdminBillingOverrideBodySchema(Schema):
+    amount = Float(validate=[Range(min=0)])
+
+
+class AdminBillingConnectionOverrideBodySchema(Schema):
+    billable = Boolean()
+
+
+class AdminBillingConnectionsQuerySchema(Schema):
+    period = String(
+        "Invoice month (YYYY-MM), or 'current' for the accruing one.",
+        "current",
+        validate=[validate_billing_period],
+    )
+
+
+class AdminBillingInvoicesQuerySchema(Schema):
+    period = String(
+        "Invoice months to compute (YYYY-MM), comma separated; 'current' is the "
+        "accruing one.",
+        "current",
+        validate=[validate_billing_periods],
+    )
+    org_id = String("Only this org's invoices.", required=False)
+
+
+class OrgSettingsBodySchema(Schema):
+    first_crawl_lookback_settings = Dict(
+        "Per-integration-type first-crawl lookback in days.",
+        {"wms": 30, "cart": 30, "carrier": 30, "freight": 30, "erp": 30},
+        String("Integration type", validate=[OneOf(INTEGRATION_TYPES)]),
+        Integer("Lookback days"),
+        required=False,
+    )
+    brand_color = String(required=False, allow_none=True)
+    prevent_duplicate_installs = Boolean(required=False)
+
+
+class CreateApiKeySchema(Schema):
+    read_only = Boolean(required=False, load_default=False)
+
+
+class UpdateApiKeySchema(Schema):
+    nickname = String(required=False, allow_none=True)
+
+
+WMS_REQUEST_FLOW_VALUES = [flow["value"] for flow in WMS_REQUEST_FLOWS]
+
+
+class IntegrationRequestFlowsQuerySchema(Schema):
+    integration_type = String(
+        "Only return flows for this integration type. Omit to get every type.",
+        "wms",
+        required=False,
+        validate=[OneOf(REQUESTABLE_INTEGRATION_TYPES)],
+    )
+
+
+class IntegrationRequestFlowsResponseSchema(Schema):
+    flows = List(
+        "The flows you can ask for on an integration request.",
+        obj=NestedSchema(
+            schema_name="IntegrationRequestFlow",
+            value=String(
+                "Send this in the flows field of an integration request.", "read_orders"
+            ),
+            label=String("Human-readable name for the flow.", "Orders & shipments"),
+            direction=String(
+                "Whether we read this data from the system or write it to the system. Requesting any write flow means we need sandbox credentials.",
+                "read",
+            ),
+            integration_type=String(
+                "The integration type this flow belongs to.", "wms"
+            ),
+        ),
+    )
+
+
+class IntegrationRequestBodySchema(Schema):
+    integration_type = String(
+        required=True, validate=[OneOf(REQUESTABLE_INTEGRATION_TYPES)]
+    )
+    integration_name = String(required=True)
+    integration_contact_email = String(required=False, allow_none=True)
+    brand_name = String(required=False, allow_none=True)
+    brand_contact_email = String(required=False, allow_none=True)
+    api_docs_url = String(required=False, allow_none=True)
+    api_docs_via_email = Boolean(required=False)
+    flows = List(
+        f"The flows you need from this integration. For wms, one of: "
+        f"{', '.join(WMS_REQUEST_FLOW_VALUES)}. For cart and carrier, the action names "
+        f'that type supports. Pass "{NOT_SURE_FLOW}" if you do not know yet, and we will '
+        f"follow up. Call GET /integration-requests/flows for the current list.",
+        ["read_orders", "read_inventory"],
+        obj=String(),
+        required=True,
+        validate=[Length(min=1)],
+    )
+    prod_creds_url = String(required=False, allow_none=True)
+    sandbox_creds_url = String(required=False, allow_none=True)
+    notes = String(required=False, allow_none=True)
+
+
+class IntegrationRequestResponseSchema(Schema):
+    success = Boolean(required=True)
+
+
+class UserNotificationSettingsQuerySchema(Schema):
+    email = String(
+        "The user's email address to fetch notification settings for.",
+        "user@example.com",
+        required=True,
+    )
+
+
+class UserNotificationSettingsInputSchema(Schema):
+    email = String("The user's email address.", "user@example.com", required=True)
+    subscriptions = Dict(
+        "Notification type subscriptions where keys are notification types and values are boolean subscription status.",
+        {"connection_error_created": True},
+        String("Notification type"),
+        Boolean("Subscription status"),
+        required=True,
+    )
+
+
+class UserNotificationSettingsResponseSchema(Schema):
+    subscriptions = Dict(
+        "User's current notification subscriptions.",
+        {"connection_error_created": True},
+        String("Notification type"),
+        Boolean("Whether user is subscribed to this notification type"),
+    )
+
+
+class NotificationTypesResponseSchema(Schema):
+    notification_types = List(
+        "List of available notification types",
+        obj=NestedSchema(
+            schema_name="NotififcationTypeSchema",
+            key=String(
+                "Unique identifier for the notification type",
+                "connection_error_created",
+                required=True,
+            ),
+            display_name=String(
+                "Human-readable name for the notification type",
+                "Connection Error",
+                required=True,
+            ),
+            description=String(
+                "Description of when this notification is sent",
+                "Get notified when a connection encounters an error",
+                required=True,
+            ),
+        ),
+    )
+
+
+class UpdateConnectionSchema(Schema):
+    customer_id = CUSTOMER_ID(allow_none=True, required=False)
+    webhooks_disabled = Boolean(required=False)
+
+
+class OrgSettingsFileSchema(Schema):
+    image = String()
+
+
+class SingleIntegrationInfoHeaderSchema(Schema):
+    x_trackstar_api_key = API_KEY_HEADER
+    x_trackstar_access_token = String(
+        "Optional. Pass this in to get connection-specific field information. Your user's access token for a specific integration (ShipHero, Extensiv, etc).",
+        "<x-trackstar-access-token>",
+        data_key="x-trackstar-access-token",
+        validate=[validate_access_token],
+        required=False,
+    )
+
+
+class IntegrationTypePathSchema(Schema):
+    integration_type = String(
+        "The type of integration to filter by.",
+        validate=[OneOf(INTEGRATION_TYPES)],
+    )
+
+
+class IntegrationTypeAndNamePathSchema(IntegrationTypePathSchema):
+    integration_name = String("The name of the integration to filter by.")
+
+
+class AvailableIntegrationsQueryParamSchema(Schema):
+    endpoints = List(
+        "A comma separated list of endpoint(s) that an integration must support for it to be included in the Modal. Mutually exclusive with `integration_allow_list`.",
+        ["get_inventory", "get_products", "create_order"],
+        String(),
+        required=False,
+        load_default=[],
+    )
+    integration_allow_list = List(
+        "Integrations that your users will be allowed to install. Mutually exclusive with `integration_block_list` and `endpoints`.",
+        ["shipbob"],
+        String(),
+        required=False,
+        load_default=[],
+    )
+    integration_block_list = List(
+        "Integrations that your users will not be allowed to install. Mutually exclusive with `integration_allow_list`.",
+        ["shipbob"],
+        String(),
+        required=False,
+        load_default=[],
+    )
+    allow_sandbox = Boolean(
+        "Whether or not to allow sandbox integrations.",
+        required=False,
+        load_default=False,
+    )
+    integration_type = String(
+        "The type of integration to filter by.",
+        required=False,
+        load_default="wms",
+        validate=[OneOf(INTEGRATION_TYPES)],
+    )
+
+
+class IntegrationsFilterQueryParamSchema(OperatorQueryParams):
+    integration_name = allowed_operators(
+        String,
+        "Filter integrations by name. Supports eq, neq, in, and nin "
+        "(e.g. integration_name[in]=shipbob,packiyo).",
+        "shipbob",
+    )
+    actions = CommaSeparatedList(
+        "A comma separated list of actions an integration must support to be included (e.g. get_orders,get_inventory).",
+        "get_orders,get_inventory",
+        String(),
+        required=False,
+    )
+
+
+class LinkTokenResponseSchema(Schema):
+    link_token = String(
+        "The link token that is required to initiate the `react-trackstar-link` component.",
+        "your_link_token",
+    )
+
+
+class MagicLinkInputSchema(Schema):
+    connection_id = String(
+        "An optional existing connection ID. If provided, the connection is reinstalled instead of a new connection being created.",
+        required=False,
+        allow_none=True,
+    )
+    integration_allow_list = List(
+        "Integrations that your users will be allowed to install. Mutually exclusive with `integration_block_list` and `integrations_with_endpoints`.",
+        ["shipbob"],
+        String(),
+        load_default=[],
+        required=False,
+    )
+    integration_block_list = List(
+        "Integrations that your users will not be allowed to install. Mutually exclusive with `integration_allow_list`.",
+        ["shipbob"],
+        String(),
+        load_default=[],
+        required=False,
+    )
+    integrations_with_endpoints = List(
+        "Only show integrations that support these endpoints. Mutually exclusive with `integration_allow_list`.",
+        ["get_inventory", "get_products", "create_order"],
+        String(),
+        load_default=[],
+        required=False,
+    )
+    integration_type = String(
+        "The type of integration to filter by.",
+        required=False,
+        load_default="wms",
+        validate=[OneOf(INTEGRATION_TYPES)],
+    )
+    disabled_functions = List(
+        "Endpoints to disable on the connection installed through this link.",
+        ["get_orders"],
+        String(),
+        load_default=[],
+        required=False,
+    )
+    enabled_functions = List(
+        "Endpoints to force-enable on the connection installed through this link, overriding your org-level disabled policy (e.g. re-enable returns for this connection).",
+        ["get_returns"],
+        String(),
+        load_default=[],
+        required=False,
+    )
+    link_duration = Integer(
+        "The number of days you want this magic link to be active.",
+        7,
+        load_default=7,
+        required=False,
+    )
+    customer_id = CUSTOMER_ID(allow_none=True, required=False)
+
+
+class ExchangeInputSchema(Schema):
+    auth_code = String(
+        "The authorization code returned from the frontend after a user installs an integration.",
+        "auth_code",
+    )
+    customer_id = CUSTOMER_ID(allow_none=True, required=False)
+
+
+class LinkTokenInputSchema(Schema):
+    connection_id = String(
+        "An optional existing connection ID. If provided, the connection is reinstalled instead of a new connection being created.",
+        "existing_connection_id",
+        required=False,
+    )
+    customer_id = String(
+        "An optional identifier for your end customer. If provided, it is recorded on any failed install attempts made with this link token and carried onto the connection once it is created, so you can trace either back to a specific customer.",
+        "customer_id",
+        required=False,
+    )
+
+
+class SetLinkDisabledFunctionsSchema(Schema):
+    disabled_functions = List(
+        "Endpoints to disable on the connection installed through this link.",
+        ["get_orders"],
+        String(),
+        load_default=[],
+        required=False,
+    )
+
+
+class PageTokenParamSchema(Schema):
+    page_token = String(
+        "The page token to use to retrieve the next page of results. If this field is omitted, there are no subsequent pages.",
+        "page_token",
+        allow_none=True,
+        required=False,
+    )
+
+
+class BillableConnectionsQuerySchema(Schema):
+    period = Date(
+        "Any date in the billing month to report on (YYYY-MM-DD).",
+        "2026-06-01",
+        required=True,
+    )
+
+
+class ScheduleParamSchema(Schema):
+    page_token = String(
+        "The page token to use to retrieve the next page of results. If this field is omitted, there are no subsequent pages.",
+        "page_token",
+        allow_none=True,
+        required=False,
+    )
+    stale_only = Boolean(
+        "Whether to retrieve only stale schedules",
+        False,
+        required=False,
+    )
+    segment = Integer(
+        "Which segment of the scan to read, from 0 to total_segments - 1",
+        0,
+        required=False,
+        validate=[Range(min=0)],
+    )
+    total_segments = Integer(
+        "How many segments the scan is split into",
+        8,
+        required=False,
+        validate=[Range(min=1)],
+    )
+
+    @validates_schema
+    def validate_segments(self, data, **kwargs):
+        # one without the other would scan the whole table or fail in dynamo
+        segment = data.get("segment")
+        total_segments = data.get("total_segments")
+        if (segment is None) != (total_segments is None):
+            raise ValidationError("segment and total_segments must be sent together.")
+        if segment is not None and segment >= total_segments:
+            raise ValidationError("segment must be less than total_segments.")
+
+
+SYNC_JOB_STATUSES = ["open", "cancelled", "completed", "stuck"]
+
+INVESTIGATION_STATUSES = ["open", "resolved"]
+
+
+class SyncJobParamSchema(Schema):
+    stale_only = Boolean(
+        "Whether to retrieve only stale sync jobs",
+        False,
+        required=False,
+    )
+    page_token = String(
+        "The page token to use to retrieve the next page of results.",
+        "page_token",
+        allow_none=True,
+        required=False,
+    )
+    status = String(
+        "Filter by job status.",
+        allow_none=True,
+        required=False,
+        validate=[OneOf(SYNC_JOB_STATUSES)],
+    )
+
+
+class OrgUsageParamSchema(Schema):
+    window_days = Integer(
+        "How many days back to aggregate per-org api call counts.",
+        30,
+        load_default=30,
+        required=False,
+        validate=[Range(min=1, max=90)],
+    )
+    org_ids = CommaSeparatedList(
+        "The org ids to report usage for. Required; each org is one indexed query.",
+        "org_abc,org_def",
+        String(),
+        required=True,
+    )
+
+
+class ReleaseStageParamSchema(Schema):
+    stage = String(
+        "Which stage to report on. Defaults to the stage answering the request.",
+        "prod",
+        required=False,
+        validate=[OneOf(["dev", "prod"])],
+    )
+
+
+class ReleaseHistoryParamSchema(Schema):
+    stage = String(
+        "Which stage to report on. Defaults to the stage answering the request.",
+        "prod",
+        required=False,
+        validate=[OneOf(["dev", "prod"])],
+    )
+    months = Integer(
+        "How many calendar months back to read, counting the current one.",
+        2,
+        load_default=2,
+        required=False,
+        validate=[Range(min=1, max=12)],
+    )
+
+
+class ShipRunsParamSchema(Schema):
+    limit = Integer(
+        "How many ship runs to return, newest first.",
+        20,
+        load_default=20,
+        required=False,
+        validate=[Range(min=1, max=100)],
+    )
+
+
+class ShipBodySchema(Schema):
+    stage = String(
+        "Stage to ship to.",
+        "dev",
+        required=True,
+        validate=[OneOf(["dev", "prod"])],
+    )
+    sha = String(
+        "The commit to build and roll out. Omit to ship whatever the tip of main"
+        " is when the workflow starts, which is what a dashboard should do rather"
+        " than send a sha it read some time ago.",
+        "a" * 40,
+        required=False,
+        validate=[Length(equal=40)],
+    )
+    services = List(
+        "Services to roll. Empty ships every one of them.",
+        obj=String(),
+        required=False,
+    )
+    actor = String(
+        "Who asked for the ship. Oak fills this in from the signed-in user.",
+        "someone@trackstarhq.com",
+        required=True,
+    )
+
+
+class ScheduleBodySchema(Schema):
+    blocked = Boolean(
+        "Whether the schedule is blocked.",
+        required=False,
+    )
+    paused = Boolean(
+        "Whether the schedule is paused.",
+        required=False,
+    )
+    # the levers for restarting a schedule that got stuck. current_crawl_start
+    # and current_crawl_end are deliberately absent: the crawler writes that
+    # pair together on every page and nulls both when the crawl ends, so any
+    # partial write here would leave a window that doesn't match the page token
+    # it goes with, or an end before its start.
+    latest_data = DateTime(
+        "How far the crawl has gotten. The next crawl starts here; null makes it a first crawl.",
+        required=False,
+        allow_none=True,
+    )
+    # raw, not a string: plenty of integrations persist a dict or a number here
+    latest_page_token = Raw(
+        description="Where the in-flight crawl resumes. Null restarts the window from the first page.",
+        required=False,
+        allow_none=True,
+    )
+    # not nullable: with no end time the scheduler treats the first crawl as
+    # still running and never enqueues another one
+    last_crawl_end = DateTime(
+        "When the last crawl finished. Setting it marks a crawl that died mid-run as over, so the next one can start.",
+        required=False,
+    )
+    last_investigation = NestedSchema(
+        "ScheduleInvestigation",
+        linear_ticket_url=String(
+            "The Linear card tracking the stale-schedule investigation.",
+            required=False,
+            allow_none=True,
+        ),
+        pr_url=String(
+            "The GitHub PR opened for the investigation, if any.",
+            required=False,
+            allow_none=True,
+        ),
+        status=String(
+            "Investigation state: 'open' (under investigation, dedup-skip) or 'resolved'.",
+            required=False,
+            allow_none=True,
+            validate=[OneOf(INVESTIGATION_STATUSES)],
+        ),
+        opened_at=String(
+            "When the investigation began (the Linear card's creation time); surfaced by oak as investigation age.",
+            required=False,
+            allow_none=True,
+        ),
+        signature=String(
+            "The error signature the investigation clusters on; oak groups rows sharing it.",
+            required=False,
+            allow_none=True,
+        ),
+        session_url=String(
+            "The Claude Code session working the investigation.",
+            required=False,
+            allow_none=True,
+        ),
+        fired_at=String(
+            "When an investigator session was last fired for this row; the re-fire guard checks it.",
+            required=False,
+            allow_none=True,
+        ),
+        skip=Boolean(
+            "Opt this schedule out of automated investigation. The dispatcher drops it before clustering.",
+            required=False,
+            allow_none=True,
+        ),
+        assignee=String(
+            "The Linear user id who owns the investigation; setting it assigns the card too. Null unassigns.",
+            required=False,
+            allow_none=True,
+        ),
+        required=False,
+        allow_none=True,
+    )
+    # for agent reference
+    notes = String(
+        "Free-form notes about this schedule (quirks, known issues, context for investigators).",
+        required=False,
+        allow_none=True,
+    )
+
+
+class ClearInvestigationBodySchema(Schema):
+    schedules = List(
+        "The (connection_id, function_name) rows whose investigation to clear.",
+        obj=NestedSchema(
+            "ClearInvestigationSchedulePair",
+            connection_id=String("The connection id.", required=True),
+            function_name=String("The crawl function name.", required=True),
+        ),
+        required=True,
+    )
+
+
+class InvestigateSchedulesBodySchema(Schema):
+    schedules = List(
+        "The (connection_id, function_name) rows to investigate as one cluster.",
+        obj=NestedSchema(
+            "InvestigateSchedulePair",
+            connection_id=String("The connection id.", required=True),
+            function_name=String("The crawl function name.", required=True),
+        ),
+        required=True,
+    )
+    force = Boolean(
+        "Bypass the re-fire guard (fires even if an investigator was fired minutes ago).",
+        False,
+        required=False,
+        load_default=False,
+    )
+    fired_by = String(
+        "Email of the admin user firing the investigation, for the audit trail.",
+        required=False,
+        allow_none=True,
+    )
+    signature = String(
+        "The cluster's error signature. Overrides the one derived from recent connection errors — pass it when the caller (e.g. the dispatcher) has already judged the cluster.",
+        required=False,
+        allow_none=True,
+    )
+    fingerprint = String(
+        "The dispatcher's stable cluster fingerprint, passed through to the investigator for the Linear label.",
+        required=False,
+        allow_none=True,
+    )
+
+
+class ToggleScheduleSchema(Schema):
+    paused = Boolean(
+        "Whether the schedule is paused.",
+        required=True,
+    )
+
+
+class UpdateOrgDisabledFunctionsSchema(Schema):
+    # a policy always targets a type; add integration_name to narrow it to one integration of
+    # that type, otherwise it applies to every integration of the type.
+    integration_name = String("The integration the policy applies to.", required=False)
+    integration_type = String(
+        "The integration type, e.g. 'wms'.",
+        required=True,
+        validate=[OneOf(INTEGRATION_TYPES)],
+    )
+    disabled_functions = List(
+        "Function names to disable. With integration_name: for that integration. Without it: every integration of integration_type.",
+        obj=String(),
+        required=True,
+    )
+
+
+class SyncConnectionResponseSchema(Schema):
+    id = String(
+        "The id of the connection synced.", "07b344db-0304-4866-9ae1-ac8af5292a28"
+    )
+    syncing = Boolean("Whether or not the connection is syncing.", True)
+    functions_to_sync = List(
+        "The functions that are being synced. Returns empty if all are being synced.",
+        ["get_inventory", "get_orders"],
+        String(),
+    )
+
+
+class DateRangeSyncInputSchema(Schema):
+    start_time = DateTime("The start time for the sync range.")
+    end_time = DateTime("The end time for the sync range.")
+    function_name = String("The function to sync.")
+
+
+class DateRangeSyncResponseSchema(Schema):
+    id = String("The sync job ID.", "550e8400-e29b-41d4-a716-446655440000")
+    connection_id = String("The connection ID.", "07b344db-0304-4866-9ae1-ac8af5292a28")
+    function_name = String("The function being synced.", "get_orders")
+    status = String("The job status.", "open")
+    requested_start_time = String("Start of the sync range.", "2024-01-01T00:00:00Z")
+    requested_end_time = String("End of the sync range.", "2024-01-31T23:59:59Z")
+    created_at = String("When the job was created.", "2024-01-15T12:00:00Z")
+    completed_at = String(
+        "When the job completed.",
+        "2024-01-15T12:05:00Z",
+        required=False,
+        allow_none=True,
+    )
+    cancelled_at = String(
+        "When the job was cancelled.",
+        "2024-01-15T12:05:00Z",
+        required=False,
+        allow_none=True,
+    )
+
+
+SYNC_JOB_SCHEMA = NestedSchema(
+    schema_name="SyncJob",
+    id=String("The sync job ID.", "550e8400-e29b-41d4-a716-446655440000"),
+    connection_id=String(
+        "The connection ID for the sync job.", "07b344db-0304-4866-9ae1-ac8af5292a28"
+    ),
+    function_name=String("The function being synced.", "get_orders"),
+    status=String("The job status.", "open", validate=[OneOf(SYNC_JOB_STATUSES)]),
+    requested_start_time=String("Start of the sync range.", "2024-01-01T00:00:00Z"),
+    requested_end_time=String("End of the sync range.", "2024-01-31T23:59:59Z"),
+    created_at=String("When the job was created.", "2024-01-15T12:00:00Z"),
+    completed_at=String(
+        "When the job completed.",
+        "2024-01-15T12:05:00Z",
+        required=False,
+        allow_none=True,
+    ),
+    cancelled_at=String(
+        "When the job was cancelled.",
+        "2024-01-15T12:05:00Z",
+        required=False,
+        allow_none=True,
+    ),
+)
+
+
+class OnDemandSyncResponseSchema(Schema):
+    data = SYNC_JOB_SCHEMA
+
+
+class OnDemandSyncsResponseSchema(Schema):
+    data = List("List of on-demand sync jobs", obj=SYNC_JOB_SCHEMA)
+
+
+MAGIC_LINK_RESPONSE_SCHEMA = NestedSchema(
+    schema_name="MagicLink",
+    id=String("The magic link ID", "c0a4fef52f664ecf9e766c16811c3289"),
+    url=String(
+        "The full Magic Link URL to share with your customer",
+        "https://link.trackstarhq.com/c0a4fef52f664ecf9e766c16811c3289",
+    ),
+    expires_at=String("ISO 8601 timestamp when link expires", "2025-09-17T15:01:41Z"),
+    integration_type=String(
+        "Type of integration", "wms", validate=[OneOf(INTEGRATION_TYPES)]
+    ),
+    integration_allow_list=List("Allowed integrations", ["shipbob"], String()),
+    integration_block_list=List(
+        "Blocked integrations", ["extensiv-3pl-central"], String()
+    ),
+    integrations_with_endpoints=List(
+        "Integrations with specific endpoints", ["get_inventory"], String()
+    ),
+    customer_id=String("Customer identifier", "customer-123", allow_none=True),
+)
+
+
+class MagicLinkResponseSchema(Schema):
+    magic_link = MAGIC_LINK_RESPONSE_SCHEMA
+
+
+class MagicLinksResponseSchema(Schema):
+    magic_links = List(
+        "List of magic links",
+        obj=MAGIC_LINK_RESPONSE_SCHEMA,
+    )
+
+
+class APILogQueryParamsSchema(Schema):
+    start_date = DateTime(
+        "The start date of the request.", required=False, load_default=None
+    )
+    end_date = DateTime(
+        "The end date of the request.", required=False, load_default=None
+    )
+    connection_id = String(
+        "The connection ID to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    integration_name = String(
+        "The integration name to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    status_code = String(
+        "The status code to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    errors = Boolean(
+        "If true, only return error responses (status code >= 400).",
+        required=False,
+        load_default=False,
+    )
+    request_method = String(
+        "The request method to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    request_path = String(
+        "The request path to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    limit = Integer(
+        "The number of items to return per page.", 20, load_default=20, required=False
+    )
+    page_token = String(
+        "The page token to use to get the next page of results.",
+        required=False,
+        load_default=None,
+    )
+    sort_by = String(
+        "The field to sort the results by.",
+        required=False,
+        load_default="request_time",
+        validate=[
+            OneOf(
+                [
+                    "request_time",
+                    "status_code",
+                    "integration_name",
+                    "connection_id",
+                    "request_method",
+                    "request_path",
+                ]
+            )
+        ],
+    )
+    sort_order = String(
+        "The order to sort the results in.",
+        required=False,
+        load_default="desc",
+        validate=[OneOf(["asc", "desc"])],
+    )
+
+
+class APILogBreakdownQueryParamsSchema(Schema):
+    start_date = DateTime(
+        "The start date of the request.", required=False, load_default=None
+    )
+    end_date = DateTime(
+        "The end date of the request.", required=False, load_default=None
+    )
+    connection_id = String(
+        "The connection ID to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    integration_name = String(
+        "The integration name to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    status_code = String(
+        "The status code to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    errors = Boolean(
+        "If true, only return error responses (status code >= 400).",
+        required=False,
+        load_default=False,
+    )
+    request_method = String(
+        "The request method to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    request_path = String(
+        "The request path to filter the results by.",
+        required=False,
+        load_default=None,
+    )
+    groups = CommaSeparatedList(
+        "What to group the data by.",
+        "connection_id,integration_name,request_time,request_method,request_path,status_code",
+        String(
+            validate=[
+                OneOf(
+                    [
+                        "connection_id",
+                        "integration_name",
+                        "request_time",
+                        "request_method",
+                        "request_path",
+                        "status_code",
+                        "minute",
+                        "hour",
+                        "day",
+                        "month",
+                        "5minute",
+                    ]
+                ),
+                lambda x: len(x),
+            ]
+        ),
+        required=True,
+    )
+
+
+class APILogSearchQueryParamsSchema(Schema):
+    start_date = DateTime(
+        f"Only return requests received at or after this time. Cannot be more than {RDS_LOG_RETENTION_DAYS} days ago, which is how long we retain logs.",
+        "2024-01-15T00:00:00Z",
+        required=True,
+    )
+    end_date = DateTime(
+        "Only return requests received at or before this time. Defaults to now.",
+        "2024-01-16T00:00:00Z",
+        required=False,
+    )
+    connection_id = String(
+        "Only return requests made against this connection.",
+        "abc123def456abc123def456abc123de",
+        required=False,
+    )
+    integration_name = String(
+        "Only return requests made against connections to this integration. The same name can exist across types, so pair it with `integration_type` to disambiguate.",
+        "shipbob",
+        required=False,
+        validate=[OneOf(ALL_INTEGRATION_NAMES)],
+    )
+    integration_type = String(
+        "Only return requests made against connections of this integration type.",
+        "wms",
+        required=False,
+        validate=[OneOf(INTEGRATION_TYPES)],
+    )
+    request_method = String(
+        "Only return requests made with this HTTP method.",
+        "GET",
+        required=False,
+        validate=[OneOf(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])],
+    )
+    request_path = String(
+        "Only return requests made to this endpoint. Path parameters are replaced with `<path_param>`, so a request to `/wms/orders/123` is stored as `/wms/orders/<path_param>`.",
+        "/wms/orders",
+        required=False,
+    )
+    status_code = Integer(
+        "Only return requests that returned this HTTP status code.",
+        200,
+        required=False,
+    )
+    limit = Integer(
+        "The maximum number of requests to return per page. The default is 100. Minimum 1 and maximum 5000. Fewer may be returned if the page would be too large, in which case a `next_token` is included.",
+        100,
+        required=False,
+        load_default=100,
+        validate=[Range(min=1, max=5000)],
+    )
+    page_token = String(
+        "The page token to use to retrieve the next page of results. If this field is omitted, there are no subsequent pages.",
+        "page_token",
+        required=False,
+    )
+
+    @validates_schema
+    def validate_date_range(self, data, **kwargs):
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
+        if not start_date:
+            return
+        earliest = now() - timedelta(days=RDS_LOG_RETENTION_DAYS)
+        if str_to_dt(start_date) < earliest:
+            raise ValidationError(
+                f"start_date cannot be more than {RDS_LOG_RETENTION_DAYS} days ago."
+            )
+        if end_date and str_to_dt(start_date) > str_to_dt(end_date):
+            raise ValidationError("start_date must be before end_date.")
+
+
+class APILogsResponseSchema(Schema):
+    data = List(
+        "The requests that matched the search, most recent first.",
+        obj=NestedSchema(
+            schema_name="APILog",
+            request_id=String(
+                "The id of the request, also returned on every response in the `X-Request-Id` header.",
+                "Root=1-abc12345-abc123def456abc123def456",
+                allow_none=True,
+            ),
+            idempotency_key=String(
+                "The `Idempotency-Key` header the request was made with, if any.",
+                "9f1c2b1e-6d4a-4c1c-9a8e-2b7e3c5d1f00",
+                allow_none=True,
+            ),
+            connection_id=String(
+                "The connection the request was made against.",
+                "abc123def456abc123def456abc123de",
+                allow_none=True,
+            ),
+            integration_name=String(
+                "The integration the connection belongs to.",
+                "example_wms",
+                allow_none=True,
+            ),
+            integration_type=String(
+                "The type of integration the connection belongs to.",
+                "wms",
+                allow_none=True,
+            ),
+            request_time=DateTime(
+                "When Trackstar received the request.", "2024-01-15T13:45:30Z"
+            ),
+            request_method=String("The HTTP method of the request.", "GET"),
+            request_path=String(
+                "The endpoint that was called, with path parameters replaced by `<path_param>`.",
+                "/wms/orders/<path_param>",
+            ),
+            path_param=String(
+                "The path parameter the request was made with.",
+                "123",
+                allow_none=True,
+            ),
+            query_params=Raw(
+                description="The query parameters the request was made with.",
+                type="object",
+                example={"limit": 100},
+                allow_none=True,
+            ),
+            request_body=Raw(
+                description="The body the request was made with.",
+                type="object",
+                example={"reference_id": "order-1001"},
+                allow_none=True,
+            ),
+            integration_request_bodies=List(
+                "The calls Trackstar made to the integration while handling this request. Credentials are redacted.",
+                obj=NestedSchema(
+                    schema_name="APILogIntegrationRequest",
+                    url=String(
+                        "The integration endpoint Trackstar called.",
+                        "https://api.example-wms.com/orders",
+                        allow_none=True,
+                    ),
+                    method=String("The HTTP method Trackstar used.", "POST"),
+                    body=Raw(
+                        description="The body Trackstar sent to the integration.",
+                        type="object",
+                        example={"order_number": "1001"},
+                        allow_none=True,
+                    ),
+                ),
+                allow_none=True,
+            ),
+            status_code=Integer("The HTTP status code the request returned.", 200),
+            error=String(
+                "The error the request returned, if it failed.",
+                "Order not found",
+                allow_none=True,
+            ),
+            error_origin=String(
+                "Whether the error came from Trackstar or the integration.",
+                "integration",
+                allow_none=True,
+            ),
+            duration_ms=Integer(
+                "How long the request took, in milliseconds.", 142, allow_none=True
+            ),
+        ),
+    )
+    total_count = TOTAL_COUNT
+    next_token = NEXT_TOKEN
+
+
+class APILogFacetsResponseSchema(Schema):
+    data = NestedSchema(
+        schema_name="APILogFacets",
+        connection_id=List(
+            "The distinct connections your requests were made against.",
+            ["abc123def456abc123def456abc123de"],
+            obj=String(),
+        ),
+        integration_name=List(
+            "The distinct integrations your requests were made against.",
+            ["example_wms"],
+            obj=String(),
+        ),
+        request_path=List(
+            "The distinct endpoints your requests were made to. Path parameters are replaced with `<path_param>`.",
+            ["/wms/orders/<path_param>"],
+            obj=String(),
+        ),
+        status_code=List(
+            "The distinct HTTP status codes your requests returned.",
+            [200, 404],
+            obj=Integer(),
+        ),
+    )
+
+
+class APIAndAccessTokenHeaderSchema(Schema):
+    x_trackstar_api_key = API_KEY_HEADER
+    x_trackstar_access_token = ACCESS_TOKEN_HEADER
+
+
+class WriteHeaderSchema(APIAndAccessTokenHeaderSchema):
+    idempotency_key = IDEMPOTENCY_KEY_HEADER()
+
+
+class WebhookPayloadResponseSchema(Schema):
+    download_url = String(
+        "Presigned download URL for the full webhook event, exactly as it would have been delivered (valid for 20 minutes).",
+        example="https://s3.amazonaws.com/...",
+    )
+    download_url_expires_at = DateTime(
+        "Expiration timestamp for the download URL.",
+        example="2025-01-15T10:50:00Z",
+    )
+
+
+# passthrough path is customer-controlled and most integrations concatenate it
+# onto the vendor host (e.g. f"https://{domain}{path}"). if the part before the
+# first '/', '?' or '#' carries a userinfo '@' or a ':' it becomes the url
+# authority, so "@evil.test/x" sends the connection's auth header to evil.test.
+# integrations disagree on whether path is rooted (shopify needs a leading '/',
+# deposco/linnworks/walmart/wayfair must not have one), so we can't force a
+# leading slash -- instead reject anything that can inject into the authority.
+MAX_PASSTHROUGH_PATH_LENGTH = 2048
+
+
+def validate_passthrough_path(path):
+    # "//host" is parsed as a protocol-relative authority by some clients
+    if path.startswith("//"):
+        raise ValidationError("path must not start with '//'")
+    # backslash is treated like '/' by some url parsers, reopening host injection
+    if "\\" in path:
+        raise ValidationError("path must not contain backslashes")
+    # control chars / spaces enable url-signing and header injection
+    for char in path:
+        if ord(char) < 0x20 or char in (" ", "\x7f"):
+            raise ValidationError(
+                "path must not contain whitespace or control characters"
+            )
+    if len(path) > MAX_PASSTHROUGH_PATH_LENGTH:
+        raise ValidationError("path is too long")
+    # the authority is everything before the first '/', '?' or '#'. a '@'
+    # (userinfo) or ':' (scheme/port) there would redirect the request to
+    # another host, so reject it. a legit timestamp ':' lives after the '?'.
+    authority = re.split(r"[/?#]", path, maxsplit=1)[0]
+    if "@" in authority or ":" in authority:
+        raise ValidationError("path must not target another host")
+
+
+class PassthroughRequestSchema(Schema):
+    method = String(
+        "The HTTP method to use for the request.",
+        "POST",
+        required=True,
+        validate=[OneOf(["GET", "POST", "PUT", "PATCH", "DELETE"])],
+    )
+    path = String(
+        "The integration-specific endpoint path.",
+        "/graphql",
+        required=True,
+        validate=[validate_passthrough_path],
+    )
+    data = Raw(
+        description="The request body to send to the integration. For GraphQL, this would be the query.",
+        required=False,
+    )
+    headers = Dict(
+        "Optional additional headers to send with the request.",
+        {"Content-Type": "application/json"},
+        String(),
+        String(),
+        required=False,
+    )
+    params = Dict(
+        "Optional query parameters to append to the request URL.",
+        {"page": "1", "limit": "100"},
+        String(),
+        String(),
+        required=False,
+    )
+
+
+class PassthroughResponseSchema(Schema):
+    status_code = Integer(
+        "The HTTP status code returned by the integration.",
+        200,
+    )
+    headers = Dict(
+        "Response headers from the integration.",
+        {"content-type": "application/json"},
+        String(),
+        Raw(),
+    )
+    body = Raw(
+        description="The raw response body from the integration.",
+    )
+
+
+class IntegrationsResponseSchema(Schema):
+    data = List(
+        "Integration Info",
+        obj=NestedSchema(
+            schema_name="IntegrationInfo",
+            integration_name=String("The name of the integration.", "shipbob"),
+            display_name=String("The display name of the integration.", "ShipBob"),
+            install_method=String(
+                "How users install the integration within the Trackstar Modal.",
+                "input",
+                validate=[OneOf(["input", "oauth"])],
+            ),
+            description=String("A description of the integration.", "description"),
+            logo_url=String(
+                "The URL of the integration's logo.", "https://example.com/logo.png"
+            ),
+            installation_guide_url=String(
+                "The URL of the installation guide.",
+                "https://trackstar.notion.site",
+                allow_none=True,
+            ),
+            docs=Raw(
+                description="The documentation for the integration. Can be a string or a dictionary of strings. May not be available"
+            ),
+            write_operations=List(
+                "The write operations supported by the integration.",
+                obj=NestedSchema(
+                    schema_name="WriteOperation",
+                    action=String("The action that can be performed.", "create_order"),
+                    url=String("The URL for the action.", "POST /wms/orders"),
+                    required_base_schema_fields=List(
+                        "The required fields for the action.",
+                        ["line_items.product_id", "line_items.quantity"],
+                        String("Field required for the action."),
+                    ),
+                    optional_base_schema_fields=List(
+                        "The optional fields for the action.",
+                        ["order_number", "line_items", "trading_partner"],
+                        String("Field optional for the action."),
+                    ),
+                    integration_specific_fields=NestedSchema(
+                        "IntegrationSpecificFields",
+                        properties=Dict(
+                            "The integration specific fields and their definitions.",
+                            {
+                                "warehouse_id": {
+                                    "title": "warehouse_id",
+                                    "type": "string",
+                                    "description": "The warehouse this order was shipped from.",
+                                    "example": "",
+                                    "enum": ["N/A - Connect an account to see options"],
+                                }
+                            },
+                            String("Field for the integration specific fields."),
+                            # TODO: this is generic -> how do we nicely show nested/list fields
+                            Raw(),
+                        ),
+                        type=String(
+                            "The type of the integration specific fields.", "object"
+                        ),
+                        required_fields=List(
+                            "The required fields for the integration specific fields.",
+                            ["warehouse_id"],
+                            String(
+                                "Field required for the integration specific fields."
+                            ),
+                            required=False,
+                        ),
+                    ),
+                ),
+            ),
+            list_operations=List(
+                "The list operations supported by the integration.",
+                obj=NestedSchema(
+                    schema_name="ListOperation",
+                    action=String("The action that can be performed.", "get_inventory"),
+                    url=String("The URL for the action.", "GET /wms/inventory"),
+                    implemented_fields=Dict(
+                        "The fields that are implemented for the action.",
+                        {
+                            "onhand": True,
+                            "lots": [
+                                {
+                                    "lot_id": True,
+                                    "expiration_date": True,
+                                    "onhand": True,
+                                    "warehouse_id": True,
+                                }
+                            ],
+                            "substitute_skus": False,
+                            "inventory_by_warehouse_id": {
+                                "key": {
+                                    "committed": True,
+                                    "fulfillable": True,
+                                    "onhand": True,
+                                    "awaiting": True,
+                                    "unfulfillable": True,
+                                    "sellable": True,
+                                }
+                            },
+                            "sellable": True,
+                            "created_date": True,
+                            "fulfillable": True,
+                            "trackstar_created_date": True,
+                            "awaiting": True,
+                            "name": True,
+                            "locations": [
+                                {
+                                    "location_id": True,
+                                    "quantity": True,
+                                    "warehouse_id": True,
+                                },
+                            ],
+                            "active": True,
+                            "committed": True,
+                            "measurements": False,
+                            "unfulfillable": True,
+                            "warehouse_customer_id": True,
+                            "trackstar_updated_date": True,
+                            "id": True,
+                            "connection_id": True,
+                            "external_system_url": False,
+                            "sku": True,
+                            "updated_date": True,
+                        },
+                        String("Field that is implemented."),
+                        Raw(
+                            description="A Boolean indicating if the field is implemented, or an object or list with more details."
+                        ),
+                    ),
+                ),
+            ),
+            available_actions=List(
+                "The actions supported by the integration.",
+                ["create_order", "get_inventory"],
+                String("Action supported by the integration"),
+            ),
+        ),
+    )
+
+
+def exchange_response_schema(integration_example="shipbob"):
+    class ExchangeResponse(Schema):
+        access_token = String(
+            "The permanent access token for the integration used to make requests to the Trackstar API.",
+            "your_permanent_access_token",
+        )
+        connection_id = String(
+            "A unique connection ID for the integration.", "unique_connection_id"
+        )
+        integration_name = String(
+            "The name of the integration that was installed.", integration_example
+        )
+        customer_id = CUSTOMER_ID(allow_none=True)
+        available_actions = List(
+            "A list of actions that the integration supports.",
+            ["get_inventory", "get_products"],
+            String("Actions supported by the integration"),
+        )
+        me = Dict(
+            "Information that helps identify the connected account. If null, the integration does not provide this information.",
+            {
+                "account_id": "account_12345",
+                "account_name": "My WMS Account",
+            },
+            String("Field name"),
+            Raw(description="Field value. Structure varies based on integration."),
+            allow_none=True,
+        )
+
+    ExchangeResponse.__name__ = f"ExchangeResponse{integration_example.title()}"
+
+    return ExchangeResponse()
+
+
+class UpdateResponseSchema(Schema):
+    id = String("The id of the updated object.", "example-id-123")
+    object = String("The type of the object that was updated.", "connection")
+    updated = Boolean("Whether or not the object was updated.", True)
+
+
+def delete_response_schema(object_type):
+    class DeleteResponse(Schema):
+        id = String("The id of the deleted object.", "example-id-123")
+        object = String("The type of the object that was deleted.", object_type)
+        deleted = Boolean("Whether or not the object was deleted.", True)
+
+    sch = DeleteResponse()
+    sch.__class__.__name__ = f"Delete{object_type.title()}Response"
+    return sch
+
+
+class SandboxOrderFulfillParamsSchema(Schema):
+    partial = Boolean(
+        "Whether or not to fulfill the order partially.",
+        False,
+        load_default=False,
+        required=False,
+    )
+
+
+class SandboxReturnReceiveSchema(Schema):
+    line_items = List(
+        "The line items being received with inspection results.",
+        obj=NestedSchema(
+            schema_name="SandboxReturnReceiveLineItem",
+            sku=String("The SKU of the item.", "XS-RED-SHIRT"),
+            received_quantity=Integer("Units received.", 2),
+            condition=String("Item condition.", "good"),
+            disposition=String("Disposition action.", "return_to_stock"),
+        ),
+    )
+
+
+def connection_sync_schema():
+    function_names = []
+    for integration_resource_map in function_to_resource_map.values():
+        for function_name in integration_resource_map.keys():
+            if function_name not in function_names:
+                function_names.append(function_name)
+
+    class ConnectionResourceSyncSchema(Schema):
+        functions_to_sync = List(
+            "The specific functions to force sync. Make sure to use one compatible with the connection's type.",
+            ["get_inventory", "get_orders"],
+            String("Function to sync", validate=[OneOf(function_names)]),
+            required=False,
+        )
+
+    return ConnectionResourceSyncSchema()
+
+
+def get_connections_response_schema(**kwargs):
+    class GetConnectionsResponse(Schema):
+        data = List(
+            "A list of connections for your organization.",
+            [
+                {
+                    "connection_id": "07b344db-0304-4866-9ae1-ac8af5292a28",
+                    "integration_name": "integration_name",
+                    "integration_display_name": "ShipBob",
+                    "customer_id": "customer_id",
+                    "created_at": "2023-01-01T00:00:00Z",
+                    "last_used": "2023-01-01T00:00:00Z",
+                    "times_used": 1,
+                    "sync_schedules": [
+                        {
+                            "function_name": "get_inventory",
+                            "last_crawl_start": "2023-01-01T00:00:00Z",
+                            "last_crawl_end": "2023-01-01T00:00:00Z",
+                            "latest_data": "2023-01-01T00:00:00Z",
+                            "sync_frequency": 3600,
+                            "sync_status": "enabled",
+                        }
+                    ],
+                    "errors": [
+                        {
+                            "error_message": "error_message",
+                            "affected_endpoints": [
+                                {
+                                    "endpoint": "GET /connection",
+                                    "preventing_sync": False,
+                                }
+                            ],
+                            "first_seen": "2023-01-01T00:00:00Z",
+                            "last_seen": "2023-01-01T00:00:00Z",
+                        }
+                    ],
+                    "available_actions": ["get_inventory", "get_products"],
+                    "integration_type": "wms",
+                    "webhooks_disabled": False,
+                    "historical_sync_completed": {
+                        "get_bills": True,
+                        "get_inbound_shipments": True,
+                        "get_inventory": True,
+                        "get_orders": True,
+                        "get_products": True,
+                        "get_returns": True,
+                        "get_warehouse_customers": True,
+                        "get_warehouse_locations": True,
+                        "get_warehouses": True,
+                    },
+                    "me": {
+                        "account_id": "account_12345",
+                        "account_name": "My WMS Account",
+                    },
+                }
+            ],
+            obj=NestedSchema(
+                schema_name="Connection",
+                connection_id=String("The unique ID of the connection."),
+                integration_name=String(
+                    "The name of the integration associated with the connection."
+                ),
+                integration_display_name=String(
+                    "The human-readable display name of the integration associated with the connection.",
+                    "ShipBob",
+                ),
+                customer_id=CUSTOMER_ID(allow_none=True),
+                created_at=CREATED_DATE("connection"),
+                last_used=UPDATED_DATE("connection", allow_none=True),
+                times_used=Integer(
+                    "The number of times the connection has been used in a request to the Trackstar API. Equal to the number of API calls made with this connection.",
+                    allow_none=True,
+                ),
+                sync_schedules=List(
+                    "A list of sync schedules for the connection.",
+                    obj=NestedSchema(
+                        schema_name="SyncSchedule",
+                        function_name=String("The function that is being synced."),
+                        last_crawl_start=DateTime(
+                            "The date when Trackstar last started a crawl for this function.",
+                            allow_none=True,
+                        ),
+                        last_crawl_end=DateTime(
+                            "The date when Trackstar last completed a crawl for this function.",
+                            allow_none=True,
+                        ),
+                        latest_data=DateTime(
+                            "The date of the most recent data successfully fetched for this function.",
+                            allow_none=True,
+                        ),
+                        sync_frequency=Integer("The frequency of the sync in seconds."),
+                        sync_status=String(
+                            "The status of the sync.",
+                            "sync_in_progress",
+                            allow_none=True,
+                            validate=[
+                                OneOf(
+                                    [
+                                        "enabled",
+                                        "disabled",
+                                        "sync_in_progress",
+                                        "first_sync_in_progress",
+                                        "error",
+                                        "stuck",
+                                    ],
+                                    labels={
+                                        "enabled": "Sync is active and scheduled to run as configured.",
+                                        "disabled": "Sync is turned off and will not run until re-enabled.",
+                                        "sync_in_progress": "A regular sync is currently running.",
+                                        "first_sync_in_progress": "The initial sync is running to fetch all historical data.",
+                                        "error": "The sync cannot complete due to connection errors.",
+                                        "stuck": "The sync has stopped making progress and appears stuck.",
+                                    },
+                                )
+                            ],
+                        ),
+                    ),
+                ),
+                errors=List(
+                    "A list of errors for the connection. e.g. missing permissions, invalid credentials, etc.",
+                    obj=NestedSchema(
+                        schema_name="ConnectionError",
+                        error_message=String("The error message."),
+                        affected_endpoints=List(
+                            "A list of endpoints that were affected by the error and whether the error is preventing the sync from completing.",
+                            [
+                                {
+                                    "endpoint": "GET /wms/inventory",
+                                    "preventing_sync": True,
+                                },
+                                {
+                                    "endpoint": "GET /wms/orders",
+                                    "preventing_sync": False,
+                                },
+                            ],
+                            obj=NestedSchema(
+                                schema_name="AffectedEndpoints",
+                                endpoint=String(
+                                    "The endpoint that was affected.",
+                                    "GET /wms/inventory",
+                                ),
+                                preventing_sync=Boolean(
+                                    "If True, the error is preventing the sync from completing. If False, we are able to sync but there may be data or fields that we are unable to fetch.",
+                                    False,
+                                ),
+                            ),
+                        ),
+                        first_seen=DateTime("The date the error was first seen."),
+                        last_seen=DateTime("The date the error was last seen."),
+                    ),
+                ),
+                available_actions=List(
+                    "A list of actions that the integration supports.",
+                    [],
+                    String("Action supported by the integration"),
+                ),
+                integration_type=String(
+                    "The type of the integration.",
+                    "wms",
+                    validate=[OneOf(INTEGRATION_TYPES)],
+                ),
+                webhooks_disabled=Boolean(
+                    "If True, create & update webhooks for Trackstar objects (e.g. order.created) will not be sent for this connection. Connection specific webhooks (e.g. connection.deleted) will still be sent.",
+                    False,
+                    allow_none=True,
+                ),
+                paused=Boolean(
+                    "If True, every sync schedule for this connection is paused and no data will sync until at least one schedule is resumed.",
+                    False,
+                ),
+                paused_at=DateTime(
+                    "The date every sync schedule for this connection was paused. Null if the connection is not currently paused.",
+                    "2022-01-02T05:05:05Z",
+                    allow_none=True,
+                ),
+                historical_sync_completed=Dict(
+                    "Indicates whether the initial historical sync has been completed for each function. If a key is not present or empty, assume the historical sync has not been completed for that function.",
+                    {
+                        "get_bills": True,
+                        "get_inbound_shipments": True,
+                        "get_inventory": True,
+                        "get_orders": True,
+                        "get_products": True,
+                        "get_returns": True,
+                        "get_warehouse_customers": True,
+                        "get_warehouse_locations": True,
+                        "get_warehouses": True,
+                    },
+                    String("Function name"),
+                    Boolean(
+                        "Whether the historical sync has been completed for the function."
+                    ),
+                ),
+                me=Raw(
+                    description="Information that helps identify the connected account. If null, the integration does not provide this information.",
+                    example={
+                        "account_id": "account_12345",
+                        "account_name": "My WMS Account",
+                    },
+                    allow_none=True,
+                ),
+            ),
+        )
+        next_token = NEXT_TOKEN
+        total_count = TOTAL_COUNT
+
+    sch = GetConnectionsResponse(**kwargs)
+    if "only" in kwargs:
+        name_to_add = "only" + "".join(kwargs["only"])
+        sch.__class__.__name__ += name_to_add
+    return sch
+
+
+def generate_sandbox_connection_id(org_private_key, integration_type):
+    if integration_type == "wms":
+        connection_id = encode_access_token(
+            {"integration_name": "sandbox"},
+            org_private_key,
+        )
+    else:
+        connection_id = encode_access_token(
+            {"integration_name": "sandbox", "integration_type": integration_type},
+            org_private_key,
+        )
+    return connection_id
+
+
+def accept_api_key_or_auth(
+    api,
+    method,
+    path,
+    cors_origins,
+    query_input=Schema(),
+    json_input=None,
+    output=Schema(),
+    tags=[],
+):
+    # this is a hack that generates two functions, one that accepts an api key and one that accepts an auth header
+    # this is because we want to call these endpoints from pokecenter, but we don't want to build a backend
+    # this makes sure that the input schemas get validated and generated in docs properly
+    json_location = "json"
+    if not json_input:
+        json_input = Schema()
+        json_location = None
+
+    def decorator(func):
+        @wraps(func)
+        @api.route(path, methods=[method], endpoint=f"{method}_{path}")
+        @api.input(APIKeyHeaderSchema(), location="headers")
+        @api.input(query_input, location="query")
+        @api.input(json_input, location=json_location)
+        @api.output(output)
+        @api.doc(tags=tags)
+        def backend(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        @wraps(func)
+        @api.route(
+            f"/internal{path}", methods=[method], endpoint=f"{method}_internal_{path}"
+        )
+        @cross_origin(origins=cors_origins)
+        @api.input(query_input, location="query")
+        @api.input(AuthHeaderSchema, location="headers")
+        @api.input(json_input, location=json_location)
+        @api.output(output)
+        @api.doc(hide=True)
+        def frontend(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return backend
+
+    return decorator
+
+
+def decorate_list_endpoint(api, resource_type):
+    resource_obj = resource_type()
+    integration_type = resource_obj.get_integration_type()
+
+    def decorator(func):
+        @wraps(func)
+        @api.input(resource_type().query_params_schema(), location="query")
+        @api.input(APIAndAccessTokenHeaderSchema(), location="headers")
+        @api.output(resource_obj.list_endpoint_schema())
+        @api.doc(tags=[integration_type, resource_obj.english_plural_name()])
+        def wrapper(*args, **kwargs):
+            query_data = dict(kwargs.get("query_data", {}))
+            integration = request.environ["integration"]
+            resource = resource_type(integration)
+            implemented = resource.get_endpoint_implemented()
+            if not implemented:
+                raise NotImplementedException(
+                    request.method, request.path, integration.integration_name
+                )
+            logger.updateConfig({"query_params": query_data})
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def decorate_single_item_endpoint(api, resource_type):
+    resource_obj = resource_type()
+    integration_type = resource_obj.get_integration_type()
+
+    def decorator(func):
+        @wraps(func)
+        @api.input(APIAndAccessTokenHeaderSchema(), location="headers")
+        @api.output(resource_obj.single_item_endpoint_schema())
+        @api.doc(tags=[integration_type, resource_obj.english_plural_name()])
+        def wrapper(*args, **kwargs):
+            integration = request.environ["integration"]
+            resource = resource_type(integration)
+            implemented = resource.get_endpoint_implemented()
+            if not implemented:
+                raise NotImplementedException(
+                    request.method, request.path, integration.integration_name
+                )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def require_integration_type(required_type):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            integration = request.environ["integration"]
+            if integration.integration_type != required_type:
+                raise NotImplementedException(
+                    request.method, request.path, integration.integration_name
+                )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def decorate_write_endpoint(api, action: Action):
+    integration_type = action.resource.get_integration_type()
+    resource = action.resource
+    singular = resource.english_singular_name().replace(" ", "")
+    response_schema = action.response_schema()
+
+    def decorate(input_schema):
+        def decorator(func):
+            @wraps(func)
+            @api.input(WriteHeaderSchema(), location="headers")
+            @api.input(input_schema)
+            @api.output(response_schema)
+            @api.doc(tags=[integration_type, resource.english_plural_name()])
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    # trackstar owns the tags, so the body is the same for every integration
+    if isinstance(action, AddTrackstarTag):
+        tag_input_schema = action.input_schema()
+        tag_input_schema.load = lambda data, **kwargs: data
+        return decorate(tag_input_schema)
+
+    integration_type_schemas = {}
+    integration_names = sorted(list_integration_names(integration_type))
+    # sandbox goes first so it is the tab the docs open on
+    if "sandbox" in integration_names:
+        integration_names.remove("sandbox")
+        integration_names.insert(0, "sandbox")
+    for integration_name in integration_names:
+        integration_file = get_integration_file(integration_name, integration_type)
+        integration = integration_file.Integration()
+        integration_action = action.__class__(resource.__class__(integration))
+        if not integration_action.is_implemented():
+            continue
+        display_name = integration.get_display_name()
+        # used in update_openapi_spec — only [a-zA-Z0-9._-] survives the
+        # openapi 3.1 component-name pattern, so & needs an encoded form
+        replaced_display_name = (
+            display_name.replace(" ", "__")
+            .replace("(", "-_")
+            .replace(")", "_-")
+            .replace("&", "_AMP_")
+        )
+        formatted_display_name = "--" + replaced_display_name + "--"
+        action_input_schema = integration_action.input_schema()
+        action_input_schema.load = lambda data, **kwargs: data
+        input_name = f"{integration_action.__class__.__name__}{integration_type}{singular}{formatted_display_name}Schema"
+        action_input_schema.__class__.__name__ = input_name
+        action_input_schema.context["integration_name"] = integration_name
+        integration_type_schemas[integration_name] = action_input_schema
+
+    # no integration writes this yet, so show the shape we plan to support
+    if not integration_type_schemas:
+        base_input_schema = action.base_input_schema(unknown="include")
+        base_input_schema.load = lambda data, **kwargs: data
+        return decorate(base_input_schema)
+
+    class InputSchema(OneOfSchema):
+        type_schemas = integration_type_schemas
+
+    InputSchema.__name__ = (
+        f"{action.__class__.__name__}{integration_type}{singular}InputSchema"
+    )
+    full_input_schema = InputSchema()
+    full_input_schema.load = lambda data, **kwargs: data
+    return decorate(full_input_schema)
+
+
+def decorate_cancel_endpoint(api, resource_type):
+    resource_obj = resource_type()
+    action = Cancel(resource_obj)
+    integration_type = resource_obj.get_integration_type()
+    response_schema = action.response_schema()
+
+    def decorator(func):
+        @wraps(func)
+        @api.input(WriteHeaderSchema(), location="headers")
+        @api.output(response_schema)
+        @api.doc(tags=[integration_type, resource_obj.english_plural_name()])
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def decorate_fulfill_endpoint(api, resource_type):
+    resource_obj = resource_type()
+    integration_type = resource_obj.get_integration_type()
+    condensed_plural_name = resource_obj.english_plural_name().replace(" ", "")
+    single_item_endpoint_schema = resource_obj.single_item_endpoint_schema()
+    single_item_endpoint_schema.fields["data"].schema.fields["status"] = String(
+        "The status of the object after fulfillment.", "fulfilled"
+    )
+    single_item_endpoint_schema.__class__.__name__ = (
+        f"{condensed_plural_name}FulfillResponse"
+    )
+    data_schema = single_item_endpoint_schema.fields["data"].schema
+    data_schema.__class__.__name__ = f"Fulfill{data_schema.__class__.__name__}"
+
+    def decorator(func):
+        @wraps(func)
+        @api.input(APIAndAccessTokenHeaderSchema(), location="headers")
+        @api.output(single_item_endpoint_schema)
+        @api.doc(tags=[integration_type, resource_obj.english_plural_name()])
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def api_sync_connection(connection_id, functions_to_sync=[]):
+    try:
+        connection = get_connections_row(connection_id)
+        connection_schedulers = get_connection_scheduler_rows(connection["id"])
+        connection_type = connection["integration_type"]
+        integration_file = get_integration_file(
+            connection["integration_name"], connection_type
+        )
+        integration = integration_file.Integration()
+        org_row = get_org_row(connection["org_id"])
+        # a disabled function must not sync, even on a manual/force sync. its scheduler row
+        # can linger from before it was disabled, so skip it here as the scheduler does.
+        disabled_functions = resolve_disabled_functions(
+            connection, org_row, connection["integration_name"], connection_type
+        )
+        for schedule in connection_schedulers:
+            function_name = schedule["function_name"]
+            # if functions are specified, only sync those functions
+            if functions_to_sync and function_name not in functions_to_sync:
+                continue
+            # don't force sync if crawl in progress
+            resource = function_to_resource_map[connection_type][function_name](
+                integration
+            )
+            if resource.is_function_disabled(disabled_functions):
+                continue
+            crawl_frequency = connection["crawl_frequencies"].get(
+                function_name, resource.crawl_frequency()
+            )
+            # handle dynamo's Decimal type
+            crawl_frequency = int(crawl_frequency)
+            update_crawl_items(
+                connection_id, function_name, {"force_sync_pending": True}
+            )
+            started = crawl_started(schedule)
+            active = crawl_heartbeat_active(schedule)
+            if started and active:
+                continue
+            latest_data = schedule.get("latest_data")
+            last_enqueued = schedule.get("last_enqueued")
+            function_name = schedule["function_name"]
+            if last_enqueued and last_enqueued > dt_to_str(
+                now() - timedelta(seconds=120)
+            ):
+                continue
+            enqueue_crawl_task(
+                {
+                    "connection_row": connection,
+                    "org_row": org_row,
+                    "function_name": function_name,
+                    "first_crawl": False,
+                    "start_time_str": latest_data,
+                    "end_time_str": None,
+                    "page_token": None,
+                    "resuming": False,
+                    "force": True,
+                }
+            )
+    except Exception:
+        raise PokedexException("Error syncing connection", 500, origin="trackstar")
+    return {
+        "id": connection_id,
+        "syncing": True,
+        "functions_to_sync": functions_to_sync,
+    }
+
+
+def api_get_connection_schedules(connection_id, org_id):
+    org_row = get_org_row(org_id)
+    connection = get_connections_row(connection_id)
+    connection_type = connection["integration_type"]
+    scheduler_rows = get_connection_scheduler_rows(connection_id)
+    integration_file = get_integration_file(
+        connection["integration_name"], connection_type
+    )
+    integration = integration_file.Integration()
+    visible_rows = []
+    for row in scheduler_rows:
+        function_name = row["function_name"]
+        resource = function_to_resource_map[connection_type][function_name](integration)
+        if resource.is_hidden():
+            continue
+        visible_rows.append(row)
+        row["resource_name"] = resource.english_plural_name()
+        row["crawl_frequency"] = resolve_crawl_frequency(
+            connection, org_row, resource, function_name
+        )
+        # add sync status
+        connection_errors = get_connection_errors(connection_id)
+        sync_status = get_sync_status(row, connection_errors, resource.endpoint_base())
+        row["sync_status"] = sync_status
+        # tasks_started + tasks_finished are non serializable sets and not needed
+        if "submit" in row:
+            del row["submit"]
+
+    return visible_rows
+
+
+def api_direct_get(resource_type, item_id):
+    integration = request.environ["integration"]
+    resource: Resource = resource_type(integration)
+    get_fn = resource.get_function()
+    rsp = get_fn(item_id)
+    to_return = best_effort_load(
+        resource.validate_pass_through,
+        resource.single_item_endpoint_schema,
+        rsp,
+    )
+    return to_return
+
+
+def get_sync_status(schedule_row, connection_errors, resource_endpoint):
+    last_enqueued = schedule_row.get("last_enqueued")
+    last_crawl_end = schedule_row.get("last_crawl_end")
+    latest_data = schedule_row.get("latest_data")
+    sync_status = "enabled"
+    if schedule_row.get("paused"):
+        sync_status = "disabled"
+    elif schedule_row.get("stuck"):
+        sync_status = "stuck"
+    elif not latest_data or (last_enqueued and not last_crawl_end):
+        sync_status = "first_sync_in_progress"
+    elif last_enqueued and last_crawl_end and last_enqueued > last_crawl_end:
+        sync_status = "sync_in_progress"
+    # check if sync error exists
+    for error in connection_errors:
+        for affected_endpoint in error["affected_endpoints"]:
+            error_resource_name = affected_endpoint["endpoint"].split("/")[2]
+            if (
+                error_resource_name == resource_endpoint
+                and affected_endpoint["preventing_sync"]
+            ):
+                sync_status = "error"
+                break
+    return sync_status
+
+
+def get_available_on_demand_sync_functions(integration):
+    integration_type = integration.integration_type
+    function_map = function_to_resource_map.get(integration_type, {})
+    available = []
+    for function_name, resource_type in function_map.items():
+        if not integration.is_implemented(function_name):
+            continue
+        resource = resource_type(integration)
+        if resource.allow_on_demand_sync():
+            available.append(function_name)
+    return available
+
+
+def api_create_on_demand_sync(
+    connection_id, start_time_str, end_time_str, function_name
+):
+    if start_time_str >= end_time_str:
+        raise PokedexException(
+            "start_time must be before end_time", 400, origin="trackstar"
+        )
+
+    connection = get_connections_row(connection_id)
+    if not connection:
+        raise PokedexException("Connection not found", 404, origin="trackstar")
+
+    org_id = connection["org_id"]
+    integration_type = connection["integration_type"]
+    integration_name = connection["integration_name"]
+
+    integration_file = get_integration_file(integration_name, integration_type)
+    integration = integration_file.Integration()
+    if not integration.is_implemented(function_name):
+        raise PokedexException(
+            f"Function {function_name} is not implemented for {integration_name}",
+            400,
+            origin="trackstar",
+        )
+    org_row = get_org_row(org_id)
+    disabled_functions = resolve_disabled_functions(
+        connection, org_row, integration_name, integration_type
+    )
+    if function_name in disabled_functions:
+        raise PokedexException(
+            f"Function {function_name} is disabled for this connection",
+            400,
+            origin="trackstar",
+        )
+    resource_type = function_to_resource_map[integration_type].get(function_name)
+    if resource_type:
+        empty_resource = resource_type()
+        try:
+            # for resources like inventory that don't support on-demand sync at all
+            # want to say something nicer. TRA-1948
+            resource_universally_blocked = False
+            if not empty_resource.allow_on_demand_sync():
+                resource_universally_blocked = True
+        except Exception:
+            resource_universally_blocked = False
+        if resource_universally_blocked:
+            raise PokedexException(
+                f"On-demand sync is not enabled for {function_name} in general. On-demand sync is not useful for this resource type, and is not supported for any connection.",
+                400,
+                origin="trackstar",
+            )
+        resource = resource_type(integration)
+        if not resource.allow_on_demand_sync():
+            raise PokedexException(
+                f"On-demand sync is not enabled for {integration_name} {function_name}",
+                400,
+                origin="trackstar",
+            )
+    existing_jobs = get_sync_jobs_for_connection(
+        connection_id, function_name=function_name, status="open"
+    )
+    if existing_jobs:
+        raise PokedexException(
+            f"An open sync job already exists for {function_name}. "
+            "Please wait for it to complete or cancel it first.",
+            400,
+            origin="trackstar",
+        )
+
+    created_at_str = dt_to_str(now())
+
+    job_id = str(uuid.uuid4())
+    job_data = {
+        "id": job_id,
+        "connection_id": connection_id,
+        "org_id": org_id,
+        "function_name": function_name,
+        "status": "open",
+        "requested_start_time": start_time_str,
+        "requested_end_time": end_time_str,
+        "created_at": created_at_str,
+    }
+    create_sync_job(job_data)
+    record_event(
+        org_id,
+        "on_demand_sync_started",
+        integration_name,
+        integration_type,
+        connection_id=connection_id,
+        customer_id=connection.get("customer_id"),
+        additional_fields={
+            "function_name": function_name,
+            "requested_start_time": start_time_str,
+            "requested_end_time": end_time_str,
+        },
+    )
+
+    return {
+        "data": {
+            "id": job_id,
+            "connection_id": connection_id,
+            "function_name": function_name,
+            "status": "open",
+            "requested_start_time": start_time_str,
+            "requested_end_time": end_time_str,
+            "created_at": created_at_str,
+        }
+    }
+
+
+def api_get_on_demand_sync(connection_id, sync_id):
+    sync_job = get_sync_job(sync_id)
+    if not sync_job:
+        raise PokedexException("Sync job not found", 404, origin="trackstar")
+    if sync_job["connection_id"] != connection_id:
+        raise PokedexException("Sync job not found", 404, origin="trackstar")
+    return {"data": sync_job}
+
+
+def api_list_on_demand_syncs(connection_id):
+    sync_jobs = get_sync_jobs_for_connection(connection_id)
+    return {"data": sync_jobs}
+
+
+def api_cancel_on_demand_sync(connection_id, sync_id):
+    sync_job = get_sync_job(sync_id)
+    if not sync_job:
+        raise PokedexException("Sync job not found", 404, origin="trackstar")
+    if sync_job["connection_id"] != connection_id:
+        raise PokedexException("Sync job not found", 404, origin="trackstar")
+    if sync_job["status"] != "open":
+        raise PokedexException(
+            "Only open sync jobs can be cancelled", 400, origin="trackstar"
+        )
+    cancelled_at_str = dt_to_str(now())
+    update_sync_job(
+        sync_id,
+        {"status": "cancelled", "cancelled_at": cancelled_at_str, "stale": False},
+    )
+    sync_job["status"] = "cancelled"
+    sync_job["cancelled_at"] = cancelled_at_str
+    sync_job["stale"] = False
+    # the cancel already committed; the connection is fetched only for the event,
+    # so a concurrent delete must not fail the request. record_event itself is
+    # best-effort, so only the lookup needs guarding.
+    try:
+        connection = get_connections_row(connection_id)
+    except Exception as e:
+        connection = None
+        logger.error(
+            f"failed to load connection for cancel event: {format_exception(e)}"
+        )
+    if connection:
+        record_event(
+            connection["org_id"],
+            "on_demand_sync_cancelled",
+            connection["integration_name"],
+            connection["integration_type"],
+            connection_id=connection_id,
+            customer_id=connection.get("customer_id"),
+            additional_fields={
+                "function_name": sync_job["function_name"],
+                "requested_start_time": sync_job["requested_start_time"],
+                "requested_end_time": sync_job["requested_end_time"],
+            },
+        )
+    return {"data": sync_job}

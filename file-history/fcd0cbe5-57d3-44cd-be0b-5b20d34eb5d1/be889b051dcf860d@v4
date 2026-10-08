@@ -1,0 +1,147 @@
+from unittest.mock import MagicMock
+
+import pytest
+
+from lambda_handlers import linked_refresh
+from lambda_handlers.linked_refresh import handler, refresh_linked_resources
+from resources.erp.sales_order_shipments import ErpSalesOrderShipment
+from resources.wms.orders import Order
+from utils.lambda_util import LambdaContextManager
+from utils.schema import validate_task_payload
+
+
+class MockIntegration:
+    connection_id = "test-connection-id"
+    org_id = "test-org-id"
+    integration_name = "test-integration"
+    integration_type = "erp"
+
+    def trimmed(self):
+        return self
+
+
+class _FakeLinkedResource:
+    def __init__(self, integration=None):
+        self.integration = integration
+
+    def name(self):
+        return "fake_linked_resource"
+
+    def crawl_schema(self):
+        schema = MagicMock()
+        schema.load.return_value = {"data": [{"id": "L1"}], "next_token": None}
+        return schema
+
+    def validate_crawl(self, response):
+        return None
+
+    def redact_pii(self, items):
+        return items
+
+    def trimmed(self):
+        return self
+
+
+class _FakeResource:
+    linked_resource_type = _FakeLinkedResource
+
+    def __init__(self, integration):
+        self.integration = integration
+
+    def fetch_linked(self, linked_ids):
+        return [{"id": "L1", "raw": True}]
+
+
+def test_validate_task_payload_linked_refresh_valid():
+    payload = {"resource": Order(MockIntegration()), "data": ["1", "2"]}
+    validate_task_payload("linked-refresh", payload)
+
+
+def test_validate_task_payload_linked_refresh_missing_data():
+    with pytest.raises(ValueError):
+        validate_task_payload("linked-refresh", {"resource": Order(MockIntegration())})
+
+
+def test_refresh_linked_resources_orchestration(mocker):
+    # fetch_linked -> stamp -> load -> validate -> submit(is_linked_refresh=True)
+    mocker.patch.object(linked_refresh, "DRY_RUN", False)
+    stamp = mocker.patch("celery_tasks.crawler.stamp_trackstar_dates")
+    submit = mocker.patch("lambda_handlers.submitter.submit")
+    resource = _FakeResource(MockIntegration())
+
+    refresh_linked_resources(
+        resource, ["L1"], "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"
+    )
+
+    stamp.assert_called_once()
+    submit.assert_called_once()
+    assert submit.call_args.args[1] == [{"id": "L1"}]
+    assert submit.call_args.kwargs["is_linked_refresh"] is True
+    assert submit.call_args.kwargs["local_submit"] is False
+
+
+def test_refresh_linked_resources_noop_on_empty_ids(mocker):
+    submit = mocker.patch("lambda_handlers.submitter.submit")
+    refresh_linked_resources(_FakeResource(MockIntegration()), [], "s", "e")
+    submit.assert_not_called()
+
+
+def test_refresh_linked_resources_noop_when_vendor_returns_no_rows(mocker):
+    submit = mocker.patch("lambda_handlers.submitter.submit")
+
+    class _EmptyResource(_FakeResource):
+        def fetch_linked(self, linked_ids):
+            return []
+
+    refresh_linked_resources(_EmptyResource(MockIntegration()), ["L1"], "s", "e")
+    submit.assert_not_called()
+
+
+def test_refresh_linked_resources_forwards_local_submit(mocker):
+    # dev local_submit path: the flag must reach submit() so dev crawls submit
+    # in-process instead of routing to the submitter lambda.
+    mocker.patch.object(linked_refresh, "DRY_RUN", False)
+    mocker.patch("celery_tasks.crawler.stamp_trackstar_dates")
+    submit = mocker.patch("lambda_handlers.submitter.submit")
+    refresh_linked_resources(
+        _FakeResource(MockIntegration()), ["L1"], "s", "e", local_submit=True
+    )
+    assert submit.call_args.kwargs["local_submit"] is True
+    assert submit.call_args.kwargs["is_linked_refresh"] is True
+
+
+def test_refresh_linked_resources_skips_submit_in_dry_run(mocker):
+    # dry run: read path runs (fetch + validate) but never persists/webhooks
+    mocker.patch.object(linked_refresh, "DRY_RUN", True)
+    mocker.patch("celery_tasks.crawler.stamp_trackstar_dates")
+    submit = mocker.patch("lambda_handlers.submitter.submit")
+    resource = _FakeResource(MockIntegration())
+    fetch_spy = mocker.spy(resource, "fetch_linked")
+
+    refresh_linked_resources(resource, ["L1"], "s", "e", local_submit=True)
+
+    fetch_spy.assert_called_once()
+    submit.assert_not_called()
+
+
+def test_handler_invokes_refresh_with_ctx_fields(
+    mocker, lambda_context, s3_linked_refresh_event, mock_s3_read_linked_refresh
+):
+    mock_refresh = mocker.patch(
+        "lambda_handlers.linked_refresh.refresh_linked_resources"
+    )
+    resource = ErpSalesOrderShipment(MockIntegration()).trimmed()
+    mock_s3_read_linked_refresh(
+        resource, ["123"], "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"
+    )
+    mock_handle_error = mocker.patch.object(LambdaContextManager, "_handle_error")
+
+    handler(s3_linked_refresh_event, lambda_context)
+
+    mock_handle_error.assert_not_called()
+    mock_refresh.assert_called_once()
+    args = mock_refresh.call_args.args
+    assert isinstance(args[0], ErpSalesOrderShipment)
+    assert args[1] == ["123"]
+    assert args[2] == "2024-01-01T00:00:00Z"
+    assert args[3] == "2024-01-01T00:00:00Z"

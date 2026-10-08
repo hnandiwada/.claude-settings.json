@@ -1,0 +1,18 @@
+deposco: inline the stored cost and measurements read
+
+Drops the get_stored_cost_and_measurements helper per review and reads
+additional_fields at each formatter instead.
+
+The fallback stays, and additional_fields itself is now read tolerantly: a scan of
+all 16 prod deposco connections found 118,345 of 127,881 stored product rows still
+without unit_cost, and on several connections (33,543 rows on 4c0b2698, 29,426 on
+18e265b0) the row has no additional_fields key at all, so indexing it directly
+would raise. Kits never carry either value by construction (format_kit_product
+stores empty additional_fields) and reach the enterprise formatter, which doesn't
+skip them.
+
+Verified with yarn test -k deposco --inventory --products (3 passed, 2 write tests
+skipped, ledger xfail).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017YUtxG7nJczeAE5nrWdMwu

@@ -1,0 +1,15 @@
+○ → cd /private/tmp/claude-501/-Users-harshanandiwada-workspace-pii-redactor/fcd0cbe5-57d3-44cd-be0b-5b20d34eb5d1/scratchpad && uv run --project /Users/harshanandiwada/workspace/pii-redactor python3 business_customers.py 10
+scanned 1273 rows, 55 with is_individual false, across 2 connections
+16 look suspicious
+- connection 93d816041abe44a8a02182b495a99eb2 id 13256: name 'MKG Productions', email jiancarlos.vasquez@thisismkg.com, ship to 'MKG Productions', bill to 'MKG Productions'; shipping_address.full_name matches name; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 3143: name '213Deli', email None, ship to '213Deli', bill to '213Deli'; shipping_address.full_name matches name; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 32012: name 'IPSY', email mandysitu@ipsy.com, ship to 'IPSY', bill to 'IPSY'; shipping_address.full_name matches name; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 52122: name 'Veritiv Solutions, LLC', email vbxops@veritiv.com, ship to 'Veritiv Solutions, LLC', bill to 'Veritiv Solutions, LLC'; shipping_address.full_name matches name; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 52823: name 'MarZ Licensing, LLC', email None, ship to 'MarZ Licensing, LLC', bill to 'MarZ Licensing, LLC'; shipping_address.full_name matches name; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 8: name 'Ulta Beauty', email None, ship to 'None', bill to 'Ulta Beauty'; name looks like a person; billing_address.full_name matches name
+- connection 459ad6d208de44baaff95a8da82fd670 id 10018167: name 'COS Municipal Court Building Marshal’s Office-Roberto Williamson', email sherryl@csppa.org, ship to 'COS Municipal Court Building Marshal’s Office-Roberto Williamson', bill to 'COS Municipal Court Building Marshal’s Office-Roberto Williamson'; shipping_address.full_name matches name; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 13659: name 'MECCA', email internationalaccounts@mecca.com.au, ship to 'MECCA Brands PTY LTD', bill to 'MECCA'; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 1933: name 'Paypal Account', email None, ship to 'None', bill to 'None'; name looks like a person
+- connection 93d816041abe44a8a02182b495a99eb2 id 21395: name 'NVE Experience Agency LLC', email None, ship to 'None', bill to 'NVE Experience Agency LLC'; billing_address.full_name matches name
+- connection 93d816041abe44a8a02182b495a99eb2 id 22307: name 'Ulta Beauty Mexico', email ulta_mex@grupoaxo.com, ship to 'ULTA BEAUTY MEXICO', bill to 'Torre C, Piso 22'; name looks like a person
+

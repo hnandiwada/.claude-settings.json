@@ -1,0 +1,63 @@
+(Pdb) pprint(receipt_line_items)
+[
+  {
+    "inventory_item_id": "263632",
+    "sku": "#10092",
+    "quantity": 10,
+    "lot_id": "782003591180",
+    "expiration_date": null
+  },
+  {
+    "inventory_item_id": "258950",
+    "sku": "#12651",
+    "quantity": 10,
+    "lot_id": "1",
+    "expiration_date": null
+  },
+  {
+    "inventory_item_id": "246690",
+    "sku": "#1265",
+    "quantity": 10,
+    "lot_id": "1",
+    "expiration_date": null
+  }
+]
+pprint(previous_receipts)
+new_received_by_key
+new_received_by_inv_id
+raise_li_exceptions
+
+(Pdb) pprint(previous_receipts)
+[
+  {
+    "id": "11315-1",
+    "arrived_date": "2026-07-23T09:57:51Z",
+    "line_items": [
+      {
+        "sku": "#10092",
+        "inventory_item_id": "263632",
+        "quantity": 10,
+        "lot_id": null,
+        "expiration_date": null
+      }
+    ]
+  }
+]
+new_received_by_key
+new_received_by_inv_id
+raise_li_exceptions
+
+(Pdb) new_received_by_key
+defaultdict(<class 'int'>, {('263632', '782003591180', None): 10, ('258950', '1', None): 10, ('246690', '1', None): 10})
+new_received_by_inv_id
+raise_li_exceptions
+
+(Pdb) new_received_by_inv_id
+defaultdict(<class 'int'>, {'263632': 10, '258950': 10, '246690': 10})
+raise_li_exceptions
+
+(Pdb) raise_li_exceptions
+[]
+
+(Pdb)
+[]

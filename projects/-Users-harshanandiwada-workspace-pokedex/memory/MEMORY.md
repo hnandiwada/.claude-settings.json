@@ -1,0 +1,4 @@
+- [APM trace gluing investigation](project_apm_trace_gluing.md) — open: many Lambda invocations sharing one trace_id on warm PC containers, suspect ThreadPoolExecutor + ddtrace
+- [Link-test compensating validation](feedback_link_test_compensating_validation.md) — resolve BOTH id sets of a failing link test symmetrically, not just one side
+- [Frivolous PR annotations](feedback_frivolous_pr_annotations.md) — fix-tests/iterate PRs shouldn't add api-summary AMENDED sections or comments for simple fixes
+- [Scope knowledge rules](feedback_scope_knowledge_rules.md) — patterns/gotcha rules apply only where the problem is observed, never as universal mandates

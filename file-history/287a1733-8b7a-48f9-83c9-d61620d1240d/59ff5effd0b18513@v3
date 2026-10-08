@@ -1,0 +1,1211 @@
+# Integration Patterns — Operational Source of Truth
+
+> **Doctrine version:** 2.4 · last updated 2026-09-28 · see [CHANGELOG.md](CHANGELOG.md) in this directory.
+> Versioned **independently of the skills that consume it.** Changes to the rules below bump the doctrine version here — not `/plan-integration`'s. The skills point at this file; they don't own its history. (Pre-1.0 doctrine changes were tracked under `plan-integration` CHANGELOG entries 1.17–1.31, before the doctrine carried its own version.)
+
+This file is the canonical pattern reference for integration subagents (`integration-api-validator`, `integration-function-writer`, `integration-reviewer`). Subagents start with clean context and **do not** auto-load the project CLAUDE.md, so this file duplicates the rules subagents need.
+
+If a rule below conflicts with the project CLAUDE.md, the project CLAUDE.md wins — open a PR to update this file.
+
+---
+
+## Scope — when these rules apply
+
+These rules apply to **new integration builds** and to **new functions added to existing integrations**. They are the target shape for new work — not a license to refactor shipped code.
+
+When editing an existing function in an existing integration (`add-function` mode pointed at an existing method, post-wrap follow-up edits, or a customer-issue fix), **match the surrounding file's style**. Don't reorder methods, hoist private helpers, or restructure for ordering compliance unless the user explicitly asked. Style-guide divergences in legacy code aren't bugs to fix — they're history to preserve.
+
+Style-guide violations in new builds and new functions: `BLOCK` or advisory per each rule below.
+Style-guide divergences in existing code (when not the focus of the edit): ignore.
+
+## Files in scope — what an integration build may modify
+
+An integration build (new-integration or add-function mode) edits **only** the following files. Every other file in the pokedex repo is read-only for the duration of the build.
+
+In scope (editable):
+
+- `pokedex/integrations/{type}/{name}/` — the integration's own directory (integration class, manifest, any scaffolder-generated files)
+- `pokedex/test/integrations/{name}_test.py` — the integration's test file
+- `.claude/references/{name}/` — api-summary + samples (committed — they ride the PR so reviewers can read the characterization and field-mapping rationale). **Never commit live credentials or customer PII into them: redact AppIds/tokens to `<app_id>`/`<access_token>` and anonymize any PII in captured sample responses (names, addresses, phones, emails).**
+- `.claude/plans/` and `.claude/tmp/{name}-*` — plans and orchestrator scratch files (gitignored)
+
+Out of scope (do not edit, automatic `[BLOCK]`):
+
+- `pokedex/resources/<type>/*.py` — **canonical schemas shared across every integration**. A single line change here ripples through every other integration's reads.
+- `pokedex/test/integrations/base_test.py` — test framework
+- `pokedex/integrations/__init__.py`, base classes, mixins, `Integration` superclass
+- `pokedex/utils/`, `pokedex/celery_tasks/`, `pokedex/lambda_handlers/`, `pokedex/api.py`, `pokedex/config.py` — application code shared across integrations
+- Other integrations under `pokedex/integrations/{type}/<other>/`
+- Any other file outside the in-scope list above
+
+**If you hit a wall where the only fix you can see requires touching out-of-scope code, STOP.** Surface to the user with three pieces of information:
+
+1. What you observed (the symptom, the failing validator / schema rejection / etc.)
+2. The workaround paths within the integration's scope (`IntegrationNotImplemented`, comment + omit, vendor support email, etc.)
+3. The out-of-scope change that would be cleaner — named explicitly: which file, which line, what change.
+
+The user decides whether to accept the workaround, ship without the field, or schedule a separate PR for the out-of-scope change. **Schema and framework changes are never bundled into integration delivery** — they're reviewed separately because they affect every other integration.
+
+The "schema is wrong (rare)" line below in the anti-patterns list is a diagnostic — for *recognizing* the case so you can escalate it. It is not authorization to edit the schema yourself.
+
+## Why these rules exist (read before applying any of them)
+
+Every rule below has a goal. Without the goal, rules degrade into rituals — boxes to tick or game. With the goal, you can apply judgment in cases the rules don't anticipate.
+
+**The integration's job is to faithfully represent the source API to the customer.** Not "to make the tests pass," not "to match the spec on paper," not "to ship without errors." Faithful representation means: when a customer asks "did this order ship?", the integration's answer reflects the source's truth, including its quirks and limitations. Every shortcut that hides source behavior — silent fallbacks, disabled validators, fields synthesized to satisfy schemas — degrades fidelity.
+
+**Loud failures > quiet workarounds.** We design for failures to surface, not be swallowed. `KeyError` during `yarn crawl` is information; `.get(field, None)` is amnesia. A failing validator is a signal that the source returned something we didn't expect; a disabled validator is a missed bug we'll see in production. Default to making things break so we can see what's happening.
+
+**Consequences of shallow work compound.** Every `IntegrationNotImplemented` shipped without investigation becomes a customer-facing capability gap. Every silent `.get()` becomes a null reaching production. Every test changed-to-pass becomes a coverage hole. Integration code is shipped to *every* customer using that integration — getting it wrong is expensive.
+
+### Root-cause-first troubleshooting (mandatory order)
+
+When something doesn't work — validation fails, test breaks, field is null, response is empty — investigate in this order **before** reaching for an escape hatch. Skipping a step needs a reason in your notes.
+
+1. **Look at the raw data.** Print the actual JSON/XML response (not the parsed model). Is the field present? What value? What type? `yarn crawl` with `--pdb` and inspect, or read the saved sample.
+2. **Check other endpoints.** Maybe `/orders` doesn't expose the field but `/orders/{id}` does. Maybe a webhook event has it. Maybe there's an `expand=` or `include=` parameter.
+3. **Re-read the spec.** Does the docs section actually claim this field exists? In what state? Are there required headers, query params, or body flags that change response shape?
+4. **Compare sandbox vs production behavior in docs.** Sandbox often has impoverished data (no shipments, no fulfilled orders, no historical records). The spec describes the contract; sandbox is one observation of it. Treat divergence as a sandbox-state issue, not a "spec is wrong."
+5. **Check vendor known issues / changelog / status page.** Vendor APIs change without notice. Sometimes a field stops being returned, an enum value gets renamed, an endpoint is deprecated. Look before assuming it's our bug.
+6. **Surface to user with findings.** "I observed X, the spec says Y, the vendor's docs/changelog say Z. Possible paths: (a), (b), (c). Which?" — this is the right escalation, not a silent workaround. The user often has context you don't (customer ask, support thread, vendor relationship).
+
+Only **after** these steps, and only with notes documenting what you found, may you reach for: `.get()`, `IntegrationNotImplemented`, custom validation, validator-disable flags, or test modifications.
+
+### Anti-patterns: the "shallow fix" family
+
+These are the moves agents reach for instead of root-cause investigation. Every one is a `[BLOCK]` if used without documented rationale.
+
+- **Disabling a validator flag** (e.g., setting a Marshmallow field's `validate` to a no-op, lowering strictness, switching `Strict()` to `Loose()`). Validators exist to catch source-side malformations before they reach customers. Disabling without investigation hides real data issues.
+- **Writing custom validators that just bypass.** A custom validator that accepts everything the default rejected is the same as no validator. Custom validators are for cases where the canonical validator is genuinely wrong for this integration's data shape — rare, and always justified.
+- **Marking `IntegrationNotImplemented` without investigation.** This is a customer-facing capability gap signal. Putting it on a field "because we couldn't find data for it" without checking other endpoints, the spec, or vendor support is shipping a downgrade silently.
+- **Adding `.get(field, None)` because the field was sometimes missing.** First understand *why* it's missing — what state, what record type, what API version. The comment requirement exists for this reason: forces you to articulate the cause.
+- **Modifying a failing test until it passes.** Tests fail because the implementation is wrong, the test is wrong, or upstream data is unexpected. Diagnose which before changing either.
+- **Synthesizing a value to satisfy a schema.** If the source doesn't provide a field and the schema requires it, the answer is rarely "make up a plausible value." First check whether the source has it elsewhere (other endpoint, `expand=` parameter, webhook event). If genuinely absent, use `IntegrationNotImplemented` with rationale recorded in `api-summary.md`. If the schema appears to be the wrong shape for this field across vendors (genuinely rare), **stop and surface to the user** — `pokedex/resources/<type>/*.py` is out of scope per "Files in scope" above. The schema change is a separate PR reviewed separately because it affects every integration.
+
+### Decisions need recorded rationale
+
+Every non-obvious field-mapping or implementation decision must have rationale recorded — terse comment in code pointing to a richer entry in `.claude/references/{integration}/api-summary.md` under a "Field-mapping decisions" section. Examples:
+
+In code (terse, present-tense, no date, no customer, no pattern attribution, no api-summary reference):
+```python
+# vendor's created_at = account creation, not record creation
+created_date = item["metadata"]["first_seen_at"]
+```
+
+In `api-summary.md`:
+```markdown
+## Field-mapping decisions
+
+- `created_date` ← `metadata.first_seen_at` (NOT `created_at`)
+  - Vendor's `created_at` is the account-creation timestamp, not the record's.
+  - Confirmed by reading vendor API docs §4.3 and observing 5 sample records where `created_at` was identical across them.
+
+- `tracking_number` ← `IntegrationNotImplemented`
+  - Source has no shipping data exposed via API; vendor confirmed shipments are emitted only via SFTP file drop.
+  - Vendor support ticket #1234 open since 2026-05 to enable shipments via REST.
+```
+
+No standing `Date:` line on entries — git history already dates every edit, and a boilerplate date reads as if the mapping itself expires. A date appears inline only when it is load-bearing: an open vendor ticket's age, a point-in-time write probe, a sandbox seeding snapshot.
+
+Reviewer enforces: any of `IntegrationNotImplemented`, `.get(...)` with default, custom validator, validator-disable, or non-obvious source-field choice **must** have a corresponding entry in `api-summary.md` "Field-mapping decisions." Missing rationale → `[BLOCK]`. Rationale present but thin (e.g., "couldn't find it") → `APPROVE_WITH_NOTES` flagging that the user should sanity-check.
+
+A straightforward change — a new enum value with a self-explanatory name, a renamed field, a new key access, a plain dedup — is not a non-obvious decision. It needs neither a code comment nor an `api-summary.md` entry. This applies everywhere a skill or agent edits an existing integration (`fix-tests`, `iterate-integration`, `stale-schedule-investigate`, `investigate`, ad-hoc reviews), not only new builds.
+
+When an entry is warranted on an *existing* integration, edit the matching entry in place — fold the new value into the map, update the evidence on that entry. Do not append a dated "Amended"/struck-through trailer stacking history under it; that convention belongs solely to `plan-integration`'s decision-contract rebuttal process ([`plan-integration/reference/decision-contract.md`](../skills/plan-integration/reference/decision-contract.md)), where the audit trail of a reversed in-flight decision is the point. Outside that process, `api-summary.md` describes current behavior, not a changelog. Every edit to it follows [`.claude/rules/api-summary.md`](../rules/api-summary.md): short entries, edited in place, no process history.
+
+---
+
+## Mandatory rules (reviewer enforces as pass/fail)
+
+### Format function output shape
+
+| Rule | Detail |
+|---|---|
+| `created_date` / `updated_date` | Pull from source when present. **When the vendor exposes only one of them** (creation-only systems, append-only logs, audit-trail revisions, single revision timestamp like `time` / `last_modified`), **set the missing one equal to the present one**. Reason: `created_date` is **frozen on first write** in our system — `update_resource_in_dynamo` never overwrites it on later crawls — so this is the one chance to record the real historical timestamp. Omitting and letting the pipeline backfill with `EPOCH` (`1970-01-01T00:00:00Z`, per `utils/utils.py`) makes a 2024 record look 50+ years old; that's a customer-visible lie. The pipeline also defaults a missing `updated_date` to whatever the integration set for `created_date` (per `celery_tasks/crawler.py` and `utils/api.py`), so explicitly setting only `created_date` and letting the pipeline copy it over is also acceptable — but explicit-on-both is preferred for clarity. `validate_created_updated` asserts `created_date <= updated_date`, so setting them equal trivially passes. **Omit both only when neither is sourceable.** Never synthesize `now()`, `datetime.utcnow()`, or hardcoded date strings for either field on a read path. Carve-out: when a `create_*` write itself originates the record and the vendor echoes no timestamp, `now()` at the moment of the write is the record's true origin — stamp it (computed once, reused wherever that moment appears) rather than freezing the epoch backfill. |
+| `trackstar_tags` | **Never populate.** This is a user-managed field. Omit it from `format_*` output. |
+| `additional_fields` | Default to `{}`. Populate for a field a customer has explicitly requested, or for a deliberate vendor-specific extra that no canonical field can carry and that downstream behavior needs (e.g. a source attribute a write path must read back) — rationale recorded in `api-summary.md` "Field-mapping decisions", **naming the requesting customer/org when the field was customer-requested**. An entry with no recorded requester reads as unrequested and risks removal in a later cost or coverage cleanup. Never for data that has a canonical slot. |
+| `IntegrationNotImplemented` | Use **only** when a field is structurally absent from the integration's API in **both directions**: no read endpoint exposes it AND no write endpoint accepts it. Never as a runtime fallback for null values. If even one code path provides the field, all other paths must use `None`, not `IntegrationNotImplemented`. |
+| **Write-accepted-but-read-absent fields get `None`, not `IntegrationNotImplemented`** | Many vendors accept a field on `create_*` / `update_*` (`unit_price`, `discount_amount`, `currency`, `note`, write-only metadata) but don't echo it on the corresponding read response. From the customer's perspective the integration **does** support the field — they can set it. Setting `IntegrationNotImplemented` on the read path mis-signals the field as wholly unsupported. Correct shape: `None` on the read path, with a one-line code comment naming the asymmetry (`# unit_price write-only: vendor accepts on create, not echoed on read`). The customer reads `null` and knows the field is supported but not retrievable from this source — that's the truth. This applies whether the write surface (`create_*` / `update_*`) is implemented today or not: the vendor's contract is what determines the absence value, not the integration's current method coverage. |
+| **Inventory quantities are physical stock, not accounting stock** | When the vendor exposes both an accounting view and a physical view of stock (`available` vs `actual_available`, ledger balances vs warehouse counts, ATP overrides), canonical inventory fields map from the **physical** fields — what is on the shelf — not the accounting derivation. Verify the chosen derivation against the vendor's own field-definition docs, not just sandbox math, and record it in `api-summary.md` "Field-mapping decisions". |
+| Anti-pattern: `x = data.get(y, IntegrationNotImplemented)` | Forbidden. Either the field exists from the API (use direct access or `None`) or it doesn't (set to `IntegrationNotImplemented` unconditionally). |
+| Anti-pattern: `x = y or IntegrationNotImplemented` | Forbidden. Same reason. |
+| **`[]` is not an absence value (structural decompositions only)** | An empty list means "the source returned a collection of zero items," not "we don't have this data" — when the collection is a **structural decomposition** of a parent record. If a parent record has data that logically must be split across the child collection (`shipment.line_items` is populated → `shipment.packages[].line_items` must account for those items), shipping `[]` on the child is incoherent. Three correct shapes for structural decompositions: (1) vendor exposes per-element breakdown → use it; (2) vendor exposes one package per shipment with no breakdown → **copy the parent's collection to the single child** (canonical shape: `list(per_package_lines.values()) or shipment_line_items` — see `shipbob/integration.py` for the exemplar); (3) vendor exposes multiple packages but no breakdown → leave every package's `line_items` empty rather than inventing an allocation (a fabricated split double-counts against the cross-package quantity validation in `resources/wms/orders.py`), and record the vendor gap in `api-summary.md`. Same rule applies to nested line-item collections, shipping addresses, etc. — `[]`/`{}` is what the vendor said, not a stand-in for "we don't have this." **Carve-out: `inbound.receipts` is an event-stream collection, not a structural decomposition** — receipts accumulate over time as items physically arrive, so `receipts = []` correctly says "no receipts have happened yet" and is the expected output of `get_receipts_from_received_quantity` until the vendor reports a non-zero `received_quantity` change. The Inbound receipts decision tree governs that case. Event-stream collections that follow the same logic (any future "events accumulated over time" field) get the same carve-out; structural decompositions don't. |
+
+### Inspect nested structure in raw responses before flattening
+
+When a list endpoint returns multiple rows that share a primary identifier (`sku`, `order_id`, `product_id`), the writer's first instinct is often "dedupe these — they're duplicates of the same record." **Look at what differentiates the rows before flattening.** If they share the primary identifier but differ on a secondary one (`batch_name`, `lot_id`, `serial_number`, `bin_location`, `variant_id`, `line_id`), that secondary identifier is signal that the rows are a **decomposition** of one canonical record — not duplicates — and the secondary structure usually maps to a canonical sub-collection.
+
+Recurring shapes to recognize:
+
+| Source rows share... | ...but differ on | Canonical mapping |
+|---|---|---|
+| `sku` (inventory) | `batch_name` / `lot_id` / `expiration_date` | Each distinct row → one entry in `inventory.lots`. Top-level quantities sum across rows; the `lots` collection preserves per-batch detail. |
+| `sku` (inventory) | `serial_number` | Serial-numbered inventory — same pattern as lots; populate `lots` (one per serial) unless the canonical schema has a serial-specific field. |
+| `sku` / `product_id` | `bin_location` / `warehouse_location_id` | Distinct rows → entries in `inventory.locations`. |
+| `order_id` | `line_id` / `package_id` | Line items or packages, not duplicate orders. Aggregate up by `order_id`, keep the inner rows as `line_items` / `packages`. |
+| `parent_sku` / `master_sku` | `variant_sku` | Product variants — distinct products under one parent. |
+
+Three required moves when you spot a shared-primary / distinct-secondary shape:
+
+1. **Stop the flatten.** Don't sum-then-drop. The writer who aggregates `available_quantity` across rows and then writes `lots = IntegrationNotImplemented` has thrown away source-side structure the customer can see in the vendor UI.
+2. **Find the canonical sub-collection.** Read the canonical resource file (`pokedex/resources/<type>/<resource>.py`); the canonical schema usually has a place for this shape (`lots`, `line_items`, `packages`, `locations`). If it does, populate it.
+3. **Escalate before silencing.** Only emit `IntegrationNotImplemented` on the sub-collection if (a) the canonical schema genuinely doesn't have a slot for the shape, AND (b) you've recorded the observation in `api-summary.md` "Field-mapping decisions" with the raw response and the rationale for skipping. "We aggregated and didn't think about it" is not rationale.
+
+Anti-pattern (recurring on inventory): seeing N rows for one SKU, deduping into one row, summing `available_quantity`, declaring `lots = IntegrationNotImplemented`. The dedupe is the moment the structural signal was lost — the writer needed to inspect the rows first, recognize the per-batch decomposition, and populate `inventory.lots` instead.
+
+Reviewer enforcement:
+- `format_*` function that dedupes / aggregates source rows by primary identifier without inspecting (or commenting on) the differentiating fields → `APPROVE_WITH_NOTES` asking the writer to confirm no structural signal was dropped.
+- Raw response demonstrably has a batch / lot / serial / variant / per-location signal (visible in the sample stored in `api-summary.md`) AND the format function emits `IntegrationNotImplemented` for the matching canonical sub-collection → `[BLOCK]`. The vendor exposes the structure; the integration must surface it.
+- Comments like `# aggregated across batches` or `# deduped by sku` without naming the sub-collection that captures the per-row detail → `APPROVE_WITH_NOTES` requesting the comment also identify where the row-level data went (or didn't).
+
+### Data access
+
+- **No `.get()` in initial implementation — on vendor-response reads.** Loud failures are how we discover real API behavior. If a `KeyError` fires during `yarn crawl`, that is information: the field is sometimes absent and we need to understand why. The rule is scoped to vendor responses: reading optional fields of the **validated write payload** in `create_*`/`update_*` methods uses `.get()` (the write schema declares them optional; absence is the normal case, not a discovery).
+- On a vendor response, `.get()` is allowed **only after** observing the field is genuinely sometimes absent in real responses. Pair it with a comment when the absence is surprising — the vendor contract says the field should be there and observation proved otherwise. A `.get()` on a field the vendor documents as optional is self-documenting and needs no comment. Comments are present-tense and source-only — no observation date, no customer org, no pattern attribution. Example:
+  ```python
+  # vendor returns null for unfulfilled orders
+  fulfilled_at = order.get("fulfilled_at")
+  ```
+  The customer/account where it was first observed (and the date, when load-bearing — e.g. an open vendor ticket) lives in `api-summary.md` "Field-mapping decisions" — not in the code, which ships to every customer.
+
+### Code style
+
+| Rule | Detail |
+|---|---|
+| No docstrings | Pokedex code is self-documenting. The exceptions in `.claude/rules/code-style.md` are all outside `integrations/`. |
+| Comments | **Default is no comment** — one exists only when the change isn't obvious from the code, and a comment restating the code, a name, or the raise beside it gets deleted, not polished. Keepers: lowercase (vendor field names keep their original casing), explain **why** not what, vendor quirks and non-obvious constraints only. **ELI5, one-read test:** any SWE who didn't write the code understands it cold in one pass. No noun-stacks ("multi-lot pick collision"), no arrow-chains (`x → y → z`), no internal/framework vocabulary, no clever compression that needs decoding. Clarity wins over brevity — a few extra plain words beat a short dense phrase. |
+| Raise, don't `assert` | Runtime error paths raise `PokedexException` (or the typed `create_*` helpers), never `assert`. Asserts strip under `python -O` and carry no status code or origin for the error surface. `assert` belongs in tests only. **Advisory on existing code; flag in new builds.** |
+| Inline private helpers | Avoid tiny `_float_or_none`-style helpers in integration mappers. Inline at the call site. |
+| Colocate per-resource constants | Status maps, type maps, etc. go directly above their `format_*` function — not in a top-of-file constants block. Only cross-cutting config goes at file top. |
+| String/datetime schema fields handle empty automatically | Drop trailing `or None` and `format_iso(x) if x else None`. The Marshmallow schemas convert empty values during deserialize. |
+| Terminology | Use **receipt** / **inbound shipment** in code identifiers, not "receiving". Only keep upstream API names verbatim in URLs and JSON keys. |
+| No list/dict comprehensions in integration code | Use multi-line `for` loops with named intermediates. Comprehensions are opaque under `pdb` and integration code is debugged frequently. |
+|  | Anti-pattern: `formatted = [format(x) for x in items]` |
+|  | Preferred: `formatted = []` / `for item in items:` / `    formatted_item = format(item)` / `    formatted.append(formatted_item)` |
+| No `logger.info` / `print` in integration code | Most integrations don't log — Datadog spans and connection-error rows are the observability surface. `logger.info("got 50 orders")` is noise; `logger.warning` / `logger.error` for genuinely surprising states only. **Carrier integrations are the documented exception:** their async/queued workflows make raw control flow harder to follow, so structured `logger.info` at major checkpoints is allowed and useful. The carrier exception does not generalize — every other type should stay quiet. If you're tempted to add a logger call to a non-carrier integration to debug something, do that locally with print and remove it before commit. |
+| Comments must be **self-contained** | Code comments must NOT reference `api-summary.md`, `references/{integration}/...`, or any other `.claude/`-side file. External reviewers (PR reviewers, future engineers reading the file at HEAD) may not have those files open in context. Inline the relevant context directly: instead of `# see api-summary.md "Field-mapping decisions" for cost_price unit`, write `# cost_price returned as int64-encoded string in whole-currency-units, e.g. "850" = $850`. The `api-summary.md` "Field-mapping decisions" section is a *working notebook for the writer during implementation*, not a runtime cross-reference for the code. |
+| De-duplicate shared rationale | When the same comment applies to multiple fields (e.g., "proto3 omits zero-valued fields, so this is absent on no-records responses" repeated on five fields), put the comment ONCE — at the function header, above the relevant block, or as a module-level note near the parsing helper that handles it. Repeating the same rationale on every field is noise that obscures the per-field comments that *are* unique. |
+| Declare `page_token` defaults inline | Put the starting `page_token` directly in the function signature — `def get_orders(self, start, end, first_crawl, first_loop, page_token=1):` or `page_token={"page": 0, "phase": "live"}`. Don't write `page_token=None` followed by `if page_token is None: page_token = ...`. The mutable-default-args pitfall (Python's classic "shared list across calls" bug) does not apply: `page_token` is treated as an opaque value that the function replaces with a new vendor-returned token each iteration; we never mutate it in place. The verbose `is None` reset is two lines that add nothing. **Exception:** if the default depends on runtime state (`first_crawl`, time math, vendor mode) and can't be a literal, keep the `is None` form — but document the dependency in a comment so the reviewer sees why the inline default doesn't work. |
+| A date sub-window is handed back as `next_start`, never carried in the page token | When a function splits the crawl range itself (a fixed window such as 1 day), the page token holds only the in-window cursor or page number. A finished window returns `next_token=None, next_start=window_end` (tz-aware UTC, whole seconds, clamped to `end`, strictly after `start`); the crawler advances `latest_data` to it, waits for the rows to land, and calls again with `start=window_end` and the default token. The resource must return True from `store_current_crawl_params()` (check the resource class). Per-crawl setup stays on `first_loop`, which is not reset per window; a lookback bigger than the default 5 minutes is `crawl_start_overlap_minutes` on the class, not `start - timedelta(...)` in the function, which would regress every window. Exemplars: `wms/finale/integration.py` `get_orders`, `wms/skuvault/integration.py` `get_orders`, `wms/shiphero/integration.py` `get_inbound_shipments`. |
+| Comments are ≤2 lines | A comment longer than two lines is almost always restating the code or describing what (not why). Keep to one short line ideally; two when the *why* needs a clause. Multi-paragraph or 5+ line comment blocks are forbidden unless the situation genuinely requires it (unusual vendor quirk that takes a paragraph to explain, with a date / observation). Reviewer flags >2 lines as `APPROVE_WITH_NOTES` and asks: can this be one line, or moved to `api-summary.md` "Field-mapping decisions"? |
+| Code comments don't name customers, source integrations, or observation dates | Three things that don't belong in code comments: (1) **customer orgs** — code ships to every customer of this integration; (2) **the source integration whose pattern was copied** (`# pattern from shipbob` / `# same as deposco`) — that's a pointer to another file that will be refactored, renamed, or itself wrong; the pattern is in the diff, not in a label; (3) **observation dates** (`# observed 2026-05`) — dates rot and tell nothing about whether the behavior is still current. Vendor-quirk comments say WHY in present tense (`# vendor returns null tracking on blocked-state orders`); rich rationale (customer, pattern source, load-bearing dates) lives in `api-summary.md` "Field-mapping decisions." **`BLOCK` on new builds; advisory on existing-integration edits.** |
+| Code comments don't reference skill doctrine or the authoring agent | Comments describe the integration's behavior in terms a human reading just this file would understand. They do NOT reference: (1) **doctrine vocabulary** — `# tier-3 pattern`, `# per the warehouse decision tree`, `# canonical exemplar`, `# shallow-fix`, `# per integration-patterns`, etc. The reader doesn't have `integration-patterns.md` open; the comment should describe the local choice (`# no warehouse endpoint; single hardcoded warehouse`) not the doctrine bucket. (2) **The authoring agent** — `# Claude flagged this`, `# AI-suggested`, `# per the model's read of the spec`, `# config-driven`, or any phrasing that exposes that an LLM wrote this. The comment is technical documentation for the next reader, not a provenance label. **`BLOCK` on new builds; advisory on existing edits.** |
+| `logger.warning` / `logger.error` must actually surface a problem the caller can act on | Existing rule allows `logger.warning` / `logger.error` for "genuinely surprising states." Refinement: if the code falls through to a default in the same path (the dominant case being `value = MAP.get(raw); if value is None: logger.warning(...); value = "other"`), the warn adds nothing — the fallback already encodes the decision. **Pick one: either raise/return an error to the caller (the value IS surprising and the customer needs to know), or silently cast to the default (the value is expected and the map should be widened).** A warn followed by a default is decoration that pollutes logs without producing actionable signal. The right move when a status map encounters an unmapped value during development is to extend the map; when it happens in production, the warn-then-default tells nobody anything because nobody reads integration logs proactively. **`APPROVE_WITH_NOTES`**; pair with a `[BLOCK]` if the warn is paired with no follow-up at all (logged-and-ignored). |
+| No leading-underscore "private" names | Don't prefix **methods** (`_helper()`), **attributes** (`self._cache`), or **locals** (`_tmp`) with an underscore. Python's underscore privacy is a convention we don't use in this codebase — it isn't enforced (nothing actually stops a caller), and the "private" signal buys nothing here. Name things plainly. For a class helper specifically: if it needs `self`, it's just a method (no underscore); if it doesn't need `self`, hoist to a module-level function; if it's used once, inline at the call site. The auth helpers (login, token refresh) always cluster with `<name>_request` as **class methods**, even when they don't read `self` — auth is the documented exception to hoisting stateless helpers to module level. (Dunder names like `__init__` are unaffected — those are Python's, not ours.) **Advisory in new integrations; ignored in existing-integration edits.** |
+| UPPER_CASE names are module-level only | A constant-style value scoped inside a function is a lowercase local like any other. Capitals are reserved for module-level constants (status maps, page sizes, vendor tunables). **Advisory in new code.** |
+| De-nest via opposite conditional + `continue` | Prefer guard clauses that exit early (`if not valid: continue`, `if not record: return`) over wrapping the happy path in a nested `if record and valid:`. Reads top-to-bottom. **Advisory in new code.** |
+| No `while True` | Use a sentinel pattern: `done = False` outside the loop, `while not done:`, set `done = True` when the exit condition is met. Single readable exit condition; the loop's termination is reviewable from one place. **Advisory in new code.** |
+| No unnecessary reassignment | Don't churn one variable through successive transforms (`data = resp.json()` → `data = data["results"]` → `data = [normalize(d) for d in data]`). Each rebind erases the prior value from the debugger and hides where the data came from. Give each step its own name (`body = resp.json()`, `rows = body["results"]`, `normalized = ...`) so a `pdb` session can inspect every stage. Same debuggability rationale as the named-intermediates / no-comprehensions rules. A single reassignment that genuinely just unwraps (`resp = resp.json()`) is fine; the rule targets a name reused across two or more meaning-changing steps. **Advisory in new code.** |
+| No multi-line value expressions inside dict / kwargs literals | If a value is a conditional, an `any()` / `all()` over an iterable, a `.get()` chain with a transform, or anything else that wraps across lines, **assign it to a named variable above the dict and reference the name inside**. The dict (or `CanonicalResource(...)` call) becomes a flat field-to-name mapping that reads top-to-bottom; the *why* of each value lives next to the variable name where a one-line comment can hang on it. Anti-pattern: `CanonicalOrder(status="shipped" if any(line["status"] == "shipped" for line in order["lines"]) else "pending", needs_attention=bool(order.get("flags") and "manual_review" in order["flags"]), ...)`. Preferred: name `status` and `needs_attention` on their own lines above the constructor, then `CanonicalOrder(status=status, needs_attention=needs_attention, ...)`. Trivial single-line ternaries and `.get(field, default)` are fine inline; the rule kicks in once the value wraps or contains an iterable scan. **Advisory in new code.** |
+
+### File structure and ordering (new integrations and new functions only)
+
+Applies to new integration builds and to brand-new functions added to existing integrations. **Do not refactor shipped integrations to match this** — existing-integration edits preserve the surrounding file's existing order.
+
+#### Two distinct "auth" surfaces — keep them straight
+
+The file has two unrelated auth-flavored clusters. Conflating them produces wrong ordering.
+
+| Cluster | What it is | Examples | Section |
+|---|---|---|---|
+| **Framework install / identity methods** | Methods `BaseIntegration` declares as part of the install-flow + identity contract. Every integration overrides the applicable subset. These are *framework defaults*, not implementation details. | `get_integration_secret`, `validate_integration_secret`, `me`, `safe_me`, `safe_integration_secret_keys`, `get_link_token` (oauth) | **Top of class**, grouped with the other framework defaults. |
+| **Request helper + its in-flight auth helpers** | The per-integration `<name>_request` helper plus any login / token-refresh / signing helpers it calls *during crawl* (after install). Not framework defaults — purely implementation details of how this integration talks to its vendor. | `<name>_request`, `<name>_auth`, `_login` (don't actually use a leading underscore — see Code style), token-refresh helper | **After** the framework defaults, **before** the data methods, as its own cluster. |
+
+Why this matters: `me` and `safe_me` belong with `get_integration_secret` and `validate_integration_secret` at the top — they're part of the same framework-default surface. They do NOT belong next to `<name>_request`, which is the per-integration HTTP helper. An ordering that puts `me`/`safe_me` after `<name>_request` reads as if those methods are implementation details of the request helper, which they aren't.
+
+#### Layout
+
+| Slot | Contents |
+|---|---|
+| **Top of file** | Imports. Integration-wide constants only (base URL, api version, anything referenced from 2+ resources). Resource-specific constants (status maps, type maps) do NOT go here — see below. |
+| **Class body** | See ordered sections below. |
+| **Below the class, above the function** | Constants used by 2+ functions for the same resource. Placed directly above the first `format_*` that consumes them. |
+| **Inside the function** | Constants used by exactly one function — defined as the first thing in the function body, before any logic. Status maps, type maps, value-to-canonical mappings consumed by a single `format_*` belong here, not at module scope. |
+| **File bottom** | `format_*` functions in the same order as their corresponding methods (`format_inventory_item` → `format_product` → `format_warehouse` → `format_order` → ...), then **any module-level helper functions last of all, after every `format_*`** (see "Helper placement" in Additional rules). |
+
+#### Class body sections, in order
+
+1. **Framework metadata defaults** (the install-modal contract surface): `test_account`, `support`, `docs`, `ui`. Order within the group varies across exemplars; pick one and be consistent within the file.
+2. **Framework install / identity defaults**: `get_integration_secret` → `me` → `safe_me` → `safe_integration_secret_keys` (when present) → `validate_integration_secret`. This is a fixed-shape group — keep `me` / `safe_me` here, not next to the request helper.
+3. **Per-integration request helper cluster**: any `<name>_auth` / login / token-refresh helpers (if applicable to this vendor's flow) → `<name>_request`. This cluster only exists when the integration has its own HTTP helper; SFTP/file-drop integrations have a transport-config method here instead (e.g., `sftp_config`).
+4. **Per-resource clusters**: each canonical resource gets its own cluster containing all of its methods — gets, writes, schemas, validators — adjacent. **Group by resource, never by action.** Cluster order (when multiple resources are present) follows the method order of the type's base integration class — `integrations/wms/WMSIntegration.py`, `cart/CartIntegration.py`, `carrier/CarrierIntegration.py`, `erp/ERPIntegration.py` — skipping any base-class resource the integration doesn't implement; read the base class, don't work from a remembered list. order_shipments ride the orders cluster. Within a cluster: **gets first, then each write immediately preceded by its schema** (and that write's custom-validation / ignore-fields hook, if any) — `get_<resource>s` (list) → `get_<resource>` (single) → resource-specific helper gets → `create_<resource>_schema` → `create_<resource>` → `update_<resource>_schema` → `update_<resource>` → `cancel_<resource>` / `delete_<resource>`. Keep each `*_schema` **directly above the write it parameterizes**; the schema and its method are read together, so pulling all schemas into a block at the cluster top breaks the grouping. Mirror at the bottom of the file: `format_*` functions appear in matching cluster order.
+
+   Rationale for inventory before products: inventory is the foundation — `format_inventory_item` populates `inventory_by_warehouse_id`, which the tier-2 `WMSIntegration.get_warehouses` base implementation walks to synthesize the warehouse list. Products are typically a derivative read (sku list often comes from inventory rows in single-warehouse / virtual-warehouse setups), so inventory landing first makes the dependency direction explicit in the file.
+
+   Anti-pattern: "all `get_*` first, then all `create_*`, then all `update_*`." This separates a resource's read-side and write-side logic by hundreds of lines and obscures the dependency. `shipbob` (`inventory` → `products` → `inbounds` → `orders` → `returns`) is the canonical exemplar for the new ordering; older integrations like `salesupply`, `deposco`, `mintsoft` use the older `products → inventory` ordering — leave them as-is unless touching that section of the file for another reason.
+
+Confirming exemplars (look at these for the convention, not as a copy target): `integrations/wms/salesupply/integration.py`, `integrations/wms/deposco/integration.py`, `integrations/wms/g-global/integration.py`, `integrations/wms/skulabs/integration.py`. All four place `me` / `safe_me` immediately after `get_integration_secret`, `<name>_request` after `validate_integration_secret`, and group methods by resource.
+
+#### Write schema field order — mirror the canonical schema
+
+When defining a `create_<resource>_schema` / `update_<resource>_schema` class body, **field declarations follow the order they appear in the canonical schema** at `pokedex/resources/<type>/<resource>.py`'s `create_*` / `update_*` method. The vendor's API ordering is irrelevant — the canonical order is the reader's reference frame, and write schemas that mirror it can be scanned the same way as the canonical schema they're parameterizing.
+
+Concretely, for WMS `create_order_schema`, the canonical order (from `resources/wms/orders.py:400-468`) is:
+
+```
+warehouse_id → reference_id → order_number → invoice_currency_code → total_price → ship_to_address → line_items
+```
+
+Integration-side `create_order_schema` declares its fields in that same order. Same applies to `create_inbound_shipment_schema`, `create_product_schema`, `update_*_schema`, etc. — read the canonical resource file to find the order, mirror it.
+
+What this rule rules out: declaring `line_items` first because that's what the vendor's POST body lists first; ordering by required-vs-optional; ordering by alphabetical / arbitrary author preference. All of these have shown up in initial drafts and required reordering commits.
+
+Reviewer enforcement:
+- Write schema field declaration order materially diverges from the canonical schema's `create_*` / `update_*` method order → `APPROVE_WITH_NOTES` with the recommended order. **`[BLOCK]` on new builds** if the deviation isn't documented (vendor genuinely requires a field that has no canonical analogue, etc.).
+- A write schema whose comment cites a vendor-side ordering reason (`# vendor requires this field first`) → confirm by reading the vendor's actual write contract; if the vendor's contract doesn't actually enforce ordering (just lists fields in some order), the comment is a misread and the canonical order should win.
+
+#### Write schema field types, validation kwargs, and cross-field checks
+
+Field order isn't the only thing the canonical schema dictates — **the field's type, the canonical method called, and the validation kwargs all come from the same source**. The write schema is the customer's API contract: anything wrong here ships a worse API than necessary, and anything missing here ships unhelpful errors that bounce back from the vendor.
+
+##### A. Use the canonical schema method that actually exists, with the right type
+
+For each field, the canonical resource file (`pokedex/resources/<type>/<resource>.py`) defines the method that wraps the field with its canonical docs, defaults, and validators. **Read the canonical file and use that method by name.** Don't invent variants (`Order().write_line(...)` when the canonical is `write_line_items_schema`), don't substitute a bare primitive (`String()`) when a canonical method exists, don't typo (`Order().total_priceee()`).
+
+The canonical method handles example values, descriptions, `allow_not_implemented` semantics, and any field-specific kwargs the integration shouldn't re-derive. Bare primitives (`String()`, `Integer()`, `Float()`, `Boolean()`, `DateTime()`, `List()`) are for fields the canonical resource doesn't expose a method for — vendor-specific write-only fields like `invoice_currency_code`, `external_id`, or vendor-specific tags. Even then, the primitive should carry the kwargs called out in (B).
+
+If a canonical method appears to be missing (`Order().some_field()` you'd expect exists but doesn't), **stop**. Two cases: (1) the field genuinely doesn't have a canonical method — declare with a primitive plus the right kwargs, document in `api-summary.md`. (2) The canonical method exists under a different name you didn't find — re-grep the resource file. Don't ship `Order().nonexistent_method(...)`; the schema will explode at runtime.
+
+##### B. Validation kwargs on every field with a known finite domain
+
+Marshmallow validators (`OneOf`, `Range`, `Length`, `Regexp`) are re-exported from `utils.schema`. Apply them on the field declaration any time the value has a known finite shape:
+
+| Field shape | Validator |
+|---|---|
+| ISO 4217 currency code | `validate=Length(equal=3)` or `validate=OneOf(["USD", "EUR", "GBP", ...])` if the vendor's accepted set is smaller |
+| ISO 3166 country code | `validate=Length(equal=2)` (alpha-2) or `validate=Regexp(r"^[A-Z]{2}$")` |
+| Status / type enum | `validate=OneOf([<allowed values>])` |
+| Quantity / count | `validate=Range(min=1)` (or `min=0` if zero is meaningful) |
+| Price / amount | `validate=Range(min=0)` |
+| Phone / postal code with vendor-specific shape | `validate=Regexp(r"<vendor's pattern>")` |
+| Length-bounded string | `validate=Length(min=..., max=...)` |
+
+These cost nothing and surface bad input before it leaves trackstar. Without them, the vendor returns whatever its API does with malformed input — often a 500 with no useful body, or worse, a 201 with a quietly-mangled record.
+
+The table above covers universal shapes (currency, country, quantity, price). **Vendor-specific bounds need provenance:** a limit the vendor's spec declares (`maxLength: 32`) is safe to encode; a limit inferred from doc prose or a single observed rejection is a second copy of a rule we don't own and drifts when the vendor changes it. Probe the API before encoding one — and isolate the field when probing, since many vendors short-circuit on the first failing field, so a multi-error probe proves nothing about the field you care about. When the vendor already rejects the value with a clear field-level error, let that error bubble instead of duplicating the rule client-side; validators earn their place when the vendor accepts garbage or errors unhelpfully.
+
+```python
+from utils.schema import (
+    String, Integer, Float, OneOf,
+    Range, Length, Regexp,
+    TrackstarWriteSchema, ValidationError, validates_schema,
+)
+
+invoice_currency_code = String(
+    "ISO 4217 currency code.",
+    "USD",
+    required=True,
+    validate=OneOf(["USD", "EUR", "GBP", "CAD", "AUD"]),
+)
+quantity = Integer(required=True, validate=Range(min=1))
+unit_price = Float(required=False, validate=Range(min=0))
+country = String(required=True, validate=Length(equal=2))
+```
+
+Canonical-exemplar pattern: `integrations/wms/deposco/integration.py:1543, 1548` uses `validate=[OneOf([...])]` on type / freight-terms enums. Look there for shape; copy the pattern.
+
+##### C. `@validates_schema` for cross-field invariants and silent-acceptance vendors
+
+When validity depends on **multiple fields** or the vendor's API silently accepts garbage (the worst case — the record is created mangled and the customer doesn't see the failure), use the `@validates_schema` decorator on a method inside the schema class. The decorator runs after per-field validation and gets the whole `data` dict; raise `ValidationError(message, field_name="path.to.field")` to reject.
+
+Triggers — add `@validates_schema` when **any** of these hold:
+
+1. **Vendor silently accepts bad input.** API returns 201 with a malformed record. The integration's responsibility is to reject before the request leaves; the vendor won't.
+2. **Vendor returns unhelpful errors.** A 400 with body `"Invalid request"` and no field detail. Customers debugging this from trackstar's side can't tell which field is wrong. Pre-validation surfaces the real cause.
+3. **Cross-field invariants** the customer can violate by combining valid-individually fields. The recurring shapes:
+   - Address requires `state` when `country` is `US` / `USA` / `CA` / `MX` (state-bearing countries) — exemplar: `deposco/integration.py:1595-1612`
+   - Conditional required: `warehouse_customer_id` required only when connection is a 3PL multi-business-unit setup — exemplar: `deposco/integration.py:1582-1594`
+   - Per-list-item shape: each `line_item` must have `sku` OR `inventory_item_id` — exemplar: `deposco/integration.py:2236-2243`
+   - `total_price` must equal `sum(line.unit_price * line.quantity) + shipping_price + tax`, or some equivalent invariant
+4. **Format-shape fields** a single-field `validate=Regexp` can't capture (e.g., country-state pairs from a closed set).
+
+Canonical shape:
+
+```python
+@validates_schema
+def validate_state_for_us(self, data, **kwargs):
+    ship_to = data.get("ship_to_address", {})
+    if ship_to.get("country", "").upper() in ("US", "USA", "UNITED STATES"):
+        if not ship_to.get("state"):
+            raise ValidationError(
+                "state is required for US addresses",
+                field_name="ship_to_address.state",
+            )
+
+@validates_schema
+def validate_line_item_skus(self, data, **kwargs):
+    for line in data.get("line_items", []):
+        if not line.get("sku") and not line.get("inventory_item_id"):
+            raise ValidationError(
+                "Each line item must have either `sku` or `inventory_item_id`"
+            )
+```
+
+Method-naming convention: `validate_<what_is_being_validated>` (`validate_state_for_us`, `validate_line_item_skus`, `validate_warehouse_customer_id`). Not `validate_1` / `validate_order`; the name should make the failure mode searchable when the error fires in production.
+
+What `@validates_schema` is NOT for: complex business-logic transformations, vendor-specific reshaping, or anything that mutates `data`. The decorator's job is **reject or pass through**. Body transformations live in the `create_*` / `update_*` method per "Write methods inline body construction by default."
+
+##### Reviewer enforcement
+
+- Write schema field uses an invented / typo'd canonical method (`Order().write_line(...)` when the canonical is `write_line_items_schema`; `Order().total_priceee()`) → `[BLOCK]`. The canonical schema file is the source of truth; using a wrong name is a sign the writer didn't read it.
+- Bare `String()` / `Integer()` / `Float()` used for a field that has a canonical method (`Order().total_price()`, `Order().reference_id()`, etc.) → `APPROVE_WITH_NOTES`. Canonical methods carry docs, defaults, and field-specific kwargs the bare primitive drops.
+- A finite-domain field (currency code, country code, status enum, quantity, price) declared without the corresponding `validate=OneOf` / `validate=Length` / `validate=Regexp` / `validate=Range` → `APPROVE_WITH_NOTES`. Pre-validation is cheap; running without it means bad input reaches the vendor.
+- A validator encoding a vendor-specific bound with no spec citation or probe evidence in `api-summary.md` → `APPROVE_WITH_NOTES` asking for provenance or removal. Bounds we don't own drift; the vendor's own clean field-level error is the better contract.
+- A write method whose `api-summary.md` "Field-mapping decisions" or "Write probe" notes document silent-acceptance or unhelpful-error behavior AND the schema has NO pre-validation covering the relevant invariant → `APPROVE_WITH_NOTES` recommending the writer consider a check. **Always advisory, never `[BLOCK]`.** `@validates_schema` isn't the only valid response: a single-field `validate=Regexp` may cover it, the vendor's error may be acceptable for this specific field even when it's bad elsewhere, or the right move may be to escalate to the vendor to improve their error rather than mask it in our code. The reviewer flags the gap; the writer judges the response.
+- A `@validates_schema` method that mutates `data`, runs vendor request side effects, or performs the body transformation that belongs in `create_*` → `[BLOCK]`. Validation is reject-or-pass; transformation goes elsewhere.
+- `@validates_schema` method named generically (`validate_order`, `validate_data`, `validate_1`) → `APPROVE_WITH_NOTES` asking for a name that describes the specific invariant.
+
+#### Write methods inline body construction by default
+
+Read-side `format_*` functions are extracted as module-level helpers because the same shape feeds multiple call sites — `get_<resource>s` (list), `get_<resource>` (single fetch), enrichment loops, post-write fetch-back. Reuse is the reason to extract.
+
+**Write-side body construction has no such reuse.** The code that builds the vendor's request body from the canonical `data` / `request_body` is called from exactly one place: the matching `create_<resource>` / `update_<resource>` / `cancel_<resource>` method. Extracting it into a module-level helper like `format_write_<resource>` / `format_create_<resource>` / `format_update_<resource>` adds a function-call hop and a file-bottom-jump for the reader without buying any reuse.
+
+**Default: inline the body construction directly in the write method.** The transformation lives next to the `self.<name>_request(...)` call that consumes it, which is what the reader is tracing anyway.
+
+```python
+def create_order(self, data):
+    company_id = self.integration_secret["company_id"]
+    line_items = []
+    for li in data["line_items"]:
+        line_items.append({"sku": li["sku"], "quantity": li["quantity"]})
+    req_body = {
+        "name": data["order_number"],
+        "currency": data["invoice_currency_code"],
+        "total": data["total_price"],
+        "ship_to": data["ship_to_address"],
+        "items": line_items,
+    }
+    self.<name>_request(f"/{company_id}/orders", method="POST", json={"order": req_body}, should_log_body=True)
+    ...
+```
+
+Not:
+
+```python
+def create_order(self, data):
+    company_id = self.integration_secret["company_id"]
+    req_body = format_write_order(data)              # one-call-site helper at file bottom
+    self.<name>_request(...)
+
+# 200 lines later, at the bottom of the file:
+def format_write_order(data):
+    ...
+```
+
+**Threshold: ~100 lines.** If the inlined body construction would exceed roughly 100 lines (genuinely complex transformation — nested SOAP envelope assembly, multi-table flattening, conditional branching across order types), extracting to a module-level helper is the readability win. Below that threshold, inline.
+
+Reviewer enforcement:
+- A `format_write_<resource>` / `format_create_<resource>` / `format_update_<resource>` / `format_cancel_<resource>` module-level helper used by exactly one caller AND whose body is ≤100 lines → `APPROVE_WITH_NOTES` recommending inline. Not a `[BLOCK]` — the code works; this is a readability refinement.
+- Same helper above the 100-line threshold (genuinely large transformation) → no flag; the extraction earns its keep.
+- A `format_write_<resource>` helper that has **multiple call sites** (e.g., shared between `create_order` and a `bulk_create_orders` method) → no flag. The reuse rule still applies; it just rarely shows up on the write side.
+
+This rule does NOT apply to read-side `format_<resource>` — those are extracted by default per "Format functions are module-level free functions by default" in the Additional rules below. The asymmetry is intentional: read-side has reuse, write-side doesn't.
+
+#### Implementation order — implement a resource's writes alongside its reads
+
+Within a resource cluster, **read and write spec study happens together, not sequentially**. The vendor's write contract (`POST /orders`, `Orders_Create`, etc.) often disambiguates fields that the read response leaves ambiguous — a `total` field that could be tax-inclusive vs. exclusive, an `id` vs. `number` ambiguity, a `status` enum whose meaning isn't documented in the read spec but *is* in the write spec because the write requires you to pass a specific value. Implementing `get_orders` in isolation, deferring the write spec until later, repeatedly produces read-side field choices that get reversed once the writer reads the create contract.
+
+How to apply it:
+
+- When starting a new resource cluster, read **both** the read spec section AND the write spec section in `api-summary.md` (and the underlying vendor docs) before implementing `format_<resource>`. The two together produce the field-mapping. Record any disambiguation finding in `api-summary.md` "Field-mapping decisions" — e.g., *"Orders_Create requires `subtotal` (pre-discount, pre-tax). So the read-side `total` must be the post-discount, post-tax value."*
+- If the connection is **writes-safe** (per `test_account()` / `allow_writes()`): run a write probe — `yarn crawl` a small `create_order` against the sandbox — to observe how the vendor echoes back the fields you sent. The echo often reveals canonical field names you wouldn't see from reads alone. Document the probe with date + request body + response body in `api-summary.md`.
+- If the connection is **writes-unsafe** (prod-as-test or customer-owned account with `allow_writes(): return False`): rely on the vendor's write spec / OpenAPI docs only. Don't probe. Note the limitation in `api-summary.md` Field-mapping decisions for any field where the write spec was the only signal: *"discount_amount mapping inferred from Orders_Create spec; not verified via probe (writes-unsafe sandbox)."*
+- The reading-both-specs step happens **before** the writer commits to a `format_<resource>` shape. Reversing direction — implementing reads first, shipping, then circling back when the write contract reveals a conflict — wastes the per-function reviewer loop and forces a follow-up edit.
+
+#### Additional rules
+
+- **Format functions are module-level free functions by default.** Define on the class only when the body actually reads `self.X` (e.g., `self.connection_id`, `self.integration_secret`). Method-on-class without `self` usage is dead encapsulation — hoist it. **Advisory in new code.**
+- **URL paths declared inline at the request call site.** Write `self.<name>_request("/orders", method="GET", params=...)`, not `ORDERS_PATH = "/orders"` at file top followed by `self.<name>_request(ORDERS_PATH, ...)`. Paths are usage-specific; abstracting them adds indirection without reuse. **Advisory in new code.**
+- **Constants live at the narrowest scope that holds all their callers.** Three placements, applied based on usage:
+  - **Used by exactly one function** → inside the function body, as the first thing before any logic. This is the default for status maps, type maps, label dicts, lookup tables that one `format_*` consumes. Hoisting them above the function is dead reach.
+  - **Used by 2+ functions for the same resource** → directly above the first `format_*` that consumes them, below the class.
+  - **Used across resources** → module-level at file top (base URL, api version, page-size defaults, anything the integration class itself references).
+  - The "above the class" placement is for the middle case only. **A single-caller `STATUS_MAP` at module scope is a `[BLOCK]`** — narrow it to function scope.
+- **Request-helper cluster stays together, in the class.** `<name>_auth` / login / token-refresh / signing helpers live directly with `<name>_request` as **class methods** — even when they don't read `self`. This is the one documented exception to "hoist stateless helpers to module level": auth stays together, in the class, around the request helper. Don't intermix them with the framework install/identity defaults (a separate cluster above), and don't drop them to module level below the class.
+- **Helper placement — cluster by use site.** A class-level helper used by one data method sits **directly above that method** (e.g. a custom `get_inbound_shipment_by_id` above `get_inbound_shipments`). A helper used by several sits directly above the **first** method that calls it. Don't park helpers at the bottom of the class or far from their caller.
+- **Module-level helpers come after the formats, and only when shared.** Inline a one-off transform at its call site; extract a module-level helper only once it is genuinely used in **2+ places**. When extracted, it lives at the very bottom of the file, **after every `format_*` function** — never before or interleaved with them. (`format_*` are themselves module-level by the rule above; the order at file bottom is formats first, then any other helpers.)
+- **No raise-only method stubs for unsupported flows.** An integration never ships a data or write method whose body only raises. Omit the method entirely — the framework's `is_implemented` treats an absent method and a raise-only body identically, so the stub is dead lines that read as intent. When the vendor's API does support the flow, implement it rather than stubbing it.
+
+#### Reviewer enforcement (new builds + new functions only — skip on existing-function edits)
+
+- `me` / `safe_me` placed after `<name>_request` instead of with `get_integration_secret` → `APPROVE_WITH_NOTES`. They are framework-default identity methods, not implementation details of the request helper.
+- Class body section ordering deviates from the four-section sequence above → `APPROVE_WITH_NOTES` with the recommended order.
+- **Methods grouped by action instead of resource** (all `get_*` methods together followed by all `create_*` together) → `[BLOCK]` on new builds. The exemplars are uniform on this; the canonical shape is each resource's gets and writes adjacent. Pre-existing integrations with action-grouped layouts are grandfathered — don't refactor.
+- `format_*` placed above the class definition (rather than at file bottom) → `APPROVE_WITH_NOTES`.
+- `format_*` order at file bottom doesn't mirror the resource-cluster order in the class → `APPROVE_WITH_NOTES`. `format_order` should appear in the same relative position at the bottom as the order cluster does in the class.
+- `format_*` defined on the class without using `self` → `APPROVE_WITH_NOTES` (hoist to module-level).
+- URL paths extracted as module-level constants → `APPROVE_WITH_NOTES`.
+- **Single-caller constant defined at module / class scope instead of inside its caller → `[BLOCK]`.** Status maps, type maps, label dicts, and lookup tables consumed by exactly one function belong in that function. Check by grepping for the constant name — if there's one caller, it's a BLOCK; the narrower scope is the right one. (Two-or-more-caller constants stay above the function per the placement rule.)
+- Multi-resource-shared constant placed above one function's `format_*` instead of at module scope → `APPROVE_WITH_NOTES`.
+- `<name>_auth` / login / token-refresh helpers placed away from `<name>_request` (e.g., at the bottom of the class, or up with the framework defaults) → `APPROVE_WITH_NOTES`.
+- An auth helper defined at **module level** (below the class) instead of as a class method in the request-helper cluster → `[BLOCK]` on new builds. Auth helpers stay in the class.
+- A `*_schema` not placed **directly above the write it parameterizes** (all schemas grouped at the cluster top, or a schema separated from its `create_*` / `update_*` by the gets) → `[BLOCK]` on new builds. Pair each schema with its write.
+- A class-level helper parked away from its caller (bottom of the class, or well above the first method that uses it) → `APPROVE_WITH_NOTES`.
+- A module-level helper defined **before or among** the `format_*` functions → `APPROVE_WITH_NOTES` (move it below every format).
+- A stateless transform extracted to a module-level helper with **exactly one caller** → `APPROVE_WITH_NOTES` (inline it; extract only at 2+ callers).
+- A raise-only method stub for an unsupported flow left in `integration.py` → `[BLOCK]` on new builds (omit the method, or implement the flow when the vendor supports it).
+- **Field-mapping decision recorded for a resource without consulting the vendor's write spec for that resource** (when a write spec exists — vendor documents `create_<resource>` / `POST /<resource>`) → `APPROVE_WITH_NOTES` requesting the writer cross-reference write spec to confirm ambiguous reads. `[BLOCK]` if a `Field-mapping decisions` entry shows the writer chose a non-obvious read-side mapping AND the vendor's write spec contradicts it.
+
+### Test files
+
+- Integration `<name>_test.py` files contain **only** the live `TestX` class.
+- No module-level pytest unit tests. No standalone `def test_*` functions outside the class.
+- **No `pytest.fail("Not implemented")` stubs left in the file.** Scaffolder generates these as placeholders; you must replace them before declaring done. If the source genuinely doesn't have the concept (e.g., a single-warehouse-per-API-key integration with no `get_warehouses` source), use `pytest.skip("source lacks {concept}; relies on base implementation")` with the reason — don't leave a `fail` stub.
+- **No no-op `super()` overrides** — adding `def get_orders(self, ...): return super().get_orders(...)` is dead weight that can subtly change semantics (e.g., `page_token` propagation). Override only when changing behavior.
+
+#### Write tests
+
+Write tests don't get their own `def test_create_*` methods on the test class — `base_test.py`'s `WMSTest` / `CartTest` provide them via `test_write_*` methods that call `write_and_validate` (`base_test.py:661`). The only thing an integration test file customizes is the **body** the framework submits to `create_*` / `update_*` / `cancel_*`. That customization happens by overriding the `full_<resource>` builders.
+
+**Canonical override pattern** (from `test/integrations/wms/salesupply_test.py:203-209`):
+
+```python
+def full_order(self, update, context):
+    full_body = super().full_order(update, context)
+    full_body["order_number"] = str(uuid.uuid4())          # idempotency key — must be unique per run
+    full_body["shop_id"] = "325"                            # sandbox-specific id
+    full_body["line_items"][0]["sku"] = "test2code"         # use a SKU that exists in the sandbox
+    full_body["channel_object"] = {"channel_name": "..."}  # vendor-required field
+    return full_body
+```
+
+Three things `full_<resource>` does:
+
+1. **Inject sandbox-specific IDs** (`warehouse_id`, `shop_id`, `channel_id`, `sku`) — the default body uses generic placeholders the vendor's sandbox doesn't recognize.
+2. **Randomize idempotency-keyed fields** — `order_number`, `purchase_order_number`, external_reference. Set them to `uuid4()` so re-running the test in the same sandbox doesn't collide with the previous run's record. Vendor uniqueness errors on re-run are a sign you forgot this.
+3. **Set vendor-required fields** that the default base body leaves blank or sets to a generic placeholder (e.g., `channel_object` for Salesupply must point at a real sandbox channel; vendor-specific tags) and remove canonical fields the vendor rejects.
+
+What goes in `full_<resource>` vs. `create_<resource>_schema` vs. the format function:
+
+| Concern | Lives in |
+|---|---|
+| What fields the customer can pass on a write request | `create_<resource>_schema` (integration class) |
+| Vendor-specific shape transformation of those fields before they hit the vendor | `create_<resource>` method (integration class) |
+| Test-time values that exist in the sandbox so write tests can actually run | `full_<resource>` override (test class) |
+
+**Writes-unsafe connections** override `allow_writes(self): return False`. The framework's `write_and_validate` skips with `"Writes not allowed for this test account"` (per the "Write safety" section above). Once `allow_writes()` is `False`, the `full_<resource>` override is dead — runtime never reaches it. **Keep the override anyway** if you've implemented one for documentation / for when a writes-safe account becomes available; don't delete it just because the current connection skips.
+
+Reviewer enforcement:
+- A `<name>_test.py` whose connection is writes-safe but does NOT override `full_<resource>` for an implemented `create_<resource>` method → `APPROVE_WITH_NOTES`. The default body almost never matches the sandbox; write tests likely fail or pollute the sandbox with garbage data.
+- A `<name>_test.py` that adds a standalone `def test_create_order(...)` method instead of overriding `full_order` → `[BLOCK]`. The framework already runs the write test; the custom method either duplicates it (clutter) or silently replaces it (coverage loss).
+- A `full_<resource>` override that doesn't randomize idempotency-keyed fields (`order_number`, `purchase_order_number`, `external_reference` set to a literal) → `APPROVE_WITH_NOTES`. Re-runs will collide.
+- A `<name>_test.py` whose `test_account()` is writes-unsafe but doesn't override `allow_writes(): return False` → `[BLOCK]` (already covered under Write safety; restated here because it's a write-test surface).
+
+### Auth bundle
+
+`validate_integration_secret`'s purpose is to surface bad credentials *during* `yarn install-integration`. The install path as a whole must perform a live authenticated round-trip against the vendor — but **where** the round-trip happens is a design choice with a clear preferred shape.
+
+#### Preferred shape (when there's a token exchange)
+
+If the vendor's auth is OAuth2 client_credentials, JWT-from-creds exchange, signed-cred-for-session, or any other flow where the install-form credentials are exchanged for a derived token before they can be used:
+
+- **Do the exchange inside `get_integration_secret`** so the persisted secret already contains the access token: `return {"client_id": ..., "client_secret": ..., "access_token": <token>}`.
+- **Set `validate_integration_secret` to `pass`** with a comment: `# auth verified during get_integration_secret token exchange`.
+- The `<name>_request` helper detects token expiry / 401 mid-crawl and refreshes by calling the **same** login / exchange helper that `get_integration_secret` used — never a second, inline copy of the exchange. See "Auth-bundle DRYness" below.
+
+This shape:
+- Verifies auth once, at install time, with no redundant call.
+- Caches the access token from the start so the first crawl doesn't pay the exchange cost.
+- Keeps all auth code in one place (`get_integration_secret` + the exchange helper it calls).
+
+The anti-pattern is **deferring the exchange** — making `get_integration_secret` a passthrough, then having `validate_integration_secret` make a real API call (which itself triggers a lazy token fetch in `<name>_request`). It works, but it splits auth across three places and forces every install attempt to do two round-trips.
+
+#### Required-pass alternative (when creds are static)
+
+If the install-form credentials are already a usable static API key (no exchange — e.g., a permanent API key passed as a header, Basic Auth with vendor-provided username/password):
+
+- `get_integration_secret` is a passthrough or local transform (base64 the cred, pack into the expected dict shape, etc.) — no vendor call.
+- `validate_integration_secret` MUST make an authenticated call. Minimum viable: hit any cheap authenticated endpoint (`/v1/account`, `/v1/me`, the lightest GET on a real resource); 401 → `create_invalid_credentials_exception`, 403 → `create_permissions_exception(path)` recorded in `api_call_errors`; return on success. The most common shape is to route through `<name>_request` so the split is centralized there; see "Request helper error handling" below.
+
+#### Reviewer enforcement
+
+The reviewer checks **whether the install path as a whole exercises authentication**, not whether `validate_integration_secret` literally contains an API call.
+
+- `pass` body in `validate_integration_secret` without a justifying comment → `[BLOCK]`.
+- `pass` body when `get_integration_secret` doesn't authenticate → `[BLOCK]`.
+- **Passthrough `get_integration_secret` AND non-`pass` `validate_integration_secret` for a vendor whose auth flow is documented as a token exchange** → `APPROVE_WITH_NOTES` flagging the inverted shape. The code works but should be refactored to do the exchange in `get_integration_secret`.
+
+### Request helper error handling
+
+The `<name>_request` helper that every method calls has a single canonical structure for branching on errors. The throttle-handling part is **conditional** on whether the vendor actually throttles — don't add it speculatively.
+
+#### Helper signature and session
+
+The helper's signature accepts `**kwargs` that flow through to `session.request()`:
+
+```python
+def <name>_request(self, path, method="GET", **kwargs):
+    session = get_request_session()
+    ...
+    response = session.request(method, url, headers=headers, **kwargs)
+```
+
+- **Use `get_request_session()`** — the canonical session factory (handles retries, default timeouts, instrumentation). Never `requests.Session()` directly.
+- **`**kwargs` accommodates per-call needs** (params, json body, files, custom timeouts) without growing the helper's positional surface. Callers pass `params=...`, `json=...`, etc. directly.
+- **Headers** stay an explicit parameter (the helper builds auth headers internally and may merge caller-provided headers).
+
+Reviewer: helper missing `**kwargs` passthrough → `BLOCK`. Raw `requests.Session()` instantiation instead of `get_request_session()` → `BLOCK`.
+
+#### Default shape (no observed/documented throttling)
+
+Canonical exemplar: `integrations/wms/salesupply/integration.py:75-98`.
+
+```python
+def <name>_request(self, path, ...):
+    session = get_request_session()
+    response = session.request(method, url, headers=headers, ...)
+    if not response.ok:
+        if response.status_code == 401:
+            raise self.create_invalid_credentials_exception()
+        if response.status_code == 403:
+            err = self.create_permissions_exception(path)
+            self.api_call_errors[path] = err
+            raise err
+        # vendor-specific status branches go here, e.g.:
+        # if response.status_code == 422 and "X" in response.text:
+        #     raise self.create_permissions_exception(...)
+        raise PokedexException(response.text, response.status_code, origin="integration")
+    self.api_call_errors[path] = None
+    return response.json()
+```
+
+This is the right shape for any vendor whose spec doesn't document a 429 / rate limit and whose live validation didn't observe one. Most integrations land here.
+
+**401 and 403 are not the same error.** 401 means the creds are bad (auth failed entirely) and the whole connection is broken — `create_invalid_credentials_exception` raises that connection-wide. 403 means the creds authenticated but the customer's scope / plan / role lacks permission for *this specific URL* — other endpoints on the same connection are still valid. Treating both as `InvalidCredentialsException` collapses a per-URL permission gap into a "your whole connection is dead" notification, which is misleading and pages the customer for the wrong remediation (re-auth vs. grant scope). See `Permission-error tracking` below for the mechanics.
+
+**The status code is not the only credential signal.** A vendor can report revoked or spent credentials without a 401: an OAuth token refresh returning `invalid_grant`, a vendor SDK raising its own typed auth exception, an error-body code meaning the grant was revoked. Any signal that means "these credentials can never work again without customer action" raises `create_invalid_credentials_exception`, exactly like a 401 — a generic `PokedexException` there leaves the connection failing crawl after crawl with no reconnect prompt to the customer. When two integrations share a vendor family or SDK (e.g. the same marketplace's cart and WMS surfaces), their credential-error handling must match — check the sibling before writing a new shape.
+
+#### Throttle-aware shape (only when 429 is documented or observed)
+
+Add the `@retry` decorator + `ThrottleException` branch **only** if:
+- The vendor's spec / docs explicitly document a rate limit and a 429 response shape, OR
+- The api-validator observed 429 (or another vendor-specific throttle signal) during live validation.
+
+The api-summary's "Rate limit" line under "API Characteristics" is the source of truth — it should record what was documented, what was observed, and the recommended retry-after seconds. If both fields are unknown, omit the throttle handling and use the default shape above. If a future crawl turns up a 429 in production, that's the trigger to add it.
+
+Canonical exemplar: `integrations/wms/deposco/integration.py:147-212`.
+
+```python
+def <name>_request(self, path, ..., throttle_sleep_time=60):
+    @retry(2, "<VendorName>")
+    def _request(method, url, headers, throttle_sleep_time, ...):
+        session = get_request_session()
+        response = session.request(method, url, headers=headers, ...)
+        if not response.ok:
+            if response.status_code == 401:
+                raise self.create_invalid_credentials_exception()
+            if response.status_code == 403:
+                err = self.create_permissions_exception(path)
+                self.api_call_errors[path] = err
+                raise err
+            if response.status_code == 429 or <observed throttle signal>:
+                raise ThrottleException("<VendorName>", throttle_sleep_time)
+            raise PokedexException(response.text, response.status_code, origin="integration")
+        self.api_call_errors[path] = None
+        return response.json()
+    return _request(method, url, headers, throttle_sleep_time, ...)
+```
+
+#### Rules (apply to both shapes)
+
+- **Error branches go inside a single `if not response.ok:` block**, not as separate top-level `if response.status_code == X:` checks scattered through the function. Top-level checks risk falling through to `return response.json()` on an error response.
+- **General fallthrough** = `raise PokedexException(response.text, response.status_code, origin="integration")`. Never `pass`, never `continue`, never a bare `Exception`.
+- **`ThrottleException` is only valid inside an `@retry`-wrapped function.** Raising it from a function without the decorator = unhandled crawl failure on every 429. So either both the decorator and the exception are present, or neither. Same for `RetryException` (`ThrottleException` subclasses it).
+- **`ThrottleException` only for a real rate limit; `RetryException` for everything else worth another attempt.** `@retry` catches both, so they retry identically. What differs is what the failure is called once the retries run out: a `ThrottleException` says the vendor rate limited us, so it reports 429, gets the integration name parsed out of its message, and the crawler logs it as a warning rather than an error. Use it only where the vendor actually said we were over a limit (429, a documented throttle code, a `Retry-After`). A transient 5xx, a gateway timeout, a dropped connection, an expired page token, a deadlock: `RetryException("<plain message>", <seconds>)`, which keeps the message and surfaces as a real error if it never succeeds. Add the vendor's status as a third argument (`RetryException(msg, 5, response.status_code)`) when they really sent a 5xx, so the log says 504 or 520 rather than the 503 default; leave it off for a 4xx, a 200 carrying an error body, or a failure with no response at all, since repeating those blames us for a vendor-side blip. A mixed branch (`429 or >= 500`) splits into one of each.
+- **401 → `create_invalid_credentials_exception`, 403 → `create_permissions_exception(path)` recorded in `api_call_errors`.** Both shapes above show the split. The two exceptions surface to the customer differently and the framework's connection-error tracking depends on the split — see `Permission-error tracking` below.
+
+#### Reviewer enforcement (request shape)
+
+- `<name>_request` raises `ThrottleException` (or `RetryException`) without `@retry` on the wrapping function → `[BLOCK]`. The retry won't happen; every 429 will fail the crawl.
+- `ThrottleException` raised on something that isn't a rate limit (a 5xx, a timeout, a dropped connection, an expired token) → `[BLOCK]`. It mislabels the failure as a vendor rate limit; use `RetryException` with a message saying what actually went wrong.
+- `@retry` decorator + `ThrottleException` branch added without supporting evidence in `api-summary.md` "Rate limit" line (no documented 429, no observed 429 during validation) → `APPROVE_WITH_NOTES` flagging speculative throttle handling. The code isn't wrong, but the complexity isn't earned.
+- Error branches structured as multiple top-level `if response.status_code == X:` checks instead of nested under `if not response.ok:` → `APPROVE_WITH_NOTES`. Older integrations diverge; new code should match the canonical structure.
+- `if not response.ok:` block missing the general fallthrough `raise PokedexException(...)` → `[BLOCK]`. Some non-2xx responses will silently return an error body as if it were data.
+
+#### Auth-bundle DRYness — one exchange, one error layer
+
+The auth bundle (`get_integration_secret`, the in-crawl re-login / token-refresh helper, and `<name>_request`) is the part of an integration most prone to copy-paste, because the *same* credential exchange runs at two moments — once at install, once mid-crawl on a 401 — and because a vendor with more than one transport (GraphQL + REST, two API hosts) tempts a second request helper that drags a second copy of the error handling along with it. The single-helper shapes above don't address either case; this does. Keep the bundle DRY:
+
+- **One credential-exchange helper, called from both sites.** The sign-in / token-exchange request (URL build, body shape, success check, `create_invalid_credentials_exception` on failure) lives in a single helper (e.g. `<name>_login`). `get_integration_secret` calls it to populate the secret at install; the request helper's 401 path calls the *same* helper to refresh and persist via `update_integration_secret`. Do **not** inline the exchange in `get_integration_secret` and again in the refresh helper — that's two copies of the auth contract that drift independently. (The "Preferred shape" section above is the install-side half of this; this is the same rule extended to the refresh path.)
+- **One error / refresh layer, shared across transports.** When a vendor needs more than one transport (a GraphQL helper and a REST helper, say), they share the *same* auth header and the *same* 401/403/refresh behavior — so that behavior is factored once, not cloned into each. Acceptable: a single `<name>_request` both call through (differing only in path/body/`Accept`), or a thin auth-header-plus-error helper the transport-specific wrappers delegate to. Not acceptable: two helpers that each carry a full copy of the `if 401 → re-login → retry → if 403 …` ladder.
+- **Use `@retry` for the retry; never hand-roll it.** The refresh-and-retry is the `@retry(n, "<Vendor>")` decorator wrapping the inner request (throttle-aware shape above), with the 401 branch refreshing the token in place and re-raising so the decorator re-runs the closure. Manually rebuilding a second session and re-issuing the request inline (`session2 = get_request_session(); response = session2.request(...)`) duplicates both the call site and the error ladder, and nests the handling 3–4 levels deep. One decorated closure, one error block.
+
+##### Reviewer enforcement (auth-bundle DRYness)
+
+- The credential exchange (sign-in / token request) implemented in full in BOTH `get_integration_secret` and the re-login / refresh helper → `[BLOCK]`. Factor one login helper and call it from both.
+- A second `<name>_request`-style helper that carries its own full copy of the 401/403/refresh ladder rather than sharing one error layer → `[BLOCK]`. Multiple transports are fine; cloned error handling is not.
+- A 401 path that hand-rolls retry (new session + inline re-request) instead of refreshing in place under `@retry` → `APPROVE_WITH_NOTES` flagging the duplicated call site; `[BLOCK]` if that inline copy also re-duplicates the 401/403 branches.
+
+#### Permission-error tracking — `api_call_errors`
+
+The `api_call_errors` dict on every integration (`BaseIntegration.__init__` initializes it to `{}`) is the bridge between a `PermissionsException` raised inside `<name>_request` and the connection-error surface that customers see in the dashboard / receive notifications about. `utils.celery.handle_api_call_errors` reads it after every crawl and persists / clears `ConnectionsError` rows accordingly.
+
+Two writes per call site, both required:
+
+```python
+# failure path (inside the 403 branch):
+err = self.create_permissions_exception(path)
+self.api_call_errors[path] = err   # record the error
+raise err
+
+# success path (after `if not response.ok:` block):
+self.api_call_errors[path] = None  # signal success
+return response.json()
+```
+
+**Why both writes matter:**
+
+- **Record on failure** — `handle_api_call_errors` iterates `api_call_errors.values()`. If a `PermissionsException` is raised but never written to the dict, the post-crawl handler logs `"error {exc} not in api_call_errors"` and the per-URL connection-error row never gets created. The customer sees no notification, no dashboard entry — just a silently failing endpoint.
+- **Clear on success** — `handle_api_call_errors` clears existing `ConnectionsError` rows for any URL where `api_call_errors[url] is None`. Without the success-path write, **stale connection errors stick forever** — the customer fixes their permissions in the vendor's UI, the next crawl succeeds, and the dashboard still shows a red error from yesterday. This is the bug shape the doctrine update specifically prevents.
+
+**The `path` key is per-URL, not per-resource.** Different endpoints (`/orders`, `/products/inventory`) carry independent permission states; a 403 on `/orders` doesn't break `/products`. Use the request path (or a stable derivative — `path?query_param` is fine if the helper varies the URL with query params) so each endpoint can independently track its own state.
+
+Canonical exemplars:
+- `wms/veeqo/integration.py:74-96` — minimal shape (`api_call_errors[path] = err` on 403, `= None` on success).
+- `wms/mintsoft/integration.py:95-110` — same split, with 401 → `create_invalid_credentials_exception` branched first.
+- `wms/shipstation/integration.py:73-176` — multiple permission signals (401-with-billing-text, 402, 403-after-JSON-error-decode); every branch records into `api_call_errors[path]`; helper-tail clear on success.
+- `wms/salesupply/integration.py:79-103` — text-based permission detection (`"SecurityException"` / `"Access Denied"`) when the vendor returns a 200/4xx with permission info in the body instead of a clean 403.
+
+**Vendor variants that aren't a literal 403** still use the same shape. The trigger is "permission missing for this URL" — whether the signal is HTTP 403, HTTP 402 (payment required → billing tier doesn't include this), a JSON `errors[].message == "Access denied."` inside a 401, or text like `"AuthorizationException"` in the body. Detect the signal, then run the same record-and-raise.
+
+**Under the permission validator, one call per endpoint is proof of access.** Its gets run under a short time limit, so a `get_*` that walks a catalogue or makes a detail call per record branches on `self.in_perm_validator()` and requests a page size of 1: inline, no constant, no comment. A bigger "safe" page brings the timeout back as the account grows.
+
+**The validator only runs for an integration that raises a `PermissionsException`.** `BaseIntegration.raises_permissions_exceptions()` scans the class source for a `self.create_permissions_exception(...)` call, and the install path only enqueues the validation job when that returns true. The shared live test applies the same gate: `get_with_perm_validator` (`test/integrations/base_test.py`) skips when `not resource.integration.raises_permissions_exceptions()`, so the test suite doesn't drive `in_perm_validator()` for such an integration either. So a `get_*` that joins stored rows (`Resource(self).get_all_resources()` / `get_resource()` / `batch_get_resources()`, which raise `PermValidatorQueryException` when `in_perm_validator()` is true) needs the `if not self.in_perm_validator():` guard around that lookup **only** when the integration raises a permission exception somewhere. An integration that never does never enters the validator in production or in tests, so the guard is dead code there — don't require it.
+
+##### Reviewer enforcement (permission tracking)
+
+- 403 (or vendor-equivalent permission signal) raises `create_invalid_credentials_exception` instead of `create_permissions_exception(path)` → `[BLOCK]`. The customer gets a "creds are bad" notification when the right remediation is "grant scope to this URL."
+- 403 branch calls `create_permissions_exception` but doesn't record into `self.api_call_errors[path]` before raising → `[BLOCK]`. The post-crawl handler logs "error not in api_call_errors" and the customer never sees the connection-error row.
+- Request helper raises a `PermissionsException` but doesn't set `self.api_call_errors[path] = None` on the success path → `[BLOCK]`. Stale connection errors will never clear when the customer fixes scope vendor-side.
+- 401 and 403 collapsed into a single `if response.status_code in [401, 403]:` branch → `[BLOCK]`. The two exceptions are intentionally distinct; older integrations that did this are grandfathered, but any new code matching this pattern flags. Acceptable variant: branch on 401 first, then 403 — or wrap both in a single `if not response.ok:` block with separate inner branches.
+- Vendor returns permission info via text-match (`"AuthorizationException"`, `"Access Denied"`, `"SecurityException"`, etc.) and the helper raises `PokedexException` instead of `create_permissions_exception(path)` → `[BLOCK]`. Detect the signal; record-and-raise the permission exception so the connection-error tracking fires.
+- Code or tests built around an empty store on the dev connection → `[BLOCK]`: catching `DependencyFirstCrawlIncompleteException`, `pytest.skip`-ing because a dependency's first crawl hasn't run, or omitting `get_resource_implemented` / `load_not_implemented` because the `-implemented` row is missing. Seed the store with a persisting crawl (or write the row) instead. A hand-written dev row with no matching prod row and no note in the PR body asking a human to seed prod → `[BLOCK]`. Under the permission validator, a function that needs dependency data uses `Resource(self).make_perm_call()` or the vendor endpoint. See integration-gotchas.md "Missing stored data on the test connection".
+
+#### Body capture and log suppression — `should_log_body` and `ignore_log`
+
+Two kwargs control how request traffic surfaces beyond the integration code. They look similar but do different things and are reached for in different contexts.
+
+##### `should_log_body=True` — capture the request body for the api_log surface (writes)
+
+Pass `should_log_body=True` on every call site that **mutates vendor state on behalf of a Trackstar API customer** — `create_*`, `update_*`, `cancel_*`, `refund_*`, `adjust_*`, and any other write method that takes a customer-supplied `request_body` and forwards it to the vendor. 99 integrations use it.
+
+What it does (mechanism, for reference — writer doesn't need to wire this up): the patched `requests.sessions.Session.request` pops the kwarg and calls `integration.capture_request_body(url, method, body)` when set. The captured bodies are read by `utils.middleware` at the end of the Trackstar API request, sanitized to redact credentials (`sanitized_request_bodies()`), and stored under `integration_request_bodies` on the api_log row. This is the surface customers and Trackstar support hit when debugging "what did Trackstar actually send to the vendor when I POSTed this order create?"
+
+Operationally:
+
+```python
+def create_order(self, request_body):
+    formatted = format_create_order(request_body)
+    response = self.shopify_request(json={"query": mutation}, should_log_body=True)
+    ...
+```
+
+- Pass it on the **write-side** request — the one mutating state, not the post-write read that fetches the freshly-created resource (the read shouldn't pollute the api_log surface; customers want to see what was POSTed, not the GET we did after).
+- **No helper-signature change needed** — `should_log_body` flows through `**kwargs` to `session.request()` where the patched `Session.request` consumes it. The integration's `<name>_request` doesn't need to know it exists.
+- The kwarg is a no-op outside `has_request_context()` (e.g., during `yarn crawl`), so it's safe to leave on; nothing logs locally that wouldn't already.
+
+Exemplars: `cart/bigcommerce/integration.py` (`create_order`, `refund_order`), `cart/shopify/integration.py` (`adjust_inventory`, `create_order_shipment`), `cart/overstock/integration.py` (batch-job creates), `wms/linnworks/integration.py` (`create_product`, `update_product`), `wms/whiplash/integration.py` (`update_return`, `cancel_return`).
+
+##### `ignore_log=True` — two distinct use cases
+
+`ignore_log=True` is reached for in two situations, both consuming the same `get_request_session(ignore_log=...)` parameter but motivated differently:
+
+**(a) Auth calls — never let credentials or tokens reach the integration logger.**
+
+Every outbound HTTP request from `get_integration_secret`, `validate_integration_secret`, and the in-`<name>_request` token-refresh path **must** pass `ignore_log=True`. Auth-flow request bodies contain credentials (`client_id`/`client_secret`, OAuth `code`/`refresh_token`, plaintext passwords). Auth-flow response bodies contain freshly-minted tokens (`access_token`, `refresh_token`). Without `ignore_log=True`, the `LoggingAdapter`'s default behavior writes both to the integration logger — and the integration logger is a different sink from `sanitized_request_bodies()`, so the redaction layer that protects the customer-facing api_log surface does **not** apply.
+
+```python
+# get_integration_secret — token exchange leaks creds + tokens to the logger
+# without ignore_log=True
+def get_integration_secret(self, body):
+    token_url = "https://vendor.example/oauth/token"
+    req_body = {"client_id": ..., "client_secret": ..., "code": body["code"]}
+    session = get_request_session(ignore_log=True)   # required
+    response = session.post(token_url, json=req_body)
+    ...
+```
+
+For integrations that go through the helper (`<name>_request`) to do their token refresh, pass `ignore_log=True` at the auth call site:
+
+```python
+# inside <name>_request's 401 refresh path:
+new_token = self.<name>_request(token_path, method="POST", json=refresh_body, ignore_log=True)
+```
+
+Exemplars: `wms/veracore/integration.py` (`# ignore_log: request body contains password in plaintext`), `wms/mintsoft/integration.py` (auth POST), `wms/bigblue/integration.py` (auth validation read). When in doubt: any request whose URL is a `/oauth/`, `/auth/`, `/token`, `/login`, `/sessions`, or `/v*/auth*` path is in this category.
+
+**(b) Suppress per-request log noise for POST-as-read APIs.**
+
+Pass `ignore_log=True` on **read** calls when the vendor uses POST (or any non-GET method) for what's logically a query, not a mutation. 14 integrations use it for this purpose.
+
+What it does: `get_request_session()`'s `LoggingAdapter.send` logs the curlified request body + response body for every non-GET — useful for vendors where non-GET implies a mutation (the dominant REST shape). For GraphQL vendors (Shopify), TikTok Shop's POST-bodied queries, or similar, the assumption breaks: every list-products call would dump a query-string body and a multi-kilobyte response payload into the integration logger, drowning real signal.
+
+```python
+def shopify_request(self, method="POST", ignore_log=False, **kwargs):
+    session = get_request_session(ignore_log=ignore_log)
+    ...
+
+# callers:
+rsp = self.shopify_request(json={"query": products_query}, ignore_log=True)  # read
+rsp = self.shopify_request(json={"query": mutation}, should_log_body=True)   # write — log it
+```
+
+##### Operational rules (both use cases)
+
+- **The integration's `<name>_request` helper must accept `ignore_log` explicitly** and forward it into `get_request_session(ignore_log=...)`. It can't be left in `**kwargs` because `requests.Session.request()` doesn't know about it — the session *factory* is the consumer, not the per-call request.
+- Default `ignore_log=False`. Only flip on (a) auth call sites and (b) read call sites for POST-as-read vendors.
+- Don't pass `ignore_log=True` on **write call sites** "to keep logs clean." Write traffic is rare and high-value; we want operational visibility, and the customer-facing audit trail comes from `should_log_body=True`.
+
+Exemplars (POST-as-read): `cart/shopify/integration.py` (every `get_*` reads via GraphQL POSTs), `cart/tiktok/integration.py` (POST-bodied list endpoints).
+
+##### Reviewer enforcement
+
+- **Auth call (`get_integration_secret`, `validate_integration_secret`, or the in-helper token-refresh path) that makes an HTTP request without `ignore_log=True` → `[BLOCK]`.** Credentials and tokens reach the integration logger, which is a different sink from `sanitized_request_bodies()` and isn't redacted. This is a credential-leak severity issue, not a style issue. Applies to any direct `get_request_session()` call inside the auth bundle and any `self.<name>_request(...)` call routed through the auth refresh path.
+- Write method (`create_*`, `update_*`, `cancel_*`, `delete_*`, `refund_*`, `adjust_*`) that doesn't pass `should_log_body=True` on the vendor-mutating request → `[BLOCK]`. Customers and Trackstar support lose the audit trail of what was sent to the vendor for that API request. Exception: if the integration mutates via SFTP, S3, or another non-`requests`-based transport, the writer should call `self.capture_request_body(url, method, body)` directly (mirrors the kwarg's mechanism) — verify this in the helper.
+- GraphQL or POST-as-read integration (`api-summary.md` "Transport" line records the vendor uses POST for reads) where the `<name>_request` helper doesn't accept and forward `ignore_log` → `APPROVE_WITH_NOTES` flagging that read traffic will flood the integration logger.
+- `ignore_log=True` set on a write call → `APPROVE_WITH_NOTES` flagging the inverted application. The default-log path is the right one for writes; suppressing it loses operational visibility.
+- `should_log_body=True` set on a read call (`get_*`) → `APPROVE_WITH_NOTES` flagging the inverted application. Reads pollute the api_log surface customers see; capture is for write traffic.
+- `should_log_body=True` set on an **auth call** → `[BLOCK]`. The kwarg captures the body to the customer-facing api_log surface — which means the credential payload would show up in customer tooling. Auth bodies never get `should_log_body=True`; they get `ignore_log=True`.
+
+### Passthrough `make_request` — build the URL with your own slash
+
+`make_request(self, path, method, headers=None, data=None, params=None)` is the passthrough entry point: the `/wms/passthrough` and `/cart/passthrough` endpoints call it directly with a customer-supplied `path`. It is a separate method from the internal `<name>_request` helper the crawl methods use — those build their own paths; `make_request` receives the customer's.
+
+**The passthrough endpoints strip a leading `/` off `path` before calling `make_request`**, so a caller can send `/orders` or `orders` and get the same result on every integration. Build the URL with your own separator so a slash-less path still resolves:
+
+```python
+def make_request(self, path, method, headers=None, data=None, params=None):
+    url = f"{self.base_url()}/{path}"   # own slash between base and path
+    ...
+```
+
+- **Never rely on the caller's leading slash.** `f"{base_url}{path}"` or `base_url + path` where `base_url` does not end in `/` builds `https://host.comorders` once the slash is stripped. Put the `/` in yourself, or join onto a base that already ends in one (`".../api/" + path`).
+- **If the vendor signs the request path, restore the slash on `path` itself, not just in the URL string.** When the signature is computed over the path (an HMAC over the path, SigV4 over a URL you assemble, or a comparison of `path` against a rooted endpoint string), the signed value and the sent URL have to match. Re-root at the top of `make_request` so both use the same form:
+
+```python
+def make_request(self, path, method, headers=None, data=None, params=None):
+    # vendor signs the request path, so keep the leading slash for both the signature and the url
+    path = "/" + path.lstrip("/")
+    ...
+```
+
+Adding the slash only in the URL string leaves the signature computed over the slash-less path, so it won't match the sent URL (a 401 the crawl never sees, since `make_request` is passthrough-only).
+
+#### Reviewer enforcement (passthrough `make_request`)
+
+- `make_request` assembles the URL as `f"{base}{path}"` / `base + path` where `base` does not end in `/` (relies on the caller's leading slash) → `[BLOCK]`. The passthrough layer strips that slash, so the request goes to a malformed host.
+- Vendor signs the request path and `make_request` adds the slash only in the URL, not on the `path` fed to the signature → `[BLOCK]`. The signature won't match the sent URL.
+
+Canonical exemplars:
+- `wms/eshipping/integration.py` — `f"{self._base_url(sandbox)}/{path}"`, own slash, no vendor signing.
+- `shared/amazon/integration.py` — `f"{base_url}/{path}"` with SigV4 computed over the assembled URL.
+- `shared/tiktok/integration.py` — `path = "/" + path.lstrip("/")` at the top so the HMAC-signed path and the URL agree.
+
+#### Surface uniformity (passthrough `make_request`)
+
+The passthrough surface is one shared endpoint across every integration that implements it — behavior contracts are system-wide, never per-integration or per-batch. Standing decisions a new `make_request` follows:
+
+- **401 re-auth refreshes the connection token and retries unconditionally**, even when the caller supplied their own `Authorization` header. Overwriting a caller's bad token is intended: they own the connection and would get the same result by omitting the header. Don't add caller-credential guards in one integration — a contract change here is a system-wide change across all merged `make_request` methods.
+- **Broad `except Exception` around `response.json()`** (fall back to raw text/status) is the accepted shape — passthrough returns the vendor's response as-is and must not crash on a non-JSON body.
+
+### Resource ID strategy — pick the right identifier for idempotency
+
+Trackstar's idempotency contract — same source resource always lands in the same Dynamo row — depends entirely on choosing a **stable, globally-unique source-side identifier** for `id`. Get this wrong and we double-write resources or silently overwrite distinct items, and the only way to recover is a backfill.
+
+**The choice the writer must make explicitly:**
+
+| Source side has... | Use as `id` |
+|---|---|
+| A stable internal ID that customers also see in the source UI / use in their own systems (e.g., Shopify's order GID, ShipBob's `order_id`) | The internal ID. |
+| A stable internal ID that customers DON'T use directly — they identify items by SKU / order number / external reference instead — AND that external reference is **verified globally unique** in the source | The external reference (SKU, order_number, etc.). Customers asking "where's order #1234" need the integration's `id` to match what they'd see in the source's UI. |
+| Internal ID + customer-facing reference, but uniqueness of the reference is unverified or known to allow duplicates | **Stop. Don't pick yet.** See escalation path below. |
+
+**Mandatory uniqueness probe before electing a non-internal-ID field as `id`:**
+
+1. Test the candidate in sandbox: try to create two products with the same SKU (or two orders with the same external reference). If the source rejects with a uniqueness error → globally unique → safe to use as `id`. If it accepts both → not unique → cannot use as `id`.
+2. If the sandbox doesn't support the create operation, query the same field across multiple list pages and check for duplicates. Not as definitive as a creation probe, but better than assuming.
+3. **Document the probe** in `api-summary.md` "Field-mapping decisions" with the date, the operation you ran, and the observed result.
+4. If neither (1) nor (2) is conclusive, **escalate to vendor support** with a draft email — do not guess. The cost of a wrong `id` choice is a customer-visible idempotency bug; the cost of a 24-hour wait for vendor confirmation is nothing.
+
+**Anti-pattern: making link tests pass by using whatever field happens to match.** `base_test.py` runs link tests that verify order line items resolve to products / inventory by `id`. If link tests fail, the temptation is to switch `id` to whatever field makes them pass, or to override `ignore_link_tests()` to skip them. **Both are wrong.** A link test failure is *signal* that the ID strategy isn't right — the function-writer should investigate (raw response shape, vendor convention, support ticket), not silence. `ignore_link_tests()` exists for vendors where the link genuinely doesn't exist (e.g., orders aren't tied to products in the source data model), not as an escape hatch when the writer hasn't figured out the right linkage field.
+
+**Reviewer enforcement:**
+- `ignore_link_tests()` overridden without a `Field-mapping decisions` entry explaining *why the source data model doesn't link this resource pair* → `[BLOCK]`. "Tests were failing" is not a justification.
+- `ignore_link_tests()` overridden without a replacement check → `[BLOCK]`. Ignoring a link test removes coverage; the test class must validate the ignored resource by other means where possible (a direct id-format check, a targeted lookup against the source) — search similar integration tests for the pattern. When no lookup against the source can validate the pair (the two sides publish different id spaces, say), the `Field-mapping decisions` entry stands on its own: say there that no replacement is possible and why. A check that the sandbox still looks the way it did when the ignore was written is not a replacement: it covers the account, not the resource, and the only thing that can ever fail it is a data refresh, with nothing in the code to fix.
+- `id` mapped to a non-internal-ID field (SKU, order_number, etc.) without a documented uniqueness probe → `[BLOCK]`.
+- Function-writer return notes claiming "used SKU as id" without sandbox evidence → `[BLOCK]`.
+
+### Write safety — never touch production data
+
+Write methods (`write_order`, `write_inbound_shipment`, `cancel_*`, `update_*`) move real data in the source system. Wrong target = vendor charge-backs, broken customer fulfillments, irreversible state changes. The default is: **don't run them**.
+
+**`allow_writes()` on the test class is the operational gate.** It's defined on `BaseTest` (`test/integrations/base_test.py:121`, defaults to `True`) and read at `base_test.py:657` inside `write_and_validate`:
+```python
+if not self.allow_writes():
+    pytest.skip("Writes not allowed for this test account")
+```
+Every test class whose connection is **not** writes-safe must override:
+```python
+def allow_writes(self):
+    return False
+```
+This skip path is what actually prevents writes from hitting the vendor — without the override, the test runs and the write fires.
+
+**`test_account()` on the integration class is the human-readable rationale** for `allow_writes()`'s value. Its return string discloses whether the underlying account is write-safe. The two must agree: `test_account()` says `writes-unsafe` ↔ `allow_writes()` returns `False`.
+
+The `test_account()` string convention (set during scaffolding):
+```
+"<requesting org> <env> · <ownership> · <write-safety> · <linear-ticket>"
+```
+- **requesting org:** the trackstar customer org that **requested this integration be built** — e.g., `caprelease` for Pimento, `tether` for Skladon, `acme` for a new integration commissioned by Acme. This is the org whose ticket motivated the build, not the org whose connection we use for dev installs. Every dev install lands at `test-org-id` regardless of which integration it is, so `test-org-id` as the leading token would tell the reader nothing; the requesting-org name is what makes the rationale informative. **Not** the integration / vendor name either — that's already evident from the file path.
+- env: `sandbox` (true vendor sandbox) or `prod-as-test` (real prod account used for testing — common when the vendor has no sandbox and the requesting org loans us their account)
+- ownership: `vendor-owned` (vendor's own sandbox account, often credentialed via vendor support) or `org: <requesting org>` (the requesting org loaned us their account at the vendor)
+- write-safety: `writes-safe` or `writes-unsafe`
+
+Examples:
+- `"caprelease sandbox · vendor-owned · writes-safe · TRA-1234"` — Pimento built for CapRelease; using a vendor-owned sandbox, writes are reversible.
+- `"tether prod-as-test · org: tether · writes-unsafe · TRA-1742"` — Skladon built for Tether; vendor has no sandbox, Tether loaned us their prod account, writes would hit real data.
+
+Do not infer write-safety from the `connection_id` — `test-*` only means "trackstar uses this for testing" and many `test-*` connections point to prod-as-test accounts (real production accounts at vendors who don't have sandboxes).
+
+**Writes-unsafe targets (set `allow_writes(): return False`):**
+- Any account where `test_account()` returns `writes-unsafe`
+- Any account where `test_account()` doesn't explicitly state `writes-safe` — absence of the marker defaults to unsafe
+- Any account marked `customer: <name>` regardless of env (customer data, not ours to mutate)
+- Any prod-as-test account, even if vendor-owned (real data flows through it)
+
+**Writes-safe targets (`allow_writes()` may stay at the default `True`):**
+- An account where `test_account()` returns `writes-safe` AND env is `sandbox` AND ownership is `vendor-owned`
+- The vendor has confirmed in writing (Linear ticket, support thread) that writes are safe and reversible
+
+**Implementation rules:**
+- Write **methods** (the integration.py code) can be implemented anytime — having the code ready when a write-safe sandbox arrives is normal.
+- Write **tests** (`<name>_test.py`) are gated by `allow_writes()`. When `allow_writes()` is `False`, `write_and_validate` auto-skips with `"Writes not allowed for this test account"` — that's adequate. If you also want a more specific reason on a per-test basis (vendor-confirmed writes are safe but a particular endpoint is broken, etc.), add `pytest.skip(reason)` inside that test method.
+- Function-writer must check `allow_writes()` on the test class (and `test_account()` on the integration class for context) before any `yarn crawl` run on a write method. If `allow_writes()` is `False` or `test_account()` indicates `writes-unsafe`, refuse and surface to user.
+- API-validator is **read-only**. It never writes against the vendor API regardless of account safety. HTTP method isn't the gate (SOAP envelopes and GraphQL queries are POST and are reads); the operation's effect on vendor data is.
+- Sandbox seeding is the `integration-data-seeder` agent's job, dispatched by the orchestrator after the validator returns. See `agents/integration-data-seeder.md`. Eligibility (writes-safe + sandbox env + vendor-owned + write endpoints documented) is checked by the seeder; the validator just surfaces the signal that seeding is needed by leaving the api-summary "Sandbox seeding" section empty for the seeder to populate.
+
+**Reviewer enforcement (BLOCK):**
+- A test class whose connection is `writes-unsafe` (per `test_account()`) but does NOT override `allow_writes()` to return `False` → `[BLOCK]`. Without the override, every write test runs against an unsafe account.
+- A test class where `allow_writes()` and `test_account()` disagree (one says safe, the other unsafe) → `[BLOCK]`. The disclosure must match the operational gate.
+- Any function-writer return notes claiming a write was crawl-validated must reference both `allow_writes()` and `test_account()`. If either indicates unsafe, `[BLOCK]` regardless of test outcome — the write may have hit production.
+- Any api-validator artifact showing **write operations** exercised against vendor APIs during validation → `[BLOCK]`. Method isn't the signal — a POST to a documented read endpoint (SOAP query, GraphQL query) is fine; a POST/PUT/PATCH/DELETE to a write endpoint listed in the spec is not.
+- A `test_account()` method that returns the scaffolder default or omits the structured fields (env / ownership / write-safety / linear ticket) → `[BLOCK]`. The method's content is the rationale a reviewer cross-checks against `allow_writes()`; without it, the gate isn't auditable.
+
+### Spec is canonical, sandbox is sample
+
+- The integration's published API spec / OpenAPI / vendor docs are the **contract**. Sandbox responses are *one observation* of that contract.
+- If a field appears in the spec but is absent from your sandbox sample (because the sandbox account is impoverished, the test data is in a blocked state, the integration vendor only seeds happy-path data, etc.), **you must still implement the field**. Comment that you couldn't exercise it live.
+  - Anti-pattern: stripping `tracking`, `unit_price`, `currency`, `total_price`, `shipping_price`, `tags` from `format_order` because the sandbox returned them as null. Those fields are in the spec; the integration must read them.
+  - Correct: include the field, add a comment if relevant ("blocked-state orders return null tracking, observed YYYY-MM-DD"), and let the live `yarn crawl` validation surface the issue.
+- Before declaring a function "done," **verify the sandbox actually exercises it**. If all 100 sandbox orders are in the same status, your function isn't validated for any other status. Either seed more data, ask the user to seed it, or document the gap explicitly in the reviewer report — don't silently accept incomplete validation.
+
+### Pick the most-populated sample per endpoint
+
+When capturing, storing, or selecting a sample record (api-validator stashing samples in `api-summary.md`, integration-data-seeder leaving a representative record for the writer to read, holistic-review orchestrator picking one item to inline in the PR mapping comment), the choice is **the record with the maximum number of populated fields**, not the first record in the list, not an arbitrary one.
+
+Why: downstream agents and human reviewers read the sample to verify *how the field gets formatted through*. A minimally-populated record (`{"id": "X", "status": "pending"}`) hides whether the integration correctly formats `tracking`, `unit_price`, `metadata`, etc. when they're present — those mappings only become visible against a record where those fields are non-null. The whole point of the sample is to show the formatting behavior; a sparse sample shows almost none of it.
+
+Operational rules:
+
+- **Validator (sample capture):** when pulling a sample for `api-summary.md`, paginate or filter to find the populated-est record available. For list endpoints, scan the first page (or two — pagination is already capped at 3 pages during dev crawls) and pick the maximum. For detail endpoints, prefer accounts with rich test data.
+- **Seeder (sandbox seeding):** when seeding records, ensure at least one record per resource type has every optional field populated — not just the bare-minimum-to-create fields. Note in `api-summary.md` "Sandbox seeding" which record id has the full field set.
+- **Orchestrator (mapping comment sample selection in `/wrap-integration` step 4):** if `api-summary.md` has multiple captured samples per endpoint, pick the one with the highest populated-field count. Don't truncate keys or values to keep the comment short — collapse via `<details>` instead (already the layout).
+- **Writer (during implementation):** when reading samples to validate `format_*` logic, hit the populated-est sample first. If only sparse samples exist, surface this to the user via the writer's return notes — it's a sandbox-state signal, not just a sample-selection question.
+
+Picking the sparsest sample because it's "easier to read" is the anti-pattern — it actively hides the integration's behavior on the fields most likely to have non-obvious mappings.
+
+### Missing-resource patterns — search before silencing
+
+- If your assigned function doesn't have an obvious source (the API has no `/warehouses` endpoint, no `/inventory_locations`, no `/receipts` endpoint, etc.), **before deciding to skip or silence**, search the codebase yourself with Grep/Glob/Read for existing integrations that handle the same shape. (Subagents are depth-1 restricted and cannot spawn subagents of their own, so this is a direct search, not a delegated one.) What to look for:
+  - "find pokedex/integrations/*/integration.py implementations of get_warehouses where the integration has only a single warehouse per API key"
+  - "find pokedex/integrations/*/integration.py where get_inventory returns a single virtual warehouse"
+  - "find pokedex/integrations/wms/*/integration.py that call get_receipts_from_received_quantity" (canonical pattern for synthesizing receipts when vendor exposes inbound line items with received_quantity but no separate receipts endpoint — see "Inbound receipts decision tree" below)
+- The pattern almost certainly exists. Match it. **Reaching for a known utility is not optional once you've spotted the trigger condition** — if the search returns 5+ integrations using the same utility, the writer who instead hand-rolls equivalent logic is shipping drift.
+- Only silence (with `pytest.skip` and a reason) after the search returns no precedent **and** you've documented why this integration sets a new pattern.
+
+### Resource scope and dependency chains (per type)
+
+What to implement is the **dependency closure** of the ticket's named resources down to the integration type's base — not a flat per-type checklist. Every resource sits on the ones below it (their IDs cross-reference in link tests), so building a higher resource without the layers under it ships something structurally broken.
+
+The chains come straight from the per-type test `ordering` dict (`test/integrations/{type}/{type}_test.py`), which encodes the data dependencies directly (`pytest.mark.after`). Resolve scope by taking each requested resource and pulling in everything beneath it:
+
+| Type | Base | Dependency chain (left depends on right, down to base) | Base layer every scope includes |
+|---|---|---|---|
+| **wms** | `inventory` | orders / returns / inbound_shipments / order_shipments → products → warehouses + inventory | `get_inventory`, `get_products`, `get_warehouses` |
+| **cart** | `products` | order_shipments / refunds → orders → products → warehouses | `get_products`, `get_warehouses` |
+| **carrier** | `invoice_line_items` | single resource — no chain | `get_invoice_line_items` |
+| **erp** | `inventory` + masters (`items`, `locations`) | sales_order_shipments → sales_orders → customers; purchase_order_receipts → purchase_orders → vendors + employees; all transactions → inventory + items + locations | `get_inventory`, `get_items`, `get_locations` |
+
+So a WMS ticket that names only `orders` still implements inventory + products + warehouses (orders carry `warehouse_id` and link-test against product / inventory rows); a cart ticket that names only `orders` still implements products + warehouses. Named higher-level resources add their own clusters on top of the base layer.
+
+Cart integrations do not implement product on-demand sync — the first crawl loads the vendor's whole catalog, so an on-demand product pull adds a sync surface the crawl already covers. Decline the request rather than wiring it up.
+
+**Why inventory is the WMS base:** `format_inventory_item` populates `inventory_by_warehouse_id`, which the tier-2 `WMSIntegration.get_warehouses` base walks to synthesize warehouses (see the warehouse decision tree below); products are typically a derivative read off inventory rows. Inventory is the resource the rest of a WMS integration is built on.
+
+If the ticket scopes fewer resources than the base layer, the build still includes the full base layer — it is the floor for a working integration of that type. (Autonomous run: journal the expansion, do not ask.)
+
+#### Warehouse decision tree
+
+Most integrations don't need a warehouse-specific custom implementation; the right move depends on what the vendor API exposes. Walk this tree in order:
+
+1. **Vendor has a warehouse endpoint** (`/warehouses`, `/locations`, `/facilities`, etc., returning a list of warehouse objects with stable IDs).
+   → Implement `get_warehouses` directly. Map the vendor's response to the canonical schema. Most integrations are here.
+
+2. **No warehouse endpoint, but inventory carries `warehouse_id`** (each inventory item's response includes which warehouse it lives in, possibly via a `quantities[].warehouse_id` array or similar).
+   → **Don't override `get_warehouses`.** The base `WMSIntegration.get_warehouses` (`integrations/wms/WMSIntegration.py:283`) walks every cached `InventoryItem`'s `inventory_by_warehouse_id` keys and synthesizes one warehouse entry per unique key (`id` and `name` both set to the warehouse_id, `code`/`address` as `IntegrationNotImplemented`).
+   → All you need to do: implement `get_inventory` such that `format_inventory_item` populates `inventory_by_warehouse_id` keyed by the real warehouse IDs. Warehouses then auto-populate from inventory on the first crawl.
+   → The `<name>_test.py` `test_get_warehouses` will pass via the inherited base implementation — don't override or `pytest.skip`. It does require persisted dev inventory data first — see "Synthesized-path test prerequisite" below.
+
+3. **Neither endpoint nor warehouse-keyed inventory** (single-warehouse vendor, or vendor doesn't expose the concept).
+   → Hardcode a default warehouse ID and have `get_warehouses` return a single-element list with that ID. Every order, inbound, shipment, and return must then set `warehouse_id` to the same default — schema validators require it; link tests assert it; idempotency depends on it.
+   → **Pattern-match before picking the literal value.** Don't copy the first tier-3 example you see. Triangulate across multiple existing tier-3 integrations to find the dominant shape:
+     - The dominant pattern is **the integration's name as a literal string** — `amplifier`, `Bigblue`, `FabFitFun`, `flatfee`, `Luxroutage`, `Next3PL`, `PackemWMS`. Use this unless there's a reason not to. For a new integration, the literal is the integration's own name in the same casing the vendor uses (e.g., `"AcmeWMS"` for an integration named `acme-wms`), not a UUID sentinel.
+     - **Install-form configurable** (`integrations/wms/shippingbo/integration.py`) — when customers may have multiple warehouses but only one per connection, the install form takes `warehouse_id` and stores it in `integration_secret`. Use this when the vendor has the concept but doesn't expose a list API.
+     - **UUID sentinel** (`integrations/wms/linnworks/integration.py:45` — `"00000000-0000-0000-0000-000000000000"`) — vendor-specific. Linnworks itself returns this UUID for unassigned warehouses, so we mirror it. **Don't copy this without the same vendor-specific reason** — outside that case, a UUID sentinel is opaque and wrong.
+     - **Customer-specific code** (`integrations/wms/icreate/integration.py` — `"BMC"`, `integrations/wms/mayple/integration.py` — `"DUB-1"`) — used when the customer's installation is at a specific named site that the customer recognizes. Rare; only when the customer has explicitly named their location.
+
+   The "Field-mapping decisions" entry in `api-summary.md` should record which pattern was chosen and why.
+
+**Synthesized-path test prerequisite (tier 2, and tier 3 relying on base synthesis).** The base `get_warehouses` gates on `InventoryItem.check_first_crawl_complete()`, which reads the test connection's scheduler row from dev DynamoDB. A freshly installed test connection has no row, so `test_get_warehouses` fails with `Inventory Item first crawl has not completed yet` — locally and in CI — no matter how correct the integration code is. After `get_inventory` is implemented and its tests pass, run a one-time real-submit inventory crawl for the test connection so dev has persisted inventory items and scheduler state:
+
+```json
+// crawl.json
+{
+    "connection_id": "test-wms-<name>-connection-id",
+    "function_name": "get_inventory",
+    "start_time": "2020-01-01T00:00:00Z",
+    "first_crawl": true
+}
+```
+
+```bash
+yarn crawl-hard --local-submit -f
+```
+
+This writes to shared dev DynamoDB — get user confirmation before running it. Once it completes, `test_get_warehouses` passes via the base synthesis (compare: the mainfreight test connection's persisted `get_inventory` scheduler row). Do this before the wrap-phase test sweep so CI is green on the first PR push.
+
+#### Reviewer enforcement
+- WMS integration without `get_inventory`, `get_products`, or `get_warehouses` (or a tier-2/3 substitute) implemented or explicitly justified by the orchestrator's scope-confirmation note → `[BLOCK]`.
+- `get_warehouses` overridden when tier 2 applies (inventory carries warehouse_id, base auto-fill would work) → `APPROVE_WITH_NOTES` flagging that the override is dead weight.
+- Tier 3 integration where some `format_*` function doesn't set `warehouse_id` to the default → `[BLOCK]` (will fail schema validation in production).
+- Tier 3 integration that uses a UUID sentinel (linnworks shape) without a documented vendor-specific reason → `APPROVE_WITH_NOTES` flagging that the integration-name-literal is the dominant pattern and the UUID is the outlier.
+
+#### Inbound receipts decision tree
+
+Canonical `InboundShipment` carries a `receipts: list[Receipt]` field — each `Receipt` is one physical receiving event at the warehouse (some line items received, with `arrived_date` and a quantity-per-SKU breakdown). Many vendors don't expose receiving events as first-class records; they only expose **inbound shipments** with a `received_quantity` (or equivalent) on each line item.
+
+`receipts` is an **event-stream collection**, not a structural decomposition of the inbound: receipts accumulate over time as items physically arrive. The expected starting state is `receipts = []` (no items received yet), and the utility in tier 2 below returns `[]` until `received_quantity` changes. This is the right value — the "[] is not an absence value" rule in "Format function output shape" carves receipts out explicitly because here `[]` correctly says "no receipts have happened yet," not "we don't know."
+
+Walk this tree in order:
+
+1. **Vendor has a receipts / receiving-events endpoint** — typically `/receipts`, `/receivings`, `/inbound-receipts`, sometimes nested under the inbound (`/inbound_shipments/{id}/receipts`). Each receipt has its own ID, timestamp, and line items.
+   → Pull receipts on the same crawl as inbound shipments and attach them to the matching inbound's `receipts` list. Minority case but the cleanest one.
+
+2. **No receipts endpoint, but inbound line items carry `received_quantity`** (a per-line "how much has arrived so far" counter that the vendor mutates as items physically arrive) — this is the dominant WMS shape.
+   → **Use `utils.utils.get_receipts_from_received_quantity`** (`pokedex/utils/utils.py`). It synthesizes receipts by diffing the current `received_quantity` against previously-stored receipts, emitting one new receipt per crawl when the diff is non-zero. **Do not reimplement this logic locally** — 21 WMS integrations use the utility (mintsoft, packiyo, whiplash, shiphero, veracore, carton-cloud, helm-wms, hive, shippingbo, logiwa, leanafy, darwynn-fulfillment, distribution-management, qls, bluebox, fba, flexport, g-global, linnall, luxroutage, osa-commerce), and any local re-implementation will drift.
+   → Required imports: `from utils.utils import get_receipts_from_received_quantity`. Required inputs: `inbound_id` (str), `line_items` (list of dicts with `inventory_item_id`, `sku`, `received_quantity`), `previous_receipts` (the existing `receipts` list on the inbound — pulled from durable storage by the framework; the writer just passes it through). Output: the new full receipts list (existing + at most one synthesized entry).
+   → Read mintsoft (`integrations/wms/mintsoft/integration.py`) for the canonical shape: first-crawl branch (pass `[]` as previous_receipts; collapse to one synthesized receipt with the vendor's confirmed-receipt date), incremental-crawl branch (pass existing previous_receipts; let the utility emit a new receipt only when received_quantity advanced).
+   → If the vendor exposes a fully-received timestamp (e.g., `BookedInDate`, `confirmedAt`), prefer it over `now()` for the synthesized receipt's `arrived_date`. The utility defaults to `now()`; the caller overwrites afterward.
+
+3. **No receipts endpoint AND no `received_quantity` on line items** (vendor only exposes "open" vs "closed" inbound state without per-line quantities).
+   → Synthesizing receipts isn't possible without observability. Set `receipts = []` on `format_inbound_shipment` and add a `# vendor exposes no per-line received_quantity` comment. Record under `api-summary.md` "Field-mapping decisions." Don't synthesize fake receipts to satisfy a downstream consumer.
+
+##### Reviewer enforcement (inbound receipts)
+- WMS integration implementing `get_inbound_shipments` against a vendor with per-line `received_quantity` (tier 2 above) that hand-rolls its own diff-against-previous-receipts logic instead of calling `get_receipts_from_received_quantity` → `[BLOCK]`. The hand-rolled version is almost always subtly wrong (off-by-one on SKU duplication, missing `inventory_item_id` key, wrong sentinel for "no previous receipts") and silently diverges from the canonical shape.
+- Tier 3 integration that sets `receipts = []` without a comment naming the missing source signal → `APPROVE_WITH_NOTES` requesting the comment.
+- Tier 2 caller that passes `[]` as `previous_receipts` on every crawl (not just first-crawl) → `[BLOCK]` — this re-emits the full received quantity as a new receipt on every sync, polluting the receipts history.
+
+---
+
+## Reviewer checklist (literal pass/fail)
+
+For each `format_*` function the function-writer touched:
+
+- [ ] No `.get()` calls (or each `.get()` has an explanatory comment about the observed missing field)
+- [ ] No `trackstar_tags` assignment
+- [ ] `additional_fields` is `{}` unless customer-specified
+- [ ] No `IntegrationNotImplemented` used as fallback for present-but-null values
+- [ ] No `x = data.get(y, IntegrationNotImplemented)` patterns
+- [ ] No `x = y or IntegrationNotImplemented` patterns
+- [ ] **Write-accepted-but-read-absent fields use `None`, not `IntegrationNotImplemented`.** If the vendor accepts a field on `create_*` / `update_*` (whether or not the integration implements writes yet) but doesn't echo it on the corresponding read, the read path sets `None` with a comment naming the asymmetry — not `IntegrationNotImplemented`. The vendor contract determines the absence value, not the integration's current method coverage. Check candidates: `unit_price`, `discount_amount`, `currency`, `note`, `b2b`, write-only metadata fields. Exception: a canonical `List`/`Dict` field whose schema rejects `None` (its `not_implemented_default` is `[]`/`{}`, so `allow_none` never auto-enables) takes `IntegrationNotImplemented` on the read side even when a write accepts it — with the asymmetry recorded in `api-summary.md`. → `[BLOCK]` when violated.
+- [ ] **No `[]` as an absence value on structural-decomposition fields when the parent has data.** Use the vendor's per-element breakdown, or mirror the parent collection to the **single** child (canonical: `list(per_package_lines.values()) or shipment_line_items` — see shipbob). → `[BLOCK]` for an empty single-package `line_items` while the parent has data, and for an invented allocation. Exception: a vendor exposing **multiple** packages with no per-package breakdown correctly leaves every package's `line_items` empty (a fabricated split double-counts against the cross-package quantity validation), with the gap recorded in `api-summary.md`. Carve-out: event-stream collections like `inbound.receipts` are NOT structural decompositions; `receipts = []` is the correct starting state until items are received (see Inbound receipts decision tree).
+- [ ] `created_date` / `updated_date` shape correct: both pulled when present; **missing one set equal to the present one** when vendor exposes only one (don't omit `created_date` while keeping `updated_date` — the pipeline backfilling `EPOCH` on the omitted side mislabels historical records as 1970); both omitted only when neither is sourceable. Never synthesized from `now()` or hardcoded dates on a read path (a `create_*` write originating the record may stamp `now()` as the true origin timestamp when the vendor echoes none — see the dates row above). → `[BLOCK]` when `created_date` is omitted while `updated_date` is set, or when either is synthesized on a read path. (The pipeline auto-copies `created_date` to a missing `updated_date`, so the integration may legitimately set only `created_date`; the inverse — only `updated_date` — is the failure case.)
+- [ ] String/datetime fields don't have `or None` suffix
+- [ ] No list/dict comprehensions in transformation logic
+- [ ] No `logger.info` / `print` calls in integration code except carrier (carrier may use them at major async checkpoints; `logger.warning` / `logger.error` for genuinely surprising states is fine in any type)
+- [ ] No docstrings
+- [ ] Comments are lowercase, ~5-10 words, explain WHY
+- [ ] **Comments pass the one-read test — plain English, no noun-stacks / arrow-chains / framework vocabulary.** Clarity wins over brevity; don't flag a clear comment just for running a little long.
+- [ ] Comments ≤2 lines (one preferred). Multi-paragraph or 5+ line blocks only for genuinely complex situations.
+- [ ] **No observation dates, customer orgs, or source-integration attribution in code comments.** Present-tense WHY only; rich rationale lives in `api-summary.md` "Field-mapping decisions" — not in the code.
+- [ ] **Comments are self-contained — no references to `api-summary.md` or other gitignored files.** Inline the relevant context.
+- [ ] **No doctrine vocabulary or authoring-agent attribution in code comments.** No `# tier-3 pattern`, `# per the warehouse decision tree`, `# canonical exemplar`, `# Claude/AI suggested`, `# config-driven`, etc. Comments describe local behavior, not the doctrine bucket or who wrote it.
+- [ ] **`logger.warning` / `logger.error` produces actionable signal, not decoration.** A warn followed by a silent default (`logger.warning(...); value = "other"`) is decoration; pick raise-or-cast and document the choice. Warn that's logged-and-ignored with no follow-up → `[BLOCK]`. Warn paired with a default-fallback → `APPROVE_WITH_NOTES` to pick one.
+- [ ] **No duplicated rationale.** If the same comment ("proto3 omits zero values", "vendor returns null for blocked-state orders", etc.) applies to multiple fields, it appears ONCE — at the function header or above the relevant block — not on every field.
+- [ ] Constants live at the narrowest scope that holds all callers: single-caller constants (e.g., a one-`format_*` `STATUS_MAP`) defined inside the function body; multi-function-same-resource constants above the first consumer; cross-resource constants at module top. Single-caller constant at module / class scope → `[BLOCK]`.
+- [ ] No leading-underscore "private" names — methods (`_helper()`), attributes (`self._cache`), or locals (`_tmp`). Underscore privacy isn't enforced and isn't a convention this codebase uses. A class helper needing `self` → plain method (no underscore); not needing `self` → module-level function; used once → inline. **Advisory in new integrations; ignored in existing-integration edits** (dunders like `__init__` exempt).
+- [ ] `page_token` default declared inline in the function signature, not via a `page_token=None` + `if page_token is None: page_token = ...` reset (unless the default genuinely depends on runtime state — exception documented in a comment)
+- [ ] A function that splits the crawl range by date returns the finished window as `next_start` (tz-aware UTC, whole seconds, `start < next_start <= end`, `next_token=None`) instead of carrying the next window's start in the page token, and the resource stores crawl params. Lookbacks live in `crawl_start_overlap_minutes`, not in the function.
+- [ ] No multi-line value expressions inside dict / kwargs literals — conditionals, `any()`/`all()` over iterables, multi-step transforms get hoisted to named variables above the constructor. Trivial inline ternaries and `.get(field, default)` are fine; the rule applies once the value wraps a line or scans an iterable. **Advisory (`APPROVE_WITH_NOTES`) on new builds.**
+- [ ] **Every field in the API spec is represented.** A field present in the vendor's spec/OpenAPI but absent from `format_*` is a `[BLOCK]` finding, even if the sandbox sample didn't return it. Verify by reading the spec section in `api-summary.md` and diffing against the implementation.
+
+For ID strategy:
+
+- [ ] If `id` maps to a non-internal-ID source field (SKU, order_number, external reference), there's a documented uniqueness probe in `api-summary.md` "Field-mapping decisions" with date + operation + observed result. Missing probe → `[BLOCK]`.
+- [ ] `ignore_link_tests()` is NOT overridden as a shortcut to silence failing link tests. Override only if the source data model genuinely doesn't link the resource pair, with an explanation in `api-summary.md`. Override-without-rationale → `[BLOCK]`.
+
+For each test file touched:
+
+- [ ] Only the `TestX` class — no module-level `def test_*` functions
+- [ ] **No `pytest.fail("Not implemented")` stubs.** Either implement, or use `pytest.skip("...")` with a reason that points to the source-lacks-concept rationale.
+- [ ] **No no-op `super()` overrides.** If the function just calls `super().<name>(...)`, delete the override.
+
+For the auth bundle:
+
+- [ ] The install path as a whole performs a live authenticated round-trip against the vendor. The check is satisfied if EITHER (a) `validate_integration_secret` makes an authenticated call and raises on failure, OR (b) `get_integration_secret` exchanges credentials for a token via an authenticated call (in which case `validate_integration_secret` may be `pass` with a comment noting auth happens in `get_integration_secret`).
+
+For the request helper (`<name>_request`):
+
+- [ ] 401 → `create_invalid_credentials_exception()`; 403 (or vendor-equivalent permission signal — text-matched `"AuthorizationException"`, JSON `"Access denied"`, HTTP 402-as-permission, etc.) → `create_permissions_exception(path)` recorded in `self.api_call_errors[path]` before raising. Collapsing the two into a single branch (`if response.status_code in [401, 403]:`) → `[BLOCK]`. The two exceptions are distinct surfaces — 401 reports connection-wide creds-broken, 403 reports per-URL scope-missing — and the framework's `ConnectionsError` row tracking depends on the split.
+- [ ] `self.api_call_errors[path] = None` runs on the success path (after the `if not response.ok:` block, before `return response.json()`). Without it, prior connection errors for this URL **never clear** even after the customer fixes scope vendor-side. → `[BLOCK]` when the success-clear is missing on a helper that has any `create_permissions_exception` branch.
+- [ ] Vendor returns permission info via text-match in a 2xx body or non-403 status and the helper raises `PokedexException` rather than recording the permission exception → `[BLOCK]`. Detect the signal; route through the same record-and-raise so the connection-error surface picks it up.
+
+For the integration as a whole:
+
+- [ ] **Diff is confined to the in-scope file set** (per "Files in scope — what an integration build may modify" above). Run `git diff --name-only main...HEAD` (or against the merge-base). Every modified path must match `pokedex/integrations/{type}/{name}/*`, `pokedex/test/integrations/{name}_test.py`, or fall under `.claude/`. Any other path — `pokedex/resources/<type>/*.py`, `pokedex/test/integrations/base_test.py`, `pokedex/utils/`, `pokedex/api.py`, `pokedex/config.py`, `pokedex/celery_tasks/`, `pokedex/lambda_handlers/`, framework base classes, other integrations — is an **automatic `[BLOCK]` with no `APPROVE_WITH_NOTES` path**. The fix is: revert the out-of-scope edit, escalate to the user with the workaround / separate-PR options, and resubmit. Reviewer must enumerate every offending file in the BLOCK finding.
+- [ ] Targeted `yarn test` filtered to the integration + resource passes (or test failure is an actual bug, not a fixture mismatch from unrelated changes)
+- [ ] `manifest.json` fields populated from the source context — not scaffolder placeholders. **`test/integrations/base_test.py::test_validate_manifest` is the canonical schema** — read it (around line 148) for the authoritative allow-list. Operational metadata (docs URL, UI URL, support contact, test account) lives on integration class methods (`Integration.docs()`, `ui()`, `support()`, `test_account()`), not the manifest.
+
+For sandbox state — if the function-writer's `yarn crawl` returned data:
+
+- [ ] Sample data **actually exercised the function path being claimed validated**. If all 100 orders are in `BLOCKED` status, `format_order`'s shipped-state path is unvalidated — flag as `APPROVE_WITH_NOTES` and surface the gap. If the function is for a resource with no sample data at all (e.g. zero orders returned), flag as `[BLOCK]` and recommend seeding before approval.
+
+For shallow-fix detection — `[BLOCK]` if any of these appear without recorded rationale in `api-summary.md` "Field-mapping decisions":
+
+- [ ] `IntegrationNotImplemented` assigned to any field
+- [ ] `.get(field, default)` used (where default is anything other than what the comment justifies)
+- [ ] A validator's `validate=` argument set to None, no-op, or weakened
+- [ ] A new custom validator function added (not borrowed from canonical helpers)
+- [ ] Schema field's `required=False` changed to bypass validation
+- [ ] A test assertion modified to expect a different value than before (vs. adding new assertions)
+- [ ] A field synthesized from `now()`, hardcoded values, or computed defaults instead of pulled from source
+- [ ] An `except` block that swallows exceptions silently (catches and continues without re-raising or logging)
+
+### Evidence-required exchange (shallow-fix family triggers a conversation, not a one-pass critique)
+
+The shallow-fix family — validator disables, `Strict()→Loose()`, custom-validator-that-bypasses, schema field weakened from required to optional, `IntegrationNotImplemented` on a field the spec says exists, `.get()` with a default where the spec doesn't say "sometimes absent" — represents **judgment failures masquerading as mechanical ones**. One-pass critique ("add rationale") doesn't surface the deeper question: *did the writer miss a better field?*
+
+A reviewer that flags `validate_financial_info_with_line_items` disabled should not just demand rationale — they should pull the writer's reasoning into the open. Maybe the writer compared `total` against `sum(line_items)` and they don't match, when they should have checked `subtotal` or summed `unit_price * quantity` instead of using `total_price`. The conversation surfaces that.
+
+**How it works:**
+
+When the reviewer detects a shallow-fix-family finding, the report's `[BLOCK]` entry includes an **Evidence required** subsection demanding four pieces from the writer:
+
+1. **Raw response sample** — paste the actual JSON/XML body of one record showing the issue (not a summary, not "the field was null"; the actual body).
+2. **Alternative source fields considered** — *named*, with their values from the raw response. Not "I considered alternatives"; specifically `"checked total=$45.20, subtotal=$42.00, total_price=$50.50, grand_total=null"`.
+3. **For each alternative, why it doesn't work** — or pick one and re-implement.
+4. **Justification for the chosen path** — valid only after exhausting the alternatives above.
+
+The writer's next-iteration response (via `SendMessage` to the persisted writer) must include a structured **Evidence responses** section mirroring the request, one block per evidence-required finding.
+
+The fresh reviewer on the next iteration reads the prior reviewer's report + the writer's evidence response as context, and evaluates whether the evidence justifies the chosen path. They can:
+
+- `APPROVE` — evidence is concrete and the chosen path is defensible.
+- `BLOCK` with a refined request — "you considered fields A, B, C but missed field D — check that against the raw response."
+- `BLOCK` on insufficient evidence — "raw response wasn't pasted" / "alternatives weren't named" / "rationale was hand-wavy."
+
+The 3-attempt iteration cap (see `references/loop-control.md`) encompasses evidence-required exchanges. If still unresolved at attempt 3, escalate to user with the full dialogue.
+
+**Mechanical-fix findings don't trigger this.** Docstring present, comprehension used, `or None` suffix — these are clear violations with clear fixes. One-pass critique stays.
+
+#### Reviewer report format addition
+
+When a finding qualifies, the report's `Mandatory rule violations` block includes:
+
+```markdown
+- [BLOCK] {file}:{line} — {validator/schema/IntegrationNotImplemented rule}. {one-line description}
+
+  **Evidence required (respond in your Evidence responses section):**
+  1. Raw response sample for {record type} — paste full JSON/XML body of one sample.
+  2. Alternative source fields considered for {target field}: list named, with values.
+  3. Per alternative: why it doesn't work, or pick it and re-implement.
+  4. Justification for the chosen path (only valid after exhausting alternatives).
+```
+
+#### Writer response format addition
+
+When responding to evidence-required findings, the writer adds an **Evidence responses** section to the return notes (or to the SendMessage response):
+
+```markdown
+## Evidence responses
+
+### {file}:{line} — {finding}
+
+**Raw sample:** {paste full record body}
+
+**Alternatives considered:**
+- `field_a`: <value> — <why considered, why rejected, or "implemented using this">
+- `field_b`: <value> — <reason>
+- `field_c`: <value> — <reason>
+
+**Chosen path:** {what was implemented, or "stands as disabled because [reason that survives the alternatives above]"}
+```
+
+The writer must do this work honestly — *if* during evidence gathering you realize the reviewer is right and there's a better field, re-implement using that field. Don't defend the original disable just because it was the initial choice.
+
+---
+
+## Exemplar discovery process
+
+The api-validator subagent identifies a **primary** and (optionally) **secondary** exemplar integration to use as shape reference. Selection axes:
+
+1. **Transport** — REST / SOAP / GraphQL / SFTP / file-drop / FTP
+2. **Auth scheme** — OAuth2 with refresh / OAuth2 static / OAuth1 HMAC / API key in header / API key in query / Basic Auth / custom signed
+3. **Pagination style** — next_token (vendor returns an opaque token under any name — `endCursor`, `next_cursor`, `next_page`, etc. — trackstar wraps it as `next_token` returned + `page_token` received) / offset+limit / page-number / link-header / none
+4. **Response format** — JSON / XML / CSV / other
+5. **Token refresh model** — refresh flow vs static creds
+6. **Webhook presence** — push model with HMAC signing, push without auth, none
+
+The api-validator searches `pokedex/integrations/*/integration.py` with Grep/Glob directly, one pass per axis (it is depth-1 restricted, so it cannot delegate the searches), then ranks candidates by overlap. Output goes into `.claude/references/{integration_name}/api-summary.md`:
+
+```markdown
+## API Characteristics
+- Transport: ...
+- Auth: ...
+- Pagination: ...
+- Response format: ...
+- Token refresh: ...
+- Webhooks: ...
+
+## Recommended exemplar
+**Primary:** pokedex/integrations/{type}/{name}/integration.py
+- matches: {axes that align}
+
+**Secondary:** pokedex/integrations/{type}/{name}/integration.py
+- partial match: {axes that align, axes that diverge}
+
+## Match notes
+{Specific guidance — e.g., "use Primary's auth header pattern at lines 40-80; use Secondary's next_token loop in get_orders since Primary uses page-number"}
+```
+
+If no candidate scores above threshold, write: **"No close exemplar — implementation will set the new pattern."** Function-writer then leans on universal rules above instead of shape-copying.
+
+---
+
+## How subagents consume this file
+
+| Subagent | Mode |
+|---|---|
+| `integration-function-writer` | Reads as **input** — follow these rules while writing |
+| `integration-reviewer` | Reads as **checklist** — verify each rule against the diff, list violations as `[BLOCK]` items |
+| `integration-api-validator` | Reads only the "Exemplar discovery process" section |
+
+All three are required to read this file at the start of every invocation. Do not skip.
+
+---
+
+## Cross-reference: project CLAUDE.md
+
+`/Users/keerthi/trackstar/.claude/CLAUDE.md` contains a shorter version of these rules for the main agent (which auto-loads CLAUDE.md). The two files duplicate intentionally — subagents have isolated context. When updating a rule, **update both**. CLAUDE.md is the human-facing summary; this file is the operational checklist.

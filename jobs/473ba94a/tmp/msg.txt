@@ -1,0 +1,28 @@
+deposco: build get_inventory's product map from the stored catalog
+
+get_inventory pre-fetched the entire Deposco product catalog on every pass just
+to read purchaseCost and pack measurements, which dominated the crawl on large
+connections (TRA-2554). Those two values now live on each product's
+additional_fields, so the pass reads the stored catalog from dynamo instead:
+
+- get_product_and_kit_maps (a full search/item + search/kitHeader walk) becomes
+  build_product_and_kit_maps, backed by Product(self).get_all_resources()
+- format_inventory_item and format_enterprise_inventory read unit_cost and
+  measurements off additional_fields rather than re-deriving them from raw packs
+- format_product drops the is_internal branch and its additional_info payload,
+  which only existed to feed the pre-fetch
+
+Building the map now either completes or raises, so the "map did not finish
+building" zero-fill guard is gone; the database-error and short-feed guards are
+unchanged. Products the feed doesn't return still zero-fill as before, and an
+inventory item with no stored product still falls back to a synthetic one.
+
+Kits and products not re-crawled since the fields landed carry no cost or
+measurements yet and fall back to null cost and empty measurements; they fill in
+as the catalog re-crawls.
+
+Verified with yarn test -k deposco --inventory --products (3 passed, 2 write
+tests skipped, ledger xfail).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017YUtxG7nJczeAE5nrWdMwu

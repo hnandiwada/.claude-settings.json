@@ -1,0 +1,249 @@
+import json
+from unittest.mock import MagicMock
+
+import pytest
+from lambda_handlers.event_intake import process_http
+from utils.event_intake import EventIntake
+
+CONNECTION_ID = "test-connection-123"
+ORG_ID = "test-org-id"
+
+
+@pytest.fixture
+def connection_row():
+    return {
+        "id": CONNECTION_ID,
+        "org_id": ORG_ID,
+        "integration_name": "fba",
+        "integration_type": "wms",
+        "additional_fields": {},
+        "customer_id": None,
+        "webhooks_disabled": False,
+    }
+
+
+@pytest.fixture
+def intake(mocker, connection_row):
+    mocker.patch("utils.event_intake.get_connections_row", return_value=connection_row)
+    mocker.patch("utils.event_intake.is_org_inactive", return_value=False)
+    mocker.patch("utils.event_intake.build_integration", return_value=MagicMock())
+    return EventIntake(CONNECTION_ID, ORG_ID, "wms")
+
+
+def test_deleted_connection_is_not_processed(mocker, connection_row):
+    deleted_row = {**connection_row, "deleted": True}
+
+    # stands in for get_connections_row, which only rejects a deleted row when the
+    # caller leaves ignore_deleted alone. asking for one back is what this pins.
+    def get_row(connection_id, ignore_deleted=True, consistent=False):
+        if ignore_deleted:
+            raise Exception("Connection deleted")
+        return deleted_row
+
+    mocker.patch("utils.event_intake.get_connections_row", side_effect=get_row)
+    build = mocker.patch("utils.event_intake.build_integration")
+    with pytest.raises(Exception, match="Connection deleted"):
+        EventIntake(CONNECTION_ID)
+    build.assert_not_called()
+
+
+class TestProcess:
+    def test_update_action_calls_handle_update(self, intake, mocker):
+        mock_handle = mocker.patch.object(intake, "_handle_update")
+        transform_result = {
+            "resource": "products",
+            "id": "sku-123",
+            "action": "update",
+            "fields": {"active": True},
+        }
+        intake.process(transform_result)
+        mock_handle.assert_called_once()
+
+    def test_inactive_org_skips_event(self, intake, mocker):
+        mocker.patch("utils.event_intake.is_org_inactive", return_value=True)
+        mock_handle = mocker.patch.object(intake, "_handle_update")
+        transform_result = {
+            "resource": "products",
+            "id": "sku-123",
+            "action": "update",
+            "fields": {"active": True},
+        }
+        intake.process(transform_result)
+        mock_handle.assert_not_called()
+
+    def test_unsupported_action_raises(self, intake):
+        transform_result = {
+            "resource": "products",
+            "id": "sku-123",
+            "action": "delete",
+            "fields": {},
+        }
+        with pytest.raises(Exception, match="Unsupported action"):
+            intake.process(transform_result)
+
+    def test_handle_update_stores_and_sends_webhook(self, intake, mocker):
+        merged_row = {
+            "connection_id": CONNECTION_ID,
+            "id": "sku-123",
+            "active": True,
+            "updated_date": "2026-04-09T00:00:00Z",
+        }
+        mocker.patch(
+            "utils.event_intake.prepare_partial_update", return_value=merged_row
+        )
+        mocker.patch(
+            "utils.event_intake.get_rows_for_dynamo_webhook",
+            return_value=([merged_row], [merged_row]),
+        )
+        mock_store = mocker.patch("utils.event_intake.store_resources")
+        mock_webhook = mocker.patch("utils.event_intake.write_pickle_to_s3")
+
+        resource = MagicMock()
+        intake._handle_update(resource, "sku-123", {"active": True})
+
+        mock_webhook.assert_called_once_with(
+            "webhook",
+            {"resource": resource, "data": [merged_row]},
+            source="event-intake",
+        )
+        mock_store.assert_called_once()
+
+    def test_handle_update_no_existing_row(self, intake, mocker):
+        mocker.patch("utils.event_intake.prepare_partial_update", return_value=None)
+        mock_store = mocker.patch("utils.event_intake.store_resources")
+        mock_webhook = mocker.patch("utils.event_intake.write_pickle_to_s3")
+
+        resource = MagicMock()
+        intake._handle_update(resource, "sku-123", {"active": True})
+
+        mock_store.assert_not_called()
+        mock_webhook.assert_not_called()
+
+    def test_handle_update_no_changes_detected(self, intake, mocker):
+        mocker.patch(
+            "utils.event_intake.prepare_partial_update",
+            return_value={"id": "sku-123"},
+        )
+        mocker.patch(
+            "utils.event_intake.get_rows_for_dynamo_webhook",
+            return_value=([], []),
+        )
+        mock_store = mocker.patch("utils.event_intake.store_resources")
+        mock_webhook = mocker.patch("utils.event_intake.write_pickle_to_s3")
+
+        resource = MagicMock()
+        intake._handle_update(resource, "sku-123", {"active": True})
+
+        mock_store.assert_not_called()
+        mock_webhook.assert_not_called()
+
+    def test_handle_update_skips_webhook_when_disabled(self, intake, mocker):
+        intake.connection_row["webhooks_disabled"] = True
+        merged_row = {"id": "sku-123", "active": True}
+        mocker.patch(
+            "utils.event_intake.prepare_partial_update", return_value=merged_row
+        )
+        mocker.patch(
+            "utils.event_intake.get_rows_for_dynamo_webhook",
+            return_value=([merged_row], [merged_row]),
+        )
+        mock_store = mocker.patch("utils.event_intake.store_resources")
+        mock_webhook = mocker.patch("utils.event_intake.write_pickle_to_s3")
+
+        resource = MagicMock()
+        intake._handle_update(resource, "sku-123", {"active": True})
+
+        # store should still run - only the webhook is skipped when disabled
+        mock_store.assert_called_once()
+        mock_webhook.assert_not_called()
+
+
+class TestRedactPii:
+    def test_handle_update_stores_redacted_rows(self, intake, mocker):
+        merged_row = {"id": "order-123", "status": "shipped"}
+        redacted_row = {"id": "order-123", "status": "redacted"}
+        mocker.patch(
+            "utils.event_intake.prepare_partial_update", return_value=merged_row
+        )
+        mock_rows = mocker.patch(
+            "utils.event_intake.get_rows_for_dynamo_webhook", return_value=([], [])
+        )
+
+        resource = MagicMock()
+        resource.redact_pii.return_value = [redacted_row]
+        intake._handle_update(resource, "order-123", {"status": "shipped"})
+
+        resource.redact_pii.assert_called_once_with([merged_row])
+        mock_rows.assert_called_once_with(resource, [redacted_row])
+
+    def test_handle_create_stores_redacted_rows(self, intake, mocker):
+        redacted_row = {"id": "order-123", "status": "redacted"}
+        mocker.patch("utils.event_intake.AddTrackstarTag")
+        mock_rows = mocker.patch(
+            "utils.event_intake.get_rows_for_dynamo_webhook", return_value=([], [])
+        )
+
+        resource = MagicMock()
+        resource.redact_pii.return_value = [redacted_row]
+        intake._handle_create(resource, "order-123", {"id": "order-123"})
+
+        resource.redact_pii.assert_called_once()
+        mock_rows.assert_called_once_with(resource, [redacted_row])
+
+
+class TestProcessHttp:
+    # generic contract between process_http and any integration's verify_notification —
+    # uses flexport as the example integration name for logging realism only.
+
+    @pytest.fixture
+    def http_intake(self, mocker):
+        integration = MagicMock()
+        integration.verify_notification.return_value = True
+        integration.transform_notification.return_value = None
+
+        intake = MagicMock()
+        intake.integration = integration
+        intake.integration_type = "wms"
+        intake.integration_name = "flexport"
+
+        mocker.patch("lambda_handlers.event_intake.EventIntake", return_value=intake)
+        return intake
+
+    def _event(self, headers=None, body=None):
+        return {
+            "requestContext": {"httpMethod": "POST"},
+            "pathParameters": {"connection_id": CONNECTION_ID},
+            "headers": headers if headers is not None else {},
+            "body": body if body is not None else json.dumps({"event": "test"}),
+        }
+
+    def test_verify_called_with_payload_raw_body_and_headers(self, http_intake):
+        headers = {"X-Trackstar-Webhook-Token": "abc"}
+        body = json.dumps({"event": "test"})
+
+        process_http(self._event(headers=headers, body=body))
+
+        http_intake.integration.verify_notification.assert_called_once_with(
+            {"event": "test"}, body, headers
+        )
+
+    def test_returns_401_and_skips_transform_when_verify_false(self, http_intake):
+        http_intake.integration.verify_notification.return_value = False
+
+        response = process_http(
+            self._event(headers={"X-Trackstar-Webhook-Token": "bad"})
+        )
+
+        assert response["statusCode"] == 401
+        assert json.loads(response["body"]) == {"error": "unauthorized"}
+        http_intake.integration.transform_notification.assert_not_called()
+
+    def test_proceeds_to_transform_when_verify_true(self, http_intake):
+        http_intake.integration.verify_notification.return_value = True
+
+        response = process_http(
+            self._event(headers={"X-Trackstar-Webhook-Token": "good"})
+        )
+
+        assert response["statusCode"] == 200
+        http_intake.integration.transform_notification.assert_called_once()

@@ -1,0 +1,1412 @@
+import json
+import re
+from copy import deepcopy
+from datetime import datetime
+from enum import Enum
+from config import IDEMPOTENCY_KEY_MAX_LENGTH, MAX_IN_OPERANDS
+from utils.exceptions import PokedexException
+from utils.utils import dt_to_str, get_state_and_country_codes_from_input
+from marshmallow import (
+    ValidationError,
+    pre_load,
+    post_load,
+    validates_schema,
+    missing,
+)  # pass thru
+from apiflask import Schema as RawSchema
+from apiflask.fields import (
+    String as StringField,
+    Boolean as BooleanField,
+    Integer as IntegerField,
+    Float as FloatField,
+    List as ListField,
+    DelimitedList as DelimitedListField,
+    Dict as DictField,
+    Raw as RawField,
+    Field,
+    File,
+    Nested,
+)
+from marshmallow_oneofschema.one_of_schema import OneOfSchema  # pass thru
+from apiflask.validators import (
+    OneOf as RawOneOf,
+    Regexp,
+    Length,
+    Range,
+    URL,
+)  # pass thru
+from utils.logutil import getLogger
+
+logger = getLogger()
+
+
+class TableClass(Enum):
+    STANDARD = "STANDARD"
+    STANDARD_INFREQUENT_ACCESS = "STANDARD_INFREQUENT_ACCESS"
+
+
+class OneOf(RawOneOf):
+    def __init__(self, choices, labels=None, **kwargs):
+        self.default_message += " Got {input} instead."
+        super().__init__(choices, labels, **kwargs)
+
+
+# fields
+class Schema(RawSchema):
+    class Meta:
+        ordered = True
+
+
+# apiflask serializes @api.output through schema.dump(); a field-less schema
+# strips everything to {}. unknown= only affects load, not dump, so pass the
+# already-shaped dict (e.g. an OpenAPI spec) straight through untouched.
+class PassthroughSchema(RawSchema):
+    def dump(self, obj, **kwargs):
+        return obj
+
+
+class FieldMixin(Field):
+    def __init__(self, *args, not_implemented_default=None, **kwargs):
+        kwargs = self.set_default_on_init(not_implemented_default, **kwargs)
+        super().__init__(*args, **kwargs)
+
+    def set_default_on_init(self, not_implemented_default=None, **kwargs):
+        kwargs.setdefault("required", True)
+        allow_none = kwargs.get("allow_none", False)
+        allow_not_implemented = kwargs.get("allow_not_implemented", False)
+        if allow_not_implemented:
+            if not_implemented_default is None:
+                if "allow_none" in kwargs and not allow_none:
+                    # TRA-734
+                    raise Exception(
+                        "allow_not_implemented requires allow_none to be True"
+                    )
+                allow_none = True
+        kwargs["allow_none"] = allow_none
+        kwargs["allow_not_implemented"] = allow_not_implemented
+        self.allow_not_implemented = allow_not_implemented
+        self.not_implemented_default = not_implemented_default
+        # when you override "validators" it becomes not JSON serializable
+        validators_msg = (
+            "Don't override `validators`! You probably meant to override `validate`."
+        )
+        assert "validators" not in kwargs, validators_msg
+        validate = kwargs.get("validate", [])
+        assert isinstance(validate, list), "validate must be a list"
+        kwargs["validate"] = validate
+        default_msg = "Don't override `default`, `missing` or `dump_default`! You probably meant to override `load_default`."
+        assert "default" not in kwargs, default_msg
+        assert "missing" not in kwargs, default_msg
+        assert "dump_default" not in kwargs, default_msg
+        if "load_default" in kwargs:
+            assert kwargs["required"] is False, (
+                "required should be False if default is set"
+            )
+            kwargs["default"] = kwargs["load_default"]
+            # for showing up in the meta response
+
+        return kwargs
+
+    def _serialize(self, value, *args, **kwargs):
+        if isinstance(value, IntegrationNotImplementedClass):
+            return self.not_implemented_default
+        return super()._serialize(value, *args, **kwargs)
+
+    def deserialize(self, value, *args, **kwargs):
+        if isinstance(value, IntegrationNotImplementedClass):
+            if self.allow_not_implemented:
+                return self.not_implemented_default
+            raise ValidationError("Field must be implemented")
+        return super().deserialize(value, *args, **kwargs)
+
+
+class IntegrationNotImplementedClass:
+    def __bool__(self):
+        return False
+
+    # instances get copied by deepcopy and rebuilt on deserialize, so identity can't
+    # be relied on when one of these is used as a dict key
+    def __eq__(self, other):
+        return isinstance(other, IntegrationNotImplementedClass)
+
+    def __hash__(self):
+        return hash(IntegrationNotImplementedClass)
+
+
+IntegrationNotImplemented = IntegrationNotImplementedClass()
+
+
+def load_not_implemented(obj, implemented_dict):
+    for key, value in obj.items():
+        if key not in implemented_dict:
+            continue
+        if key == "trackstar_tags":
+            continue
+        impl_value = implemented_dict[key]
+        if not value and impl_value == False:
+            obj[key] = IntegrationNotImplemented
+            continue
+        if isinstance(value, dict):
+            if isinstance(impl_value, dict):
+                load_not_implemented(value, impl_value)
+            elif not impl_value:
+                if not value:
+                    obj[key] = IntegrationNotImplemented
+                else:
+                    all_keys_null = True
+                    for v in value.values():
+                        if v is not None:
+                            all_keys_null = False
+                            break
+                    if all_keys_null:
+                        obj[key] = IntegrationNotImplemented
+            else:
+                obj[key] = value
+        elif isinstance(value, list):
+            returned_list = []
+            for item in value:
+                if isinstance(item, dict):
+                    if impl_value and isinstance(impl_value[0], dict):
+                        load_not_implemented(item, impl_value[0])
+                else:
+                    if impl_value:
+                        if not item and not impl_value[0]:
+                            item = IntegrationNotImplemented
+                returned_list.append(item)
+            obj[key] = returned_list
+
+
+def same_option_in(choices, value):
+    # if example has different capitalization, correct it
+    if not choices or not value:
+        return None
+    wanted = re.sub(r"[^a-z0-9]", "", value.lower())
+    for choice in sorted(choices):
+        if not isinstance(choice, str):
+            continue
+        if re.sub(r"[^a-z0-9]", "", choice.lower()) == wanted:
+            return choice
+    return None
+
+
+def is_placeholder_enum(choices):
+    # filter out some placeholders
+    if not choices:
+        return False
+    for choice in choices:
+        if not isinstance(choice, str):
+            return False
+        text = choice.lower()
+        if "connect an account" not in text and not text.startswith("n/a"):
+            return False
+    return True
+
+
+def string_is_empty(item):
+    if item is None:
+        return True
+    if not isinstance(item, str):
+        return False
+    item = item.strip()
+    if item.lower() == "none":
+        return True
+    if item.lower() == "null":
+        return True
+    if item == "":
+        return True
+    return False
+
+
+def validate_string_is_not_empty(item):
+    if string_is_empty(item):
+        raise ValidationError("String may not be empty.")
+    return item
+
+
+def get_real_string_value(item):
+    if string_is_empty(item):
+        return None
+    if isinstance(item, str):
+        return item.strip()
+    return item
+
+
+REDACTED = "*****"
+
+
+class Raw(FieldMixin, RawField):
+    pass
+
+
+class String(FieldMixin, StringField):
+    fallback_example = None
+
+    def __init__(
+        self, desc: str = "", example: str = "", dont_strip: bool = False, **kwargs
+    ):
+        self.dont_strip = dont_strip
+        validate = kwargs.get("validate", [])
+        # OneOf stopped showing enums in meta response. Here we add them in manually
+        for v in validate:
+            if isinstance(v, RawOneOf):
+                kwargs["enum"] = v.choices
+        validate.append(validate_string_is_not_empty)
+        kwargs["validate"] = validate
+        kwargs["description"] = desc
+        if example:
+            kwargs["example"] = example
+        super().__init__(**kwargs)
+
+    def default_example(self, field_name, replacing=None):
+        load_default = self.load_default
+        if load_default is missing or not isinstance(load_default, str):
+            load_default = None
+        enum = self.metadata.get("enum")
+        if is_placeholder_enum(enum):
+            enum = None
+        candidates = [
+            same_option_in(enum, replacing),
+            load_default,
+            # min() used to ensure the same pick every time
+            min(enum) if enum else None,
+            self.fallback_example,
+            field_name,
+        ]
+        for candidate in candidates:
+            if candidate and self.example_is_allowed(candidate):
+                return candidate
+        return None
+
+    def example_is_allowed(self, candidate):
+        for validator in self.validators:
+            # only the declarative validators
+            if not isinstance(validator, (RawOneOf, Regexp, Length)):
+                continue
+            if isinstance(validator, RawOneOf) and is_placeholder_enum(
+                validator.choices
+            ):
+                continue
+            try:
+                validator(candidate)
+            except ValidationError:
+                # test will fail and we can edit the individual example
+                return False
+        return True
+
+    def _bind_to_schema(self, field_name, schema):
+        super()._bind_to_schema(field_name, schema)
+        given = self.metadata.get("example")
+        if given and self.example_is_allowed(given):
+            return
+        example = self.default_example(field_name, replacing=given)
+        if example:
+            self.metadata["example"] = example
+        else:
+            self.metadata.pop("example", None)
+
+    def deserialize(self, *args, **kwargs):
+        original_value = args[0]
+        stripped_value = get_real_string_value(original_value)
+        if self.dont_strip:
+            if stripped_value is None:
+                value_to_use = None
+            else:
+                value_to_use = original_value
+        else:
+            value_to_use = stripped_value
+        args_to_use = (value_to_use,) + args[1:]
+        ret = super().deserialize(*args_to_use, **kwargs)
+        return ret
+
+
+class DateTime(String):
+    fallback_example = "2023-03-15T13:45:30Z"
+
+    def __init__(self, desc: str = "", example: str = "", **kwargs):
+        metadata = kwargs.get("metadata", {})
+        metadata["format"] = "date-time"
+        kwargs["metadata"] = metadata
+
+        def validate_iso8601_datetime(item):
+            try:
+                dt = datetime.fromisoformat(item)
+                if not dt.tzinfo:
+                    raise ValidationError("ISO8601 datetime must have a timezone.")
+            except ValueError:
+                raise ValidationError(f"Invalid ISO8601 datetime format for {item}")
+
+        validate = kwargs.get("validate", [])
+        validate.append(validate_iso8601_datetime)
+        kwargs["validate"] = validate
+        super().__init__(
+            desc=desc,
+            example=example,
+            **kwargs,
+        )
+
+    def _deserialize(self, *args, **kwargs):
+        ret = super()._deserialize(*args, **kwargs)
+        try:
+            dt = datetime.fromisoformat(ret)
+        except ValueError:
+            raise ValidationError(f"Invalid ISO8601 datetime format: {ret}")
+        if not dt.tzinfo:
+            raise ValidationError("ISO8601 datetime must have a timezone.")
+        in_utc = dt_to_str(dt)
+        return in_utc
+
+
+class Date(String):
+    fallback_example = "2023-03-15"
+
+    def __init__(self, desc: str = "", example: str = "", **kwargs):
+        metadata = kwargs.get("metadata", {})
+        metadata["format"] = "date"
+        kwargs["metadata"] = metadata
+
+        def validate_date(item):
+            try:
+                datetime.strptime(item, "%Y-%m-%d")
+            except ValueError:
+                raise ValidationError("Invalid date format.")
+
+        validate = kwargs.get("validate", [])
+        validate.append(validate_date)
+        kwargs["validate"] = validate
+        super().__init__(
+            desc=desc,
+            example=example,
+            **kwargs,
+        )
+
+    def _deserialize(self, *args, **kwargs):
+        ret = super()._deserialize(*args, **kwargs)
+        if "T" in ret:
+            ret = ret.split("T")[0]
+        return ret
+
+
+class Boolean(FieldMixin, BooleanField):
+    def __init__(self, desc: str = "", example: bool = True, **kwargs):
+        super().__init__(description=desc, example=example, **kwargs)
+
+
+class Integer(FieldMixin, IntegerField):
+    def __init__(self, desc: str = "", example: int = 0, **kwargs):
+        super().__init__(description=desc, example=example, **kwargs)
+
+
+class Float(FieldMixin, FloatField):
+    def __init__(self, desc: str = "", example: float = 0.0, **kwargs):
+        super().__init__(description=desc, example=example, **kwargs)
+
+
+class List(FieldMixin, ListField):
+    def __init__(
+        self,
+        desc: str = "",
+        example: list = [],
+        obj=None,
+        not_implemented_default=[],
+        **kwargs,
+    ):
+        if not obj:
+            raise ValueError("obj is required")
+        init_args = {"cls_or_instance": obj, "description": desc}
+        if example:
+            init_args["example"] = example
+        super().__init__(
+            **init_args, not_implemented_default=not_implemented_default, **kwargs
+        )
+
+
+class CommaSeparatedList(FieldMixin, DelimitedListField):
+    def __init__(self, desc: str = "", example: str = "", obj=None, **kwargs):
+        if not obj:
+            raise ValueError("obj is required")
+        kwargs["delimiter"] = ","
+        init_args = {"cls_or_instance": obj, "description": desc}
+        if example:
+            init_args["example"] = example
+        super().__init__(**init_args, **kwargs)
+
+
+class Dict(FieldMixin, DictField):
+    def __init__(
+        self,
+        desc: str = "",
+        example: dict = {},
+        keys=None,
+        values=None,
+        not_implemented_default={},
+        **kwargs,
+    ):
+        if not keys:
+            raise ValueError("keys is required")
+        if not values:
+            raise ValueError("values is required")
+        super().__init__(
+            description=desc,
+            example=example,
+            keys=keys,
+            values=values,
+            not_implemented_default=not_implemented_default,
+            **kwargs,
+        )
+
+
+class NestedSchema(FieldMixin, Nested):
+    def __init__(self, schema_name, not_implemented_default={}, **kwargs):
+        # build schema out of kwargs
+        assert " " not in schema_name, "Schema name cannot contain spaces"
+        kwargs = kwargs.copy()
+        allow_none = kwargs.pop("allow_none", False)
+        required = kwargs.pop("required", True)
+        allow_not_implemented = kwargs.pop("allow_not_implemented", False)
+        exclude = kwargs.pop("exclude", [])
+        partial = kwargs.pop("partial", None)
+        if partial:
+            schema_name += "Partial"
+        unknown = kwargs.pop("unknown", None)
+        schema = Schema.from_dict(kwargs, name=schema_name)
+        schema_instance = schema(partial=partial, unknown=unknown, exclude=exclude)
+        super().__init__(
+            schema_instance,
+            not_implemented_default=not_implemented_default,
+            allow_none=allow_none,
+            required=required,
+            allow_not_implemented=allow_not_implemented,
+        )
+
+
+def validate_created_updated(item):
+    msg = f"created_date is after updated_date for item: {item}"
+    assert item["created_date"] <= item["updated_date"], msg
+
+
+# schema descriptions
+
+CUSTOMER_ID = lambda **kwargs: String(
+    "An identifier for your end customer.", "customer_id", **kwargs
+)
+
+NEXT_TOKEN = String(
+    "See [pagination](/how-to-guides/about-the-api#pagination) for more details.",
+    "next_token",
+    allow_none=True,
+)
+
+TOTAL_COUNT = Integer("The number of items returned.", 1)
+
+WAREHOUSE_CUSTOMER_ID = lambda obj, allow_not_implemented=True, **kwargs: String(
+    f"The ID of the merchant/tenant/customer that owns the {obj}. {WAREHOUSE_CUSTOMER_ENDPOINT}",
+    "warehouse_customer_id",
+    allow_not_implemented=allow_not_implemented,
+    **kwargs,
+)
+
+CREATED_DATE = lambda obj, **kwargs: DateTime(
+    f"The date the {obj} was created.",
+    "2022-01-01T00:00:00Z",
+    **kwargs,
+)
+UPDATED_DATE = lambda obj, **kwargs: DateTime(
+    f"The date the {obj} was last updated.",
+    "2022-01-02T05:05:05Z",
+    **kwargs,
+)
+
+STATUS = lambda obj, options, **kwargs: String(
+    f"The status of the {obj}. See the [{obj} information](info) for more details.",
+    options[0],
+    validate=[OneOf(options)],
+    **kwargs,
+)
+
+SKIP_RETRIEVAL = lambda obj, verb, **kwargs: Boolean(
+    f"Skip {obj} retrieval after successful {verb}",
+    False,
+    required=False,
+    load_default=False,
+    **kwargs,
+)
+
+WAREHOUSE_CUSTOMER_ENDPOINT = "Can be passed into the [Warehouse Customer](/api-reference/wms-api/warehouse-customers/get-item) endpoint for more details."
+WAREHOUSE_ENDPOINT = "Can be passed into the [Warehouse](/api-reference/wms-api/warehouses/get-item) endpoint for more details."
+CART_WAREHOUSE_ENDPOINT = "Can be passed into the [Warehouse](/api-reference/cart-api/warehouses/get-item) endpoint for more details."
+INVENTORY_ENDPOINT = "Can be passed into the [Inventory](/api-reference/wms-api/inventory/get-item) endpoint for more details."
+PRODUCT_ENDPOINT = "Can be passed into the [Product](/api-reference/wms-api/products/get-item) endpoint for more details."
+CART_PRODUCT_ENDPOINT = "Can be passed into the [Cart Product](/api-reference/cart-api/products/get-item) endpoint for more details."
+ORDER_ENDPOINT = "Can be passed into the [Order](/api-reference/wms-api/orders/get-item) endpoint for more details."
+SHIPPING_METHOD_ENDPOINT = "Can be passed into the [Shipping Method](/api-reference/wms-api/shipping-methods/get-item) endpoint for more details."
+WAREHOUSE_LOCATION_ENDPOINT = "Can be passed into the [Warehouse Location](/wms-api/warehouses/get-warehouse-locations) endpoint for more details."
+
+
+# this is only for user with the get schemas!
+SHIP_TO_ADDRESS = lambda **kwargs: NestedSchema(
+    schema_name="ShipToAddress",
+    full_name=String(example="John Doe", allow_not_implemented=True),
+    company=String(example="Company", allow_not_implemented=True),
+    address1=String(example="123 Main St", allow_not_implemented=True),
+    address2=String(example="Apt 2", allow_not_implemented=True),
+    address3=String(example="Floor 3", allow_not_implemented=True),
+    city=String(example="New York", allow_not_implemented=True),
+    state=String(example="NY", allow_not_implemented=True),
+    postal_code=String(example="10001", allow_not_implemented=True),
+    country=String(example="United States", allow_not_implemented=True),
+    phone_number=String(example="123-456-7890", allow_not_implemented=True),
+    email_address=String(example="johndoe@example.com", allow_not_implemented=True),
+    allow_not_implemented=True,
+    not_implemented_default={
+        "full_name": None,
+        "company": None,
+        "address1": None,
+        "address2": None,
+        "address3": None,
+        "city": None,
+        "state": None,
+        "postal_code": None,
+        "country": None,
+        "phone_number": None,
+        "email_address": None,
+    },
+    **kwargs,
+)
+# this is only for user with the get schemas!
+BILLING_ADDRESS = lambda **kwargs: NestedSchema(
+    schema_name="BillToAddress",
+    full_name=String(example="John Doe", allow_not_implemented=True),
+    address1=String(example="123 Main St", allow_not_implemented=True),
+    address2=String(example="Apt 2", allow_not_implemented=True),
+    address3=String(example="Floor 3", allow_not_implemented=True),
+    city=String(example="New York", allow_not_implemented=True),
+    state=String(example="NY", allow_not_implemented=True),
+    postal_code=String(example="10001", allow_not_implemented=True),
+    country=String(example="United States", allow_not_implemented=True),
+    allow_not_implemented=True,
+    not_implemented_default={
+        "full_name": None,
+        "address1": None,
+        "address2": None,
+        "address3": None,
+        "city": None,
+        "state": None,
+        "postal_code": None,
+        "country": None,
+    },
+    **kwargs,
+)
+# this is only for user with the get schemas!
+SHIP_FROM_ADDRESS = lambda **kwargs: NestedSchema(
+    schema_name="ShipFromAddress",
+    address1=String(example="123 Main St", allow_not_implemented=True),
+    address2=String(example="Apt 2", allow_not_implemented=True),
+    address3=String(example="Floor 3", allow_not_implemented=True),
+    city=String(example="New York", allow_not_implemented=True),
+    state=String(example="NY", allow_not_implemented=True),
+    postal_code=String(example="10001", allow_not_implemented=True),
+    country=String(example="United States", allow_not_implemented=True),
+    allow_not_implemented=True,
+    not_implemented_default={
+        "address1": None,
+        "address2": None,
+        "address3": None,
+        "city": None,
+        "state": None,
+        "postal_code": None,
+        "country": None,
+    },
+    **kwargs,
+)
+# don't use this raw! use it from the integrations!
+CREATE_ADDRESS = (
+    lambda schema_name, optional=[], nullable=[], integration_name="", **kwargs: (
+        NestedSchema(
+            schema_name=schema_name + integration_name.title(),
+            full_name=String(
+                example="John Doe",
+                required=("full_name" not in optional),
+                allow_none=("full_name" in nullable),
+            ),
+            company=String(
+                example="Company",
+                required=("company" not in optional),
+                allow_none=("company" in nullable),
+            ),
+            address1=String(
+                example="123 Main St",
+                required=("address1" not in optional),
+                allow_none=("address1" in nullable),
+            ),
+            address2=String(
+                example="Apt 2",
+                required=("address2" not in optional),
+                allow_none=("address2" in nullable),
+            ),
+            city=String(
+                example="San Francisco",
+                required=("city" not in optional),
+                allow_none=("city" in nullable),
+            ),
+            state=String(
+                example="CA",
+                required=("state" not in optional),
+                allow_none=("state" in nullable),
+            ),
+            postal_code=String(
+                example="94105",
+                required=("postal_code" not in optional),
+                allow_none=("postal_code" in nullable),
+            ),
+            country=String(
+                example="United States",
+                required=("country" not in optional),
+                allow_none=("country" in nullable),
+            ),
+            **kwargs,
+        )
+    )
+)
+
+
+def redact_resource_pii(resource):
+    fields_to_redact = [
+        "full_name",
+        "name",
+        "first_name",
+        "last_name",
+        "address1",
+        "address2",
+        "address3",
+        "phone_number",
+        "phone",
+        "email_address",
+        "email",
+    ]
+    resource_needs_redaction = "full_name" in resource or "name" in resource
+    # otherwise it's not a PII address.
+    # for example, inbound shipments have a "ship_from_address" that is the warehouse, not a person.
+    result = {}
+    for field_name, field_value in resource.items():
+        if isinstance(field_value, str):
+            if (
+                resource_needs_redaction
+                and field_name in fields_to_redact
+                and field_value
+            ):
+                field_value = REDACTED
+        if isinstance(field_value, dict):
+            field_value = redact_resource_pii(field_value)
+        elif isinstance(field_value, list):
+            field_value = redact_resources_pii(field_value)
+        result[field_name] = field_value
+    return result
+
+
+def redact_resources_pii(resources):
+    redacted_resources = []
+    for resource in resources:
+        if isinstance(resource, dict):
+            resource = redact_resource_pii(resource)
+        # shouldn't need to handle list of list
+        redacted_resources.append(resource)
+    return redacted_resources
+
+
+dimension_units = ["cm", "in"]
+DIMENSION_UNIT = lambda obj, **kwargs: String(
+    f"The unit of measurement for the size of the {obj}.",
+    "in",
+    validate=[OneOf(dimension_units)],
+    **kwargs,
+)
+weight_units = ["kg", "oz", "lb"]
+WEIGHT_UNIT = lambda obj, **kwargs: String(
+    f"The unit of measurement for the weight of the {obj}.",
+    "lb",
+    validate=[OneOf(weight_units)],
+    **kwargs,
+)
+MEASUREMENTS = lambda obj, integration_name="", **kwargs: NestedSchema(
+    schema_name=f"{obj.title().replace(' ', '')}Measurements{integration_name}",
+    description=f"The measurements of the {obj}.",
+    length=Float(example=1.5, allow_not_implemented=True),
+    width=Float(example=1.5, allow_not_implemented=True),
+    height=Float(example=1.5, allow_not_implemented=True),
+    unit=DIMENSION_UNIT(obj, allow_not_implemented=True),
+    weight=Float(example=2.5, allow_not_implemented=True),
+    weight_unit=WEIGHT_UNIT(obj, allow_not_implemented=True),
+    allow_not_implemented=True,
+    not_implemented_default={
+        "length": None,
+        "width": None,
+        "height": None,
+        "unit": None,
+        "weight": None,
+        "weight_unit": None,
+    },
+    **kwargs,
+)
+
+EXTERNAL_SYSTEM_URL = lambda obj, **kwargs: String(
+    f"URL link to the {obj} in the external system (WMS/Freight etc).",
+    f"https://example.com/{obj.replace(' ', '').lower()}/123",
+    allow_not_implemented=True,
+    **kwargs,
+)
+
+
+def validate_tag(items):
+    """Validator to ensure each item in the list is either a string or a single key-value pair dictionary."""
+    for item in items:
+        if not isinstance(item, (str, dict)):
+            raise ValidationError(
+                "Each tag must be either a string or a dictionary with one key-value pair."
+            )
+        if isinstance(item, dict) and len(item) != 1:
+            raise ValidationError(
+                "Dictionary tags must contain exactly one key-value pair."
+            )
+
+
+TRACKSTAR_TAGS = lambda **kwargs: List(
+    f"A list of custom tags associated with the resource. A tag can be either a string or a dictionary with one key-value pair.",
+    ["tag1", "tag2", {"tag3": "value3"}],
+    obj=Raw(),
+    validate=[validate_tag],
+    **kwargs,
+)
+
+SKIP_RETRIEVAL = lambda obj="resource", verb="write", **kwargs: Boolean(
+    f"Skip {obj} retrieval after successful {verb} operation",
+    False,
+    required=False,
+    load_default=False,
+    **kwargs,
+)
+
+IDEMPOTENCY_KEY_HEADER = lambda **kwargs: String(
+    "Optional key that makes this request safe to retry. Send the same key on a "
+    "retry and Trackstar returns the first attempt's response instead of writing "
+    "again; if the first attempt failed, the retry runs the write again. Reusing a "
+    "key with a different request is rejected. Keys expire after 24 hours.",
+    "9f1c2b1e-6d4a-4c1c-9a8e-2b7e3c5d1f00",
+    data_key="Idempotency-Key",
+    required=False,
+    validate=[Length(min=1, max=IDEMPOTENCY_KEY_MAX_LENGTH)],
+    **kwargs,
+)
+
+
+PASSTHROUGH_FIELDS_NOTE = "Use this object to pass fields directly to the underlying API. You will have to read the API's documentation to know what fields are available, and cannot override fields that are managed by Trackstar."
+
+
+class PassthroughFields:
+    # use this to allow users to pass arbitrary fields to the underlying API.
+    # we don't normalize or validate, but we also don't want them to be able to override fields we manage.
+    # this class is a wrapper around a dict so that we can control how it is used.
+    # the apply_to method is the only way to apply the direct fields to a target dict,
+    # and it will raise an exception if there are any conflicts with managed fields.
+    def __init__(self, fields):
+        self.fields = dict(fields)
+
+    def __repr__(self):
+        return f"PassthroughFields({self.fields!r})"
+
+    def __getattr__(self, name):
+        # dunders are left to fail normally so copy/pickle machinery (deepcopy
+        # probes __deepcopy__ etc.) still works; everything else points the dev
+        # at apply_to instead of a bare AttributeError on .keys()/.get()/...
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise AttributeError(
+            f"PassthroughFields has no .{name}; it is not a dict. "
+            f"call passthrough_fields.apply_to(target) to merge its fields"
+        )
+
+    def apply_to(self, target):
+        conflicts = []
+        for key in self.fields:
+            if key in target:
+                conflicts.append(key)
+        if conflicts:
+            raise PokedexException(
+                f"passthrough_fields cannot override managed fields: {sorted(conflicts)}",
+                400,
+                origin="trackstar",
+            )
+        target.update(self.fields)
+        return target
+
+
+class PassthroughFieldsField(Dict):
+    def _deserialize(self, *args, **kwargs):
+        # validate keys=String / values=Raw first, then wrap so the result can't
+        # be spread
+        validated = super()._deserialize(*args, **kwargs)
+        return PassthroughFields(validated)
+
+    def _serialize(self, value, *args, **kwargs):
+        # write-only field; if ever dumped, expose the plain dict
+        if isinstance(value, PassthroughFields):
+            value = value.fields
+        return super()._serialize(value, *args, **kwargs)
+
+
+def PASSTHROUGH_FIELDS(description="", **kwargs):
+    description = description.strip()
+    if not description:
+        full_description = PASSTHROUGH_FIELDS_NOTE
+    elif description.endswith("."):
+        # caller already ended with a period, don't double up the ". "
+        full_description = f"{description} {PASSTHROUGH_FIELDS_NOTE}"
+    else:
+        full_description = f"{description}. {PASSTHROUGH_FIELDS_NOTE}"
+    return PassthroughFieldsField(
+        desc=full_description,
+        keys=String(),
+        values=Raw(),
+        required=False,
+        example={"custom_field_1": "value1", "custom_field_2": 123},
+        **kwargs,
+    )
+
+
+def skip_retrieval_response_data_schema():
+    class SkipRetrievalResponseDataSchema(Schema):
+        success = Boolean("Whether the operation was confirmed successfully", True)
+        id = String("The ID of the object that has been created or modified", "id")
+
+    return SkipRetrievalResponseDataSchema()
+
+
+def compare_with_base_schema(schema, base_schema, parent_field=""):
+    required_fields = []
+    optional_fields = []
+    schema_specific_fields = {}
+    base_fields = []
+    # iterate through the base schema fields
+
+    def traverse_nested(field, field_name):
+        field_list = []
+        for nested_field_name in field.schema.fields.keys():
+            field_list.append(f"{field_name}.{nested_field_name}")
+        type_schemas = {}
+        if hasattr(field.schema, "type_schemas"):
+            # for OneOfSchema
+            type_schemas = field.schema.type_schemas
+        for type_schema_class in type_schemas.values():
+            type_schema = type_schema_class()
+            for nested_field_name in type_schema.fields.keys():
+                # TODO should this have another identifier for the shape?
+                field_list.append(f"{field_name}.{nested_field_name}")
+        return field_list
+
+    for field_name, field in base_schema.fields.items():
+        base_fields.append(field_name)
+        if isinstance(field, Nested):
+            field_list = traverse_nested(field, field_name)
+            base_fields.extend(field_list)
+        elif isinstance(field, List):
+            if isinstance(field.inner, Nested):
+                field_list = traverse_nested(field.inner, field_name)
+                base_fields.extend(field_list)
+
+    for field_name, field in schema.fields.items():
+        current_field = f"{parent_field}.{field_name}" if parent_field else field_name
+        # Check if the field/parent_field is in the base schema
+        if current_field not in base_fields:
+            schema_specific_fields[current_field] = field
+
+        if isinstance(field, Nested):
+            nested_required, nested_optional, nested_specific = (
+                compare_with_base_schema(field.schema, base_schema, current_field)
+            )
+            required_fields.extend(nested_required)
+            optional_fields.extend(nested_optional)
+            schema_specific_fields.update(nested_specific)
+            if current_field not in schema_specific_fields:
+                if field.required:
+                    required_fields.append(current_field)
+                else:
+                    optional_fields.append(current_field)
+        elif isinstance(field, List):
+            if isinstance(field.inner, Nested):
+                nested_required, nested_optional, nested_specific = (
+                    compare_with_base_schema(
+                        field.inner.schema, base_schema, current_field
+                    )
+                )
+                required_fields.extend(nested_required)
+                optional_fields.extend(nested_optional)
+                schema_specific_fields.update(nested_specific)
+            if current_field not in schema_specific_fields:
+                if field.required:
+                    required_fields.append(current_field)
+                else:
+                    optional_fields.append(current_field)
+        else:
+            if current_field not in schema_specific_fields:
+                if field.required:
+                    required_fields.append(current_field)
+                else:
+                    optional_fields.append(current_field)
+
+    return required_fields, optional_fields, schema_specific_fields
+
+
+def resolve_mm_json_schema(schema):
+    original_schema = deepcopy(schema)
+    definitions = original_schema["definitions"]
+    copied_definitions = deepcopy(definitions)
+    # for handling doubly nested. like labels.labels.image_location etc.
+    resolved_definitions = resolve_definitions(copied_definitions)
+    ref = original_schema["$ref"]
+    trimmed_ref = ref.removeprefix("#/definitions/")
+    schema = definitions[trimmed_ref]
+    properties = schema["properties"]
+    for key in properties:
+        value = properties[key]
+        if "$ref" in value:
+            ref = value["$ref"].removeprefix("#/components/schemas/")
+            properties[key] = resolved_definitions[ref]
+        elif "items" in value:
+            if value["items"].get("$ref"):
+                items_ref = value["items"]["$ref"].removeprefix("#/components/schemas/")
+                properties[key]["items"] = resolved_definitions[items_ref]
+    schema = remove_unwanted_schema_fields(schema)
+    return schema
+
+
+def resolve_definitions(definitions):
+    cleaned_definitions = {}
+    for outer_key, outer_value in definitions.items():
+        properties = outer_value.get("properties", {})
+        for key, value in properties.items():
+            if "$ref" in value:
+                ref = value["$ref"].removeprefix("#/components/schemas/")
+                properties[key] = definitions[ref]
+            elif "items" in value:
+                if value["items"].get("$ref"):
+                    items_ref = value["items"]["$ref"].removeprefix(
+                        "#/components/schemas/"
+                    )
+                    properties[key]["items"] = definitions[items_ref]
+
+        cleaned_definitions[outer_key] = remove_unwanted_schema_fields(outer_value)
+    return cleaned_definitions
+
+
+def resolve_api_spec_schema(schemas, schema_name):
+    base_schema = schemas[schema_name]
+    properties = base_schema.get("properties", {})
+    for key in properties:
+        value = properties[key]
+        if "$ref" in value:
+            ref = value["$ref"].removeprefix("#/components/schemas/")
+            resolved_ref = resolve_api_spec_schema(schemas, ref)
+            properties[key] = resolved_ref
+        elif "items" in value:
+            if "$ref" in value["items"]:
+                items_ref = value["items"]["$ref"].removeprefix("#/components/schemas/")
+                resolved_items_ref = resolve_api_spec_schema(schemas, items_ref)
+                properties[key]["items"] = resolved_items_ref
+        elif "allOf" in value:
+            all_of = value.pop("allOf")
+            description = value.pop("description", None)
+            assert not value, "allOf should be the only key in the schema"
+            assert len(all_of) == 1, "allOf should only have one item"
+            all_of = all_of[0]
+            if "$ref" not in all_of:
+                raise Exception("allOf should have a $ref")
+            all_of_ref = all_of["$ref"].removeprefix("#/components/schemas/")
+            resolved_all_of_ref = resolve_api_spec_schema(schemas, all_of_ref)
+            properties[key] = {"type": "object", "properties": resolved_all_of_ref}
+            if description:
+                properties[key]["description"] = description
+    for i, one_of in enumerate(base_schema.get("oneOf", [])):
+        if "$ref" in one_of:
+            one_of_ref = one_of["$ref"].removeprefix("#/components/schemas/")
+            resolved_one_of_ref = resolve_api_spec_schema(schemas, one_of_ref)
+            base_schema["oneOf"][i] = resolved_one_of_ref
+
+    base_schema = remove_unwanted_schema_fields(base_schema)
+    return base_schema
+
+
+def remove_unwanted_schema_fields(data):
+    unwanted_field = ["allow_not_implemented", "additionalProperties", "discriminator"]
+    for field in unwanted_field:
+        if field in data:
+            del data[field]
+    # we cannot use required as a field name in our schemas since it is a reserved keyword used by NestedSchema
+    if "required" in data:
+        data["required_fields"] = data["required"]
+        del data["required"]
+    for _, value in data.items():
+        if isinstance(value, dict):
+            remove_unwanted_schema_fields(value)
+
+    return data
+
+
+## Validation functions
+
+
+def is_upper(value):
+    if value and value != value.upper():
+        raise ValidationError("Must be all caps")
+    return True
+
+
+def is_digit(value):
+    if value and not value.isdigit():
+        raise ValidationError(f"Must be a number - got {value}")
+    return True
+
+
+def is_decimal(value):
+    # isdecimal rejects superscript and other digit-like chars that isdigit accepts
+    # but int() can't parse; use it to guard a value that will be int()-ed
+    if value and not value.isdecimal():
+        raise ValidationError(f"Must be a number - got {value}")
+    return True
+
+
+def max_length(str, max_length):
+    if len(str) > max_length:
+        raise ValidationError(
+            f"String is too long. Max length is {max_length} characters."
+        )
+    return True
+
+
+def greater_than_zero(value):
+    if value <= 0:
+        raise ValidationError(f"Value must be greater than 0 - got {value}")
+    return True
+
+
+def list_not_empty(value):
+    if not value:
+        raise ValidationError("List must not be empty")
+    return True
+
+
+# dynamo caps the IN operator at 100 operands, so in/nin filters must too
+def list_within_in_limit(value):
+    if len(value) > MAX_IN_OPERANDS:
+        raise ValidationError(
+            f"in/nin filters accept at most {MAX_IN_OPERANDS} values "
+            f"(got {len(value)}); split your request into multiple calls"
+        )
+    return True
+
+
+def same_state_country(body_state, body_country, rsp_state, rsp_country):
+    body_codes = get_state_and_country_codes_from_input(
+        body_state, body_country, should_fail=False
+    )
+    state_code, country_code = body_codes
+    if state_code and "-" in state_code:
+        state_code = state_code.split("-")[1]
+    data_codes = get_state_and_country_codes_from_input(
+        rsp_state, rsp_country, should_fail=False
+    )
+    rsp_state_code, rsp_country_code = data_codes
+    if rsp_state_code and "-" in rsp_state_code:
+        rsp_state_code = rsp_state_code.split("-")[1]
+    if country_code:
+        country_code = country_code.upper()
+    if rsp_country_code:
+        rsp_country_code = rsp_country_code.upper()
+    assert country_code == rsp_country_code, (
+        f"Country {country_code} does not match {rsp_country_code}"
+    )
+    if state_code:
+        state_code = state_code.upper()
+    if rsp_state_code:
+        rsp_state_code = rsp_state_code.upper()
+    assert state_code == rsp_state_code, (
+        f"State {state_code} does not match {rsp_state_code}"
+    )
+
+
+# API-specific schemas
+
+
+def allowed_operators(schema_type, description=None, example=None, nested_kwargs={}):
+    eq_kwargs = {}
+    if example:
+        eq_kwargs["example"] = example
+
+    class AllowedOperators(Schema):
+        eq = schema_type(required=False, **eq_kwargs, **nested_kwargs)
+        neq = schema_type(required=False, **nested_kwargs)
+        _in = CommaSeparatedList(
+            obj=schema_type(**nested_kwargs),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty, list_within_in_limit],
+            data_key="in",
+        )
+        nin = CommaSeparatedList(
+            obj=schema_type(**nested_kwargs),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty, list_within_in_limit],
+        )
+
+    nested_metadata = {}
+    if description:
+        nested_metadata["description"] = description
+    return Nested(
+        AllowedOperators,
+        required=False,
+        metadata=nested_metadata,
+    )
+
+
+def allowed_operators_with_ltgt(schema_type, description=None, example=None):
+    eq_kwargs = {}
+    if example:
+        eq_kwargs["example"] = example
+
+    class AllowedOperatorsWithLtGt(Schema):
+        eq = schema_type(required=False, **eq_kwargs)
+        neq = schema_type(required=False)
+        _in = CommaSeparatedList(
+            obj=schema_type(),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty, list_within_in_limit],
+            data_key="in",
+        )
+        nin = CommaSeparatedList(
+            obj=schema_type(),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty, list_within_in_limit],
+        )
+        gt = schema_type(required=False)
+        gte = schema_type(required=False)
+        lt = schema_type(required=False)
+        lte = schema_type(required=False)
+
+    nested_metadata = {}
+    if description:
+        nested_metadata["description"] = description
+    return Nested(
+        AllowedOperatorsWithLtGt,
+        required=False,
+        metadata=nested_metadata,
+    )
+
+
+def allowed_operators_with_contains(
+    schema_type,
+    description=None,
+    example=None,
+    nested_kwargs={},
+    include_is_null=False,
+    **kwargs,
+):
+    eq_kwargs = {}
+    if example:
+        eq_kwargs["example"] = example
+
+    class AllowedOperatorsWithContains(Schema):
+        eq = schema_type(required=False, **eq_kwargs, **nested_kwargs)
+        neq = schema_type(required=False, **nested_kwargs)
+        _in = CommaSeparatedList(
+            obj=schema_type(**nested_kwargs),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty, list_within_in_limit],
+            data_key="in",
+        )
+        nin = CommaSeparatedList(
+            obj=schema_type(**nested_kwargs),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty, list_within_in_limit],
+        )
+        contains = schema_type(required=False)
+        not_contains = schema_type(required=False)
+
+    mixins = [AllowedOperatorsWithContains]
+    if include_is_null:
+
+        class IsNullMixin(Schema):
+            is_null = Boolean(
+                "Filter by whether the field is null.",
+                True,
+                required=False,
+            )
+
+        mixins.append(IsNullMixin)
+
+    class MergedOperators(*reversed(mixins)):
+        pass
+
+    nested_metadata = {}
+    if description:
+        nested_metadata["description"] = description
+    return Nested(
+        MergedOperators,
+        required=False,
+        metadata=nested_metadata,
+        **kwargs,
+    )
+
+
+def contains_list_operators(description, example, **kwargs):
+    class ContainsListOperators(Schema):
+        contains = CommaSeparatedList(
+            obj=String(),
+            desc="Comma-separated.",
+            example=example,
+            required=False,
+            validate=[list_not_empty],
+        )
+        not_contains = CommaSeparatedList(
+            obj=String(),
+            desc="Comma-separated.",
+            required=False,
+            validate=[list_not_empty],
+        )
+
+    return Nested(
+        ContainsListOperators,
+        required=False,
+        metadata={"description": description},
+        **kwargs,
+    )
+
+
+# parses the field[operator]=value query syntax (bare field => eq) for any
+# schema built from allowed_operators; shared by resource list endpoints and
+# other query endpoints that want the same filter UX
+class OperatorQueryParams(Schema):
+    @pre_load
+    def normalize_operators(self, data, **kwargs):
+        # parse ImmutableMultiDict to dict and join comma separated stuff
+        data_as_dict = data.to_dict(flat=False)
+        # handle data_keys. e.g. trackstar_tags_flat
+        # is exposed on as trackstar_tags via data_key
+        fields_by_data_key = {}
+        for attr_name, field_obj in self.fields.items():
+            wire_name = field_obj.data_key if field_obj.data_key else attr_name
+            fields_by_data_key[wire_name] = field_obj
+        # turns everything into lists
+        data_object = {}
+        for key, value in data_as_dict.items():
+            match = re.match(r"^(.*)\[(.*)\]$", key)
+            if match:
+                field = match.group(1)
+                operator = match.group(2)
+            else:
+                field = key
+                operator = "eq"
+            error_dict = {"parameter": field, "operator": operator}
+            if field not in fields_by_data_key:
+                raise ValidationError(f"Unsupported query parameter: {error_dict}")
+            field_schema = fields_by_data_key[field]
+            if isinstance(field_schema, Nested):
+                allowed_operators = []
+                for nested_field in field_schema.schema.fields.values():
+                    if nested_field.data_key:
+                        allowed_operators.append(nested_field.data_key)
+                    else:
+                        allowed_operators.append(nested_field.name)
+                if operator not in allowed_operators:
+                    raise ValidationError(f"Unsupported query parameter: {error_dict}")
+                field_dict = data_object.get(field, {})
+                field_dict[operator] = ",".join(value)
+                data_object[field] = field_dict
+            else:
+                if operator != "eq":
+                    raise ValidationError(f"Unsupported query parameter: {error_dict}")
+                data_object[field] = ",".join(value)
+        return data_object
+
+    @post_load
+    def wrap_operators(self, data, **kwargs):
+        js_data = json.loads(json.dumps(data))
+        parsed_params = {}
+        for key, value in js_data.items():
+            if not isinstance(value, dict):
+                parsed_params[key] = {"eq": value}
+            else:
+                nested_fields = self.fields[key].schema.fields
+                parsed_value = {}
+                for nested_key, nested_value in value.items():
+                    nested_field = nested_fields[nested_key]
+                    nested_field_data_key = nested_field.name
+                    if nested_field.data_key:
+                        nested_field_data_key = nested_field.data_key
+                    parsed_value[nested_field_data_key] = nested_value
+                parsed_params[key] = parsed_value
+        return parsed_params
+
+
+class TrackstarWriteSchema(Schema):
+    trackstar_tags = TRACKSTAR_TAGS(required=False, allow_none=True)
+
+
+class IntegrationRequestBodyEntry(Schema):
+    url = String("Outbound URL")
+    method = String("HTTP method", "POST")
+    body = Raw(allow_none=True)
+
+
+def validate_integration_request_bodies(integration):
+    if not integration:
+        return []
+    entries = integration.sanitized_request_bodies()
+    schema = IntegrationRequestBodyEntry()
+    try:
+        return schema.load(entries, many=True, unknown="exclude")
+    except ValidationError as e:
+        logger.warning(
+            f"Dropping invalid integration request body entries: {e.messages}"
+        )
+        invalid_indices = set(e.messages.keys())
+        valid = []
+        for idx, item in enumerate(e.valid_data):
+            if idx not in invalid_indices:
+                valid.append(item)
+        return valid
+
+
+# Lambda-specific schemas
+
+
+def validate_task_payload(task, payload):
+    from resources import Resource
+
+    schema = {
+        "submitter": {
+            "resource": Resource,
+            "first_crawl": bool,
+            "start": str,
+            "data": list,
+        },
+        "webhook": {
+            "resource": Resource,
+            "data": list,
+        },
+        "linked-refresh": {
+            "resource": Resource,
+            "data": list,
+        },
+    }
+    if task not in schema:
+        raise ValueError(f"Invalid task: {task}")
+    for key, expected_type in schema[task].items():
+        if key not in payload:
+            raise ValueError(f"Missing required field '{key}' for task '{task}'")
+        elif not isinstance(payload[key], expected_type):
+            raise ValueError(
+                f"Invalid type for field '{key}': expected {expected_type.__name__}, got {type(payload[key]).__name__}"
+            )
