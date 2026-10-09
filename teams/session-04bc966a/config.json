@@ -1,0 +1,18 @@
+{
+  "name": "session-04bc966a",
+  "createdAt": 1791492726655,
+  "leadAgentId": "team-lead@session-04bc966a",
+  "leadSessionId": "04bc966a-2a2f-4263-bc31-c6d254eea253",
+  "members": [
+    {
+      "agentId": "team-lead@session-04bc966a",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "joinedAt": 1791492726655,
+      "tmuxPaneId": "leader",
+      "cwd": "/Users/harshanandiwada/workspace/tests",
+      "subscriptions": [],
+      "backendType": "in-process"
+    }
+  ]
+}
